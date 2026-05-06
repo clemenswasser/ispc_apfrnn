@@ -1,74 +1,20 @@
-#include "apfrnn.hpp"
+#include "apfrnn_support.hpp"
 #include <benchmark/benchmark.h>
 #include <cmath>
-#include <cstdint>
-#include <random>
-#include <vector>
-
-namespace {
-
-struct PointCloud {
-  std::vector<float> x;
-  std::vector<float> y;
-  std::vector<float> z;
-};
-
-PointCloud make_point_cloud(int num_points, float side, uint32_t seed) {
-  PointCloud cloud;
-  cloud.x.resize(num_points);
-  cloud.y.resize(num_points);
-  cloud.z.resize(num_points);
-
-  std::mt19937 gen(seed);
-  std::uniform_real_distribution<float> dist(0.0f, side);
-  for (int i = 0; i < num_points; ++i) {
-    cloud.x[i] = dist(gen);
-    cloud.y[i] = dist(gen);
-    cloud.z[i] = dist(gen);
-  }
-
-  return cloud;
-}
-
-std::size_t
-collect_concat_cross_neighbors(const apfrnn::NeighborSearchData &data,
-                               int query_size) {
-  std::vector<int> original_to_sorted(data.num_points);
-  for (int sorted_index = 0; sorted_index < data.num_points; ++sorted_index) {
-    original_to_sorted[data.original_index[sorted_index]] = sorted_index;
-  }
-
-  std::size_t total_neighbors = 0;
-  for (int point_index = 0; point_index < query_size; ++point_index) {
-    int sorted_index = original_to_sorted[point_index];
-    int begin = data.row_ptr[sorted_index];
-    int end = data.row_ptr[sorted_index + 1];
-    for (int row_index = begin; row_index < end; ++row_index) {
-      if (data.col_idx[row_index] >= query_size) {
-        ++total_neighbors;
-      }
-    }
-  }
-
-  return total_neighbors;
-}
-
-} // namespace
 
 class ISPCScalingFixture : public benchmark::Fixture {
 public:
   int N;
   float R = 2.0f;
   static constexpr int substeps_per_frame = 333;
-  PointCloud cloud;
+  apfrnn::support::PointCloud cloud;
   apfrnn::NeighborSearchData neighbor_data;
 
   void SetUp(const ::benchmark::State &state) override {
     N = state.range(0);
 
-    std::mt19937 gen(42);
     float side = std::pow(N, 1.0f / 3.0f) * 2.0f;
-    cloud = make_point_cloud(N, side, 42);
+    cloud = apfrnn::support::make_point_cloud(N, side, 42);
     neighbor_data =
         apfrnn::build_neighbor_search_data(cloud.x, cloud.y, cloud.z, R);
   }
@@ -139,15 +85,15 @@ public:
   static constexpr int target_n = 78437;
   static constexpr int substeps_per_frame = 333;
   float R = 0.02f;
-  PointCloud target;
+  apfrnn::support::PointCloud target;
   apfrnn::NeighborSearchData target_data;
-  PointCloud query;
+  apfrnn::support::PointCloud query;
   apfrnn::CrossNeighborSearchData cross_data;
 
   void SetUp(const ::benchmark::State &state) override {
     int query_n = static_cast<int>(state.range(0));
-    target = make_point_cloud(target_n, 1.0f, 42);
-    query = make_point_cloud(query_n, 1.0f, 1337);
+    target = apfrnn::support::make_point_cloud(target_n, 1.0f, 42);
+    query = apfrnn::support::make_point_cloud(query_n, 1.0f, 1337);
     target_data =
         apfrnn::build_neighbor_search_data(target.x, target.y, target.z, R);
     cross_data = apfrnn::build_cross_neighbor_search_data(
@@ -175,7 +121,7 @@ BENCHMARK_DEFINE_F(MixedSetFixture,
     auto combined = apfrnn::build_neighbor_search_data(combined_x, combined_y,
                                                        combined_z, R);
     apfrnn::write_neighbors_parallel(combined);
-    auto edges = collect_concat_cross_neighbors(
+    auto edges = apfrnn::support::collect_concat_cross_neighbors(
         combined, static_cast<int>(query.x.size()));
     benchmark::DoNotOptimize(edges);
   }
@@ -231,7 +177,7 @@ BENCHMARK_DEFINE_F(MixedSetFixture,
       auto combined = apfrnn::build_neighbor_search_data(combined_x, combined_y,
                                                          combined_z, R);
       apfrnn::write_neighbors_parallel(combined);
-      total_edges += collect_concat_cross_neighbors(
+      total_edges += apfrnn::support::collect_concat_cross_neighbors(
           combined, static_cast<int>(query.x.size()));
     }
     benchmark::DoNotOptimize(total_edges);
