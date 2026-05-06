@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdint>
 #include <random>
+#include <set>
 #include <vector>
 
 namespace apfrnn::support {
@@ -117,6 +118,12 @@ ispc_neighbors_for(const CrossNeighborSearchData &neighbor_data,
 
   std::sort(neighbors.begin(), neighbors.end());
   return neighbors;
+}
+
+inline bool is_strictly_sorted_unique(const std::vector<int> &values) {
+  return std::adjacent_find(
+             values.begin(), values.end(),
+             [](int left, int right) { return left >= right; }) == values.end();
 }
 
 template <typename SearchData>

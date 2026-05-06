@@ -14,6 +14,23 @@ apfrnn::support::PointCloud make_duplicate_point_cloud() {
   return cloud;
 }
 
+apfrnn::support::PointCloud make_threshold_point_cloud() {
+  apfrnn::support::PointCloud cloud;
+  cloud.x = {0.0f, 1.0f, 2.0001f, -1.0f, 0.0f};
+  cloud.y = {0.0f, 0.0f, 0.0f, 0.0f, 2.0f};
+  cloud.z = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  return cloud;
+}
+
+void translate_cloud(apfrnn::support::PointCloud &cloud, float dx, float dy,
+                     float dz) {
+  for (std::size_t index = 0; index < cloud.x.size(); ++index) {
+    cloud.x[index] += dx;
+    cloud.y[index] += dy;
+    cloud.z[index] += dz;
+  }
+}
+
 } // namespace
 
 TEST_CASE(
@@ -191,4 +208,151 @@ TEST_CASE("duplicate points preserve expected zero-distance neighbors") {
         std::vector<int>{0});
   CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 2).empty());
   CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 3).empty());
+}
+
+TEST_CASE(
+    "same-set neighbors are symmetric, duplicate-free, and exclude self") {
+  constexpr int num_points = 192;
+  constexpr float radius = 1.5f;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 12.0f, 31415);
+  auto neighbor_data =
+      apfrnn::build_neighbor_search_data(cloud.x, cloud.y, cloud.z, radius);
+  apfrnn::write_neighbors_parallel(neighbor_data);
+
+  CHECK(apfrnn::support::has_valid_row_ptr(neighbor_data));
+
+  std::vector<std::vector<int>> all_neighbors(num_points);
+  for (int point_index = 0; point_index < num_points; ++point_index) {
+    all_neighbors[point_index] =
+        apfrnn::support::ispc_neighbors_for(neighbor_data, point_index);
+    CHECK(
+        apfrnn::support::is_strictly_sorted_unique(all_neighbors[point_index]));
+    CHECK(std::find(all_neighbors[point_index].begin(),
+                    all_neighbors[point_index].end(),
+                    point_index) == all_neighbors[point_index].end());
+  }
+
+  for (int point_index = 0; point_index < num_points; ++point_index) {
+    for (int neighbor_index : all_neighbors[point_index]) {
+      CHECK(std::binary_search(all_neighbors[neighbor_index].begin(),
+                               all_neighbors[neighbor_index].end(),
+                               point_index));
+    }
+  }
+}
+
+TEST_CASE(
+    "distance threshold is inclusive and points beyond radius are excluded") {
+  constexpr float radius = 1.0f;
+
+  auto cloud = make_threshold_point_cloud();
+  auto neighbor_data =
+      apfrnn::build_neighbor_search_data(cloud.x, cloud.y, cloud.z, radius);
+  apfrnn::write_neighbors_parallel(neighbor_data);
+
+  CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 0) ==
+        std::vector<int>{1, 3});
+  CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 1) ==
+        std::vector<int>{0});
+  CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 2).empty());
+  CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 3) ==
+        std::vector<int>{0});
+  CHECK(apfrnn::support::ispc_neighbors_for(neighbor_data, 4).empty());
+}
+
+TEST_CASE(
+    "same-set and cross-set results are deterministic across repeated runs") {
+  constexpr int query_points = 64;
+  constexpr int target_points = 160;
+  constexpr float radius = 1.1f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 10.0f, 21);
+  auto target = apfrnn::support::make_point_cloud(target_points, 10.0f, 84);
+
+  auto first_same =
+      apfrnn::build_neighbor_search_data(query.x, query.y, query.z, radius);
+  apfrnn::write_neighbors_parallel(first_same);
+  auto second_same =
+      apfrnn::build_neighbor_search_data(query.x, query.y, query.z, radius);
+  apfrnn::write_neighbors_parallel(second_same);
+
+  CHECK(first_same.original_index == second_same.original_index);
+  CHECK(first_same.row_ptr == second_same.row_ptr);
+  CHECK(first_same.col_idx == second_same.col_idx);
+
+  auto target_data =
+      apfrnn::build_neighbor_search_data(target.x, target.y, target.z, radius);
+  auto first_cross = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(first_cross, target_data);
+  auto second_cross = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(second_cross, target_data);
+
+  CHECK(first_cross.original_index == second_cross.original_index);
+  CHECK(first_cross.row_ptr == second_cross.row_ptr);
+  CHECK(first_cross.col_idx == second_cross.col_idx);
+}
+
+TEST_CASE("cross-set writes do not mutate cached target search data") {
+  constexpr int query_points = 48;
+  constexpr int target_points = 96;
+  constexpr float radius = 1.3f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 8.0f, 17);
+  auto target = apfrnn::support::make_point_cloud(target_points, 8.0f, 18);
+
+  auto target_data =
+      apfrnn::build_neighbor_search_data(target.x, target.y, target.z, radius);
+  auto target_data_before = target_data;
+
+  auto cross_data = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(cross_data, target_data);
+
+  CHECK(target_data.original_index == target_data_before.original_index);
+  CHECK(target_data.cell_starts == target_data_before.cell_starts);
+  CHECK(target_data.cell_ends == target_data_before.cell_ends);
+  CHECK(target_data.hash_keys == target_data_before.hash_keys);
+  CHECK(target_data.hash_vals == target_data_before.hash_vals);
+  CHECK(target_data.row_ptr == target_data_before.row_ptr);
+  CHECK(target_data.col_idx == target_data_before.col_idx);
+}
+
+TEST_CASE(
+    "mixed frame replay remains exact for same-set and cross-set queries") {
+  constexpr int fluid_points = 24;
+  constexpr int boundary_points = 40;
+  constexpr float radius = 0.9f;
+  constexpr int replay_steps = 6;
+
+  auto fluid = apfrnn::support::make_point_cloud(fluid_points, 6.0f, 1001);
+  auto boundary =
+      apfrnn::support::make_point_cloud(boundary_points, 6.0f, 2002);
+  auto boundary_data = apfrnn::build_neighbor_search_data(
+      boundary.x, boundary.y, boundary.z, radius);
+
+  for (int step = 0; step < replay_steps; ++step) {
+    auto same_data =
+        apfrnn::build_neighbor_search_data(fluid.x, fluid.y, fluid.z, radius);
+    apfrnn::write_neighbors_parallel(same_data);
+
+    auto cross_data = apfrnn::build_cross_neighbor_search_data(
+        fluid.x, fluid.y, fluid.z, boundary_data, radius);
+    apfrnn::write_cross_neighbors_parallel(cross_data, boundary_data);
+
+    CHECK(apfrnn::support::has_valid_row_ptr(same_data));
+    CHECK(apfrnn::support::has_valid_row_ptr(cross_data));
+
+    for (int point_index = 0; point_index < fluid_points; ++point_index) {
+      CHECK(apfrnn::support::exact_neighbors_for(fluid, point_index, radius) ==
+            apfrnn::support::ispc_neighbors_for(same_data, point_index));
+      CHECK(apfrnn::support::exact_cross_neighbors_for(fluid, point_index,
+                                                       boundary, radius) ==
+            apfrnn::support::ispc_neighbors_for(cross_data, point_index));
+    }
+
+    translate_cloud(fluid, 0.05f, -0.02f, 0.03f);
+  }
 }
