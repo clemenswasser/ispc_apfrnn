@@ -25,7 +25,7 @@ inline void neighbor_search_core(
 
     int local_count = 0;
     int write_offset = 0;
-    cif (is_write_mode) {
+    if (is_write_mode) {
       write_offset = row_ptr[i];
     }
 
@@ -47,7 +47,7 @@ inline void neighbor_search_core(
             float dist2 = dx_p * dx_p + dy_p * dy_p + dz_p * dz_p;
 
             if ((i != j) && (dist2 <= R2)) {
-              cif(is_write_mode) { col_idx[write_offset++] = orig_idx[j]; }
+              if(is_write_mode) { col_idx[write_offset++] = orig_idx[j]; }
               else {
                 ++local_count;
               }
@@ -60,7 +60,7 @@ inline void neighbor_search_core(
       hz += K3;
     }
 
-    cif(!is_write_mode) { counts[i] = local_count; }
+    if(!is_write_mode) { counts[i] = local_count; }
   }
 }
 
