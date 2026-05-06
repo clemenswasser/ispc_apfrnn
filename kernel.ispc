@@ -22,24 +22,25 @@ export void count_neighbors_ispc(
     uniform int counts[]
 ) {
     uniform float invR = 1.0f / R;
-    for (uniform int i = start_query; i < end_query; ++i) {
-        uniform float qx = X[i], qy = Y[i], qz = Z[i];
-        uniform int cx = (int)(qx * invR);
-        uniform int cy = (int)(qy * invR);
-        uniform int cz = (int)(qz * invR);
-        uniform int local_count = 0;
+    foreach (i = start_query ... end_query) {
+        float qx = X[i], qy = Y[i], qz = Z[i];
+        int cx = (int)(qx * invR);
+        int cy = (int)(qy * invR);
+        int cz = (int)(qz * invR);
+        int local_count = 0;
         for (uniform int dz = -1; dz <= 1; dz++) {
             for (uniform int dy = -1; dy <= 1; dy++) {
                 for (uniform int dx = -1; dx <= 1; dx++) {
-                    uniform uint32 h = spatial_hash(cx+dx, cy+dy, cz+dz, hash_mask);
-                    uniform int b_start = bin_start[h];
-                    uniform int b_end   = bin_end[h];
-                    foreach (j = b_start ... b_end) {
+                    uint32 h = spatial_hash(cx+dx, cy+dy, cz+dz, hash_mask);
+                    int b_start = bin_start[h];
+                    int b_end   = bin_end[h];
+                    for (int j = b_start; j < b_end; ++j) {
                         float dx_p = X[j] - qx;
                         float dy_p = Y[j] - qy;
                         float dz_p = Z[j] - qz;
                         float dist2 = dx_p*dx_p + dy_p*dy_p + dz_p*dz_p;
-                        local_count += popcnt((i != j) && (dist2 <= R2));
+                        if ((i != j) && (dist2 <= R2))
+                            ++local_count;
                     }
                 }
             }
