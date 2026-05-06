@@ -33,7 +33,7 @@ public:
 BENCHMARK_DEFINE_F(ISPCScalingFixture,
                    BM_WriteNeighbors)(benchmark::State &state) {
   for (auto _ : state) {
-    apfrnn::write_neighbors_range(neighbor_data, 0, N);
+    apfrnn::write_neighbors_range(neighbor_data, 0, neighbor_data.num_cells);
     benchmark::DoNotOptimize(neighbor_data.col_idx.data());
   }
 
