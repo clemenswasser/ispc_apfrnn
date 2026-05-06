@@ -8,12 +8,9 @@
 int main() {
   constexpr int N = 1000000;
   constexpr float R = 2.0f;
-  constexpr uint32_t HASH_SIZE = 1 << 22;
 
   std::cout << "Allocating and generating " << N << " points...\n";
   std::vector<float> X(N), Y(N), Z(N);
-
-  // Generate Random Data + Add an "Insane Distance" particle
   std::mt19937 gen(42);
   std::uniform_real_distribution<float> dist(0.0f, 100.0f);
   for (int i = 0; i < N; ++i) {
@@ -26,8 +23,7 @@ int main() {
   Z[0] = 5e8;
 
   auto t_start = std::chrono::steady_clock::now();
-  auto neighbor_data =
-      apfrnn::build_neighbor_search_data(X, Y, Z, R, HASH_SIZE);
+  auto neighbor_data = apfrnn::build_neighbor_search_data(X, Y, Z, R);
   apfrnn::write_neighbors_parallel(neighbor_data);
   auto t_end = std::chrono::steady_clock::now();
   std::cout
@@ -36,10 +32,7 @@ int main() {
       << " ms\n";
   std::cout << "Total neighbors found: " << neighbor_data.row_ptr[N] << "\n";
 
-  // ============================================
-  // VALIDATION: Proof of absolute correctness
-  // ============================================
-  int test_idx = 42; // Choose random original index to verify
+  int test_idx = 42;
   std::vector<int> exact_neighbors;
   for (int i = 0; i < N; ++i) {
     if (i == test_idx)
@@ -52,7 +45,6 @@ int main() {
     }
   }
 
-  // Gather results produced by ISPC
   std::vector<int> ispc_neighbors;
   auto sorted_it = std::find(neighbor_data.original_index.begin(),
                              neighbor_data.original_index.end(), test_idx);

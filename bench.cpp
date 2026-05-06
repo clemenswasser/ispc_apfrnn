@@ -8,7 +8,6 @@ class ISPCScalingFixture : public benchmark::Fixture {
 public:
   int N;
   float R = 2.0f;
-  uint32_t HASH_SIZE = 1 << 22;
   apfrnn::NeighborSearchData neighbor_data;
 
   void SetUp(const ::benchmark::State &state) override {
@@ -25,7 +24,7 @@ public:
       Z[i] = dist(gen);
     }
 
-    neighbor_data = apfrnn::build_neighbor_search_data(X, Y, Z, R, HASH_SIZE);
+    neighbor_data = apfrnn::build_neighbor_search_data(X, Y, Z, R);
   }
 
   void TearDown(const benchmark::State &state) override { neighbor_data = {}; }
