@@ -33,6 +33,13 @@ template <typename T> struct DefaultInitAllocator : std::allocator<T> {
 
 using IntBuffer = std::vector<int, DefaultInitAllocator<int>>;
 
+struct SortPointKey {
+  uint64_t key;
+  int index;
+
+  bool operator<(const SortPointKey &other) const { return key < other.key; }
+};
+
 struct NeighborSearchData {
   int num_points = 0;
   int num_cells = 0;
@@ -52,6 +59,11 @@ struct NeighborSearchData {
   IntBuffer col_idx;
   std::vector<uint64_t> hash_keys;
   IntBuffer hash_vals;
+  std::vector<SortPointKey> scratch_point_keys;
+  std::vector<uint64_t> scratch_sorted_keys;
+  std::vector<uint64_t> scratch_unique_keys;
+  IntBuffer scratch_cached_neighbor_cells;
+  IntBuffer scratch_cached_neighbor_counts;
   uint64_t empty_key = ~0ULL;
   uint32_t hash_mask = 0;
 };
@@ -73,12 +85,28 @@ struct CrossNeighborSearchData {
   IntBuffer counts;
   IntBuffer row_ptr;
   IntBuffer col_idx;
+  std::vector<SortPointKey> scratch_point_keys;
+  std::vector<uint64_t> scratch_sorted_keys;
+  std::vector<uint64_t> scratch_unique_keys;
+  IntBuffer scratch_cached_neighbor_cells;
+  IntBuffer scratch_cached_neighbor_counts;
 };
+
+void build_neighbor_search_data_inplace(NeighborSearchData &data,
+                                        const std::vector<float> &x,
+                                        const std::vector<float> &y,
+                                        const std::vector<float> &z,
+                                        float radius);
 
 NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
                                               const std::vector<float> &y,
                                               const std::vector<float> &z,
                                               float radius);
+
+void build_cross_neighbor_search_data_inplace(
+    CrossNeighborSearchData &data, const std::vector<float> &query_x,
+    const std::vector<float> &query_y, const std::vector<float> &query_z,
+    const NeighborSearchData &target_data, float radius);
 
 CrossNeighborSearchData build_cross_neighbor_search_data(
     const std::vector<float> &query_x, const std::vector<float> &query_y,
