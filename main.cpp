@@ -356,3 +356,163 @@ TEST_CASE(
     translate_cloud(fluid, 0.05f, -0.02f, 0.03f);
   }
 }
+
+TEST_CASE("same-set write_neighbors_range matches write_neighbors_parallel") {
+  constexpr int num_points = 320;
+  constexpr float radius = 1.35f;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 14.0f, 551);
+  auto ranged =
+      apfrnn::build_neighbor_search_data(cloud.x, cloud.y, cloud.z, radius);
+  auto parallel = ranged;
+
+  apfrnn::write_neighbors_range(ranged, 0, ranged.num_cells);
+  apfrnn::write_neighbors_parallel(parallel);
+
+  CHECK(ranged.original_index == parallel.original_index);
+  CHECK(ranged.row_ptr == parallel.row_ptr);
+  CHECK(ranged.col_idx == parallel.col_idx);
+}
+
+TEST_CASE("cross-set write_cross_neighbors_range matches "
+          "write_cross_neighbors_parallel") {
+  constexpr int query_points = 128;
+  constexpr int target_points = 384;
+  constexpr float radius = 1.15f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 12.0f, 701);
+  auto target = apfrnn::support::make_point_cloud(target_points, 12.0f, 702);
+  auto target_data =
+      apfrnn::build_neighbor_search_data(target.x, target.y, target.z, radius);
+  auto ranged = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  auto parallel = ranged;
+
+  apfrnn::write_cross_neighbors_range(ranged, target_data, 0, ranged.num_cells);
+  apfrnn::write_cross_neighbors_parallel(parallel, target_data);
+
+  CHECK(ranged.original_index == parallel.original_index);
+  CHECK(ranged.row_ptr == parallel.row_ptr);
+  CHECK(ranged.col_idx == parallel.col_idx);
+}
+
+TEST_CASE(
+    "same-set results are permutation invariant in original index space") {
+  constexpr int num_points = 180;
+  constexpr float radius = 1.6f;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 16.0f, 808);
+  auto permutation = apfrnn::support::make_permutation(num_points, 809);
+  auto inverse_permutation = apfrnn::support::invert_permutation(permutation);
+  auto permuted_cloud = apfrnn::support::permute_cloud(cloud, permutation);
+
+  auto permuted_data = apfrnn::build_neighbor_search_data(
+      permuted_cloud.x, permuted_cloud.y, permuted_cloud.z, radius);
+  apfrnn::write_neighbors_parallel(permuted_data);
+
+  for (int original_point = 0; original_point < num_points; ++original_point) {
+    int permuted_point =
+        inverse_permutation[static_cast<std::size_t>(original_point)];
+    auto permuted_neighbors =
+        apfrnn::support::ispc_neighbors_for(permuted_data, permuted_point);
+    auto remapped_neighbors =
+        apfrnn::support::remap_neighbors(permuted_neighbors, permutation);
+    auto exact_neighbors =
+        apfrnn::support::exact_neighbors_for(cloud, original_point, radius);
+    CHECK(remapped_neighbors == exact_neighbors);
+  }
+}
+
+TEST_CASE("cross-set results are permutation invariant for query and target") {
+  constexpr int query_points = 72;
+  constexpr int target_points = 144;
+  constexpr float radius = 1.05f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 9.0f, 901);
+  auto target = apfrnn::support::make_point_cloud(target_points, 9.0f, 902);
+  auto query_permutation = apfrnn::support::make_permutation(query_points, 903);
+  auto target_permutation =
+      apfrnn::support::make_permutation(target_points, 904);
+  auto inverse_query_permutation =
+      apfrnn::support::invert_permutation(query_permutation);
+  auto permuted_query =
+      apfrnn::support::permute_cloud(query, query_permutation);
+  auto permuted_target =
+      apfrnn::support::permute_cloud(target, target_permutation);
+
+  auto permuted_target_data = apfrnn::build_neighbor_search_data(
+      permuted_target.x, permuted_target.y, permuted_target.z, radius);
+  auto permuted_cross = apfrnn::build_cross_neighbor_search_data(
+      permuted_query.x, permuted_query.y, permuted_query.z,
+      permuted_target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(permuted_cross, permuted_target_data);
+
+  for (int original_point = 0; original_point < query_points;
+       ++original_point) {
+    int permuted_point =
+        inverse_query_permutation[static_cast<std::size_t>(original_point)];
+    auto permuted_neighbors =
+        apfrnn::support::ispc_neighbors_for(permuted_cross, permuted_point);
+    auto remapped_neighbors = apfrnn::support::remap_neighbors(
+        permuted_neighbors, target_permutation);
+    auto exact_neighbors = apfrnn::support::exact_cross_neighbors_for(
+        query, original_point, target, radius);
+    CHECK(remapped_neighbors == exact_neighbors);
+  }
+}
+
+TEST_CASE("same-set neighbors are monotonic with increasing radius") {
+  constexpr int num_points = 140;
+  constexpr float small_radius = 0.8f;
+  constexpr float large_radius = 1.6f;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 11.0f, 10001);
+  auto small_data = apfrnn::build_neighbor_search_data(cloud.x, cloud.y,
+                                                       cloud.z, small_radius);
+  auto large_data = apfrnn::build_neighbor_search_data(cloud.x, cloud.y,
+                                                       cloud.z, large_radius);
+  apfrnn::write_neighbors_parallel(small_data);
+  apfrnn::write_neighbors_parallel(large_data);
+
+  for (int point_index = 0; point_index < num_points; ++point_index) {
+    auto small_neighbors =
+        apfrnn::support::ispc_neighbors_for(small_data, point_index);
+    auto large_neighbors =
+        apfrnn::support::ispc_neighbors_for(large_data, point_index);
+    for (int neighbor_index : small_neighbors) {
+      CHECK(std::binary_search(large_neighbors.begin(), large_neighbors.end(),
+                               neighbor_index));
+    }
+  }
+}
+
+TEST_CASE("cross-set neighbors are monotonic with increasing radius") {
+  constexpr int query_points = 60;
+  constexpr int target_points = 100;
+  constexpr float small_radius = 0.7f;
+  constexpr float large_radius = 1.4f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 7.0f, 11001);
+  auto target = apfrnn::support::make_point_cloud(target_points, 7.0f, 11002);
+  auto small_target_data = apfrnn::build_neighbor_search_data(
+      target.x, target.y, target.z, small_radius);
+  auto large_target_data = apfrnn::build_neighbor_search_data(
+      target.x, target.y, target.z, large_radius);
+  auto small_cross = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, small_target_data, small_radius);
+  auto large_cross = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, large_target_data, large_radius);
+  apfrnn::write_cross_neighbors_parallel(small_cross, small_target_data);
+  apfrnn::write_cross_neighbors_parallel(large_cross, large_target_data);
+
+  for (int point_index = 0; point_index < query_points; ++point_index) {
+    auto small_neighbors =
+        apfrnn::support::ispc_neighbors_for(small_cross, point_index);
+    auto large_neighbors =
+        apfrnn::support::ispc_neighbors_for(large_cross, point_index);
+    for (int neighbor_index : small_neighbors) {
+      CHECK(std::binary_search(large_neighbors.begin(), large_neighbors.end(),
+                               neighbor_index));
+    }
+  }
+}

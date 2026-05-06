@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <numeric>
 #include <random>
 #include <set>
 #include <vector>
@@ -124,6 +125,52 @@ inline bool is_strictly_sorted_unique(const std::vector<int> &values) {
   return std::adjacent_find(
              values.begin(), values.end(),
              [](int left, int right) { return left >= right; }) == values.end();
+}
+
+inline std::vector<int> make_permutation(int num_points, uint32_t seed) {
+  std::vector<int> permutation(static_cast<std::size_t>(num_points));
+  std::iota(permutation.begin(), permutation.end(), 0);
+  std::mt19937 generator(seed);
+  std::shuffle(permutation.begin(), permutation.end(), generator);
+  return permutation;
+}
+
+inline PointCloud permute_cloud(const PointCloud &cloud,
+                                const std::vector<int> &permutation) {
+  PointCloud permuted;
+  permuted.x.resize(permutation.size());
+  permuted.y.resize(permutation.size());
+  permuted.z.resize(permutation.size());
+
+  for (std::size_t index = 0; index < permutation.size(); ++index) {
+    int source_index = permutation[index];
+    permuted.x[index] = cloud.x[static_cast<std::size_t>(source_index)];
+    permuted.y[index] = cloud.y[static_cast<std::size_t>(source_index)];
+    permuted.z[index] = cloud.z[static_cast<std::size_t>(source_index)];
+  }
+
+  return permuted;
+}
+
+inline std::vector<int>
+invert_permutation(const std::vector<int> &permutation) {
+  std::vector<int> inverse(permutation.size());
+  for (std::size_t index = 0; index < permutation.size(); ++index) {
+    inverse[static_cast<std::size_t>(permutation[index])] =
+        static_cast<int>(index);
+  }
+  return inverse;
+}
+
+inline std::vector<int> remap_neighbors(const std::vector<int> &neighbors,
+                                        const std::vector<int> &index_map) {
+  std::vector<int> remapped;
+  remapped.reserve(neighbors.size());
+  for (int neighbor_index : neighbors) {
+    remapped.push_back(index_map[static_cast<std::size_t>(neighbor_index)]);
+  }
+  std::sort(remapped.begin(), remapped.end());
+  return remapped;
 }
 
 template <typename SearchData>
