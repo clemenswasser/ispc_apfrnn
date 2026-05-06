@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.31)
-include(FetchContent)
-FetchContent_Declare(vcpkg URL [[https://github.com/microsoft/vcpkg/archive/refs/tags/2026.04.27.tar.gz]])
-FetchContent_MakeAvailable(vcpkg)
-set(CMAKE_TOOLCHAIN_FILE "${vcpkg_SOURCE_DIR}/scripts/buildsystems/vcpkg.cmake")
+
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(vcpkg URL [[https://github.com/microsoft/vcpkg/archive/refs/tags/2026.04.27.tar.gz]])
+    FetchContent_MakeAvailable(vcpkg)
+    set(CMAKE_TOOLCHAIN_FILE "${vcpkg_SOURCE_DIR}/scripts/buildsystems/vcpkg.cmake")
+endif()
+
 project(ispc_apfrnn LANGUAGES CXX ISPC)
 add_library(ispc_apfrnn_kernels kernel.ispc apfrnn.cpp)
 target_compile_options(ispc_apfrnn_kernels PRIVATE
