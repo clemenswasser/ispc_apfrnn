@@ -96,22 +96,18 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
   unique_keys.reserve(data.num_points);
   data.cell_starts.push_back(0);
   unique_keys.push_back(sorted_keys[0]);
-  data.point_cell_idx.resize(data.num_points);
-  data.point_cell_idx[0] = 0;
 
-  int current_cell = 0;
   for (int i = 1; i < data.num_points; ++i) {
     if (sorted_keys[i] != sorted_keys[i - 1]) {
       data.cell_ends.push_back(i);
       data.cell_starts.push_back(i);
       unique_keys.push_back(sorted_keys[i]);
-      ++current_cell;
     }
-    data.point_cell_idx[i] = current_cell;
   }
   data.cell_ends.push_back(data.num_points);
 
   int num_cells = static_cast<int>(data.cell_starts.size());
+  data.num_cells = num_cells;
   int hash_capacity = 1;
   while (hash_capacity < num_cells * 2) {
     hash_capacity <<= 1;
@@ -200,14 +196,14 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
 
   data.counts.assign(data.num_points, 0);
   tbb::parallel_for(
-      tbb::blocked_range<int>(0, data.num_points, 1024),
+      tbb::blocked_range<int>(0, data.num_cells, 64),
       [&](const tbb::blocked_range<int> &range) {
         ispc::count_neighbors_ispc(
-            range.begin(), range.end(), data.point_cell_idx.data(),
-            data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
-            data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data(),
-            data.radius * data.radius, data.sorted_x.data(),
-            data.sorted_y.data(), data.sorted_z.data(),
+            range.begin(), range.end(), data.cell_starts.data(),
+            data.cell_ends.data(), data.cell_neighbor_offset.data(),
+            data.cell_num_neighbors.data(), data.cell_neighbor_starts.data(),
+            data.cell_neighbor_ends.data(), data.radius * data.radius,
+            data.sorted_x.data(), data.sorted_y.data(), data.sorted_z.data(),
             data.original_index.data(), data.counts.data());
       });
 
@@ -231,10 +227,10 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
   return data;
 }
 
-void write_neighbors_range(NeighborSearchData &data, int start_query,
-                           int end_query) {
+void write_neighbors_range(NeighborSearchData &data, int start_cell,
+                           int end_cell) {
   ispc::write_neighbors_ispc(
-      start_query, end_query, data.point_cell_idx.data(),
+      start_cell, end_cell, data.cell_starts.data(), data.cell_ends.data(),
       data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
       data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data(),
       data.radius * data.radius, data.sorted_x.data(), data.sorted_y.data(),
@@ -243,7 +239,11 @@ void write_neighbors_range(NeighborSearchData &data, int start_query,
 }
 
 void write_neighbors_parallel(NeighborSearchData &data) {
-  tbb::parallel_for(tbb::blocked_range<int>(0, data.num_points, 1024),
+  if (data.num_points == 0) {
+    return;
+  }
+
+  tbb::parallel_for(tbb::blocked_range<int>(0, data.num_cells, 64),
                     [&](const tbb::blocked_range<int> &range) {
                       write_neighbors_range(data, range.begin(), range.end());
                     });
