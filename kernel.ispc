@@ -25,8 +25,8 @@ inline void neighbor_search_core(
 
     int local_count = 0;
     int write_offset = 0;
-    if (is_write_mode) {
-      write_offset = row_ptr[orig_idx[i]];
+    cif (is_write_mode) {
+      write_offset = row_ptr[i];
     }
 
     uint32 hz = hz_start;
@@ -60,7 +60,7 @@ inline void neighbor_search_core(
       hz += K3;
     }
 
-    cif(!is_write_mode) { counts[orig_idx[i]] = local_count; }
+    cif(!is_write_mode) { counts[i] = local_count; }
   }
 }
 

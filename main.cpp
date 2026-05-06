@@ -54,8 +54,11 @@ int main() {
 
   // Gather results produced by ISPC
   std::vector<int> ispc_neighbors;
-  for (int i = neighbor_data.row_ptr[test_idx];
-       i < neighbor_data.row_ptr[test_idx + 1]; ++i) {
+  auto sorted_it = std::find(neighbor_data.original_index.begin(),
+                             neighbor_data.original_index.end(), test_idx);
+  int sorted_idx = sorted_it - neighbor_data.original_index.begin();
+  for (int i = neighbor_data.row_ptr[sorted_idx];
+       i < neighbor_data.row_ptr[sorted_idx + 1]; ++i) {
     ispc_neighbors.push_back(neighbor_data.col_idx[i]);
   }
 
