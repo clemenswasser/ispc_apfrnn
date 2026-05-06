@@ -1,9 +1,37 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace apfrnn {
+
+template <typename T> struct DefaultInitAllocator : std::allocator<T> {
+  using value_type = T;
+
+  DefaultInitAllocator() = default;
+
+  template <typename U>
+  DefaultInitAllocator(const DefaultInitAllocator<U> &) noexcept {}
+
+  template <typename U> struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+
+  template <typename U, typename... Args>
+  void construct(U *ptr, Args &&...args) {
+    if constexpr (sizeof...(Args) == 0 &&
+                  std::is_trivially_default_constructible_v<U>) {
+      ::new (static_cast<void *>(ptr)) U;
+    } else {
+      ::new (static_cast<void *>(ptr)) U(std::forward<Args>(args)...);
+    }
+  }
+};
+
+using IntBuffer = std::vector<int, DefaultInitAllocator<int>>;
 
 struct NeighborSearchData {
   int num_points = 0;
@@ -12,18 +40,18 @@ struct NeighborSearchData {
   std::vector<float> sorted_x;
   std::vector<float> sorted_y;
   std::vector<float> sorted_z;
-  std::vector<int> original_index;
-  std::vector<int> cell_starts;
-  std::vector<int> cell_ends;
-  std::vector<int> cell_neighbor_offset;
-  std::vector<int> cell_num_neighbors;
-  std::vector<int> cell_neighbor_starts;
-  std::vector<int> cell_neighbor_ends;
-  std::vector<int> counts;
-  std::vector<int> row_ptr;
-  std::vector<int> col_idx;
+  IntBuffer original_index;
+  IntBuffer cell_starts;
+  IntBuffer cell_ends;
+  IntBuffer cell_neighbor_offset;
+  IntBuffer cell_num_neighbors;
+  IntBuffer cell_neighbor_starts;
+  IntBuffer cell_neighbor_ends;
+  IntBuffer counts;
+  IntBuffer row_ptr;
+  IntBuffer col_idx;
   std::vector<uint64_t> hash_keys;
-  std::vector<int> hash_vals;
+  IntBuffer hash_vals;
   uint64_t empty_key = ~0ULL;
   uint32_t hash_mask = 0;
 };
@@ -35,16 +63,16 @@ struct CrossNeighborSearchData {
   std::vector<float> sorted_x;
   std::vector<float> sorted_y;
   std::vector<float> sorted_z;
-  std::vector<int> original_index;
-  std::vector<int> cell_starts;
-  std::vector<int> cell_ends;
-  std::vector<int> cell_neighbor_offset;
-  std::vector<int> cell_num_neighbors;
-  std::vector<int> cell_neighbor_starts;
-  std::vector<int> cell_neighbor_ends;
-  std::vector<int> counts;
-  std::vector<int> row_ptr;
-  std::vector<int> col_idx;
+  IntBuffer original_index;
+  IntBuffer cell_starts;
+  IntBuffer cell_ends;
+  IntBuffer cell_neighbor_offset;
+  IntBuffer cell_num_neighbors;
+  IntBuffer cell_neighbor_starts;
+  IntBuffer cell_neighbor_ends;
+  IntBuffer counts;
+  IntBuffer row_ptr;
+  IntBuffer col_idx;
 };
 
 NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,

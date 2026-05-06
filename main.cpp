@@ -176,7 +176,8 @@ TEST_CASE("empty same-set and cross-set inputs produce valid empty CSR") {
   apfrnn::write_neighbors_parallel(empty_data);
 
   CHECK(empty_data.num_points == 0);
-  CHECK(empty_data.row_ptr == std::vector<int>{0});
+  CHECK(empty_data.row_ptr.size() == 1);
+  CHECK(empty_data.row_ptr[0] == 0);
   CHECK(empty_data.col_idx.empty());
   CHECK(apfrnn::support::has_valid_row_ptr(empty_data));
 
@@ -188,7 +189,8 @@ TEST_CASE("empty same-set and cross-set inputs produce valid empty CSR") {
   apfrnn::write_cross_neighbors_parallel(empty_cross, target_data);
 
   CHECK(empty_cross.num_points == 0);
-  CHECK(empty_cross.row_ptr == std::vector<int>{0});
+  CHECK(empty_cross.row_ptr.size() == 1);
+  CHECK(empty_cross.row_ptr[0] == 0);
   CHECK(empty_cross.col_idx.empty());
   CHECK(apfrnn::support::has_valid_row_ptr(empty_cross));
 }

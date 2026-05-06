@@ -37,7 +37,7 @@ inline int unpack_coord(uint64_t key, int shift) {
 }
 
 inline int find_cell_index(const std::vector<uint64_t> &ht_keys,
-                           const std::vector<int> &ht_vals, uint64_t empty_key,
+                           const IntBuffer &ht_vals, uint64_t empty_key,
                            uint32_t hash_mask, uint64_t key) {
   uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
   h64 ^= h64 >> 33;
@@ -56,9 +56,8 @@ inline int find_cell_index(const std::vector<uint64_t> &ht_keys,
 }
 
 inline int collect_neighbor_cells(const std::vector<uint64_t> &ht_keys,
-                                  const std::vector<int> &ht_vals,
-                                  uint64_t empty_key, uint32_t hash_mask,
-                                  int cx, int cy, int cz,
+                                  const IntBuffer &ht_vals, uint64_t empty_key,
+                                  uint32_t hash_mask, int cx, int cy, int cz,
                                   int neighbor_cells[27]) {
   int count = 0;
   for (int dx = -1; dx <= 1; ++dx) {
@@ -77,8 +76,8 @@ inline int collect_neighbor_cells(const std::vector<uint64_t> &ht_keys,
   return count;
 }
 
-inline int count_merged_neighbor_ranges(const std::vector<int> &cell_starts,
-                                        const std::vector<int> &cell_ends,
+inline int count_merged_neighbor_ranges(const IntBuffer &cell_starts,
+                                        const IntBuffer &cell_ends,
                                         const int neighbor_cells[27],
                                         int count) {
   int merged = 0;
@@ -107,8 +106,8 @@ inline int count_merged_neighbor_ranges(const std::vector<int> &cell_starts,
   return merged;
 }
 
-inline void write_merged_neighbor_ranges(const std::vector<int> &cell_starts,
-                                         const std::vector<int> &cell_ends,
+inline void write_merged_neighbor_ranges(const IntBuffer &cell_starts,
+                                         const IntBuffer &cell_ends,
                                          const int neighbor_cells[27],
                                          int count, int offset,
                                          int *neighbor_starts,
@@ -146,8 +145,8 @@ inline void
 sort_point_set(const std::vector<float> &x, const std::vector<float> &y,
                const std::vector<float> &z, float inv_radius,
                std::vector<float> &sorted_x, std::vector<float> &sorted_y,
-               std::vector<float> &sorted_z, std::vector<int> &original_index,
-               std::vector<int> &cell_starts, std::vector<int> &cell_ends,
+               std::vector<float> &sorted_z, IntBuffer &original_index,
+               IntBuffer &cell_starts, IntBuffer &cell_ends,
                std::vector<uint64_t> &unique_keys) {
   int const num_points = static_cast<int>(x.size());
   std::vector<PointKey> point_keys(num_points);
@@ -197,9 +196,8 @@ sort_point_set(const std::vector<float> &x, const std::vector<float> &y,
 }
 
 inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
-                             std::vector<uint64_t> &ht_keys,
-                             std::vector<int> &ht_vals, uint64_t empty_key,
-                             uint32_t &hash_mask) {
+                             std::vector<uint64_t> &ht_keys, IntBuffer &ht_vals,
+                             uint64_t empty_key, uint32_t &hash_mask) {
   int hash_capacity = 1;
   while (hash_capacity < static_cast<int>(unique_keys.size()) * 2) {
     hash_capacity <<= 1;
@@ -251,7 +249,8 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
 
   std::vector<int> cached_neighbor_cells(static_cast<std::size_t>(num_cells) *
                                          27);
-  std::vector<int> cached_neighbor_counts(num_cells);
+  IntBuffer cached_neighbor_counts;
+  cached_neighbor_counts.resize(num_cells);
   data.cell_num_neighbors.resize(num_cells);
   data.cell_neighbor_offset.resize(num_cells);
 
@@ -304,7 +303,7 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
                                  data.cell_neighbor_ends.data());
   });
 
-  data.counts.assign(data.num_points, 0);
+  data.counts.resize(data.num_points);
   tbb::parallel_for(
       tbb::blocked_range<int>(0, data.num_cells, 64),
       [&](const tbb::blocked_range<int> &range) {
@@ -317,7 +316,7 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
             data.original_index.data(), data.counts.data());
       });
 
-  data.row_ptr.assign(data.num_points + 1, 0);
+  data.row_ptr.resize(data.num_points + 1);
   int total_neighbors = tbb::parallel_scan(
       tbb::blocked_range<int>(0, data.num_points), 0,
       [&](const tbb::blocked_range<int> &range, int sum, bool is_final_scan) {
@@ -332,7 +331,7 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
       },
       [](int left, int right) { return left + right; });
   data.row_ptr[data.num_points] = total_neighbors;
-  data.col_idx.assign(total_neighbors, 0);
+  data.col_idx.resize(total_neighbors);
 
   return data;
 }
@@ -359,7 +358,8 @@ CrossNeighborSearchData build_cross_neighbor_search_data(
   data.num_cells = static_cast<int>(data.cell_starts.size());
   std::vector<int> cached_neighbor_cells(
       static_cast<std::size_t>(data.num_cells) * 27);
-  std::vector<int> cached_neighbor_counts(data.num_cells);
+  IntBuffer cached_neighbor_counts;
+  cached_neighbor_counts.resize(data.num_cells);
   data.cell_num_neighbors.resize(data.num_cells);
   data.cell_neighbor_offset.resize(data.num_cells);
 
@@ -413,7 +413,7 @@ CrossNeighborSearchData build_cross_neighbor_search_data(
                                  data.cell_neighbor_ends.data());
   });
 
-  data.counts.assign(data.num_points, 0);
+  data.counts.resize(data.num_points);
   tbb::parallel_for(
       tbb::blocked_range<int>(0, data.num_cells, 64),
       [&](const tbb::blocked_range<int> &range) {
@@ -427,7 +427,7 @@ CrossNeighborSearchData build_cross_neighbor_search_data(
             target_data.sorted_z.data(), data.counts.data());
       });
 
-  data.row_ptr.assign(data.num_points + 1, 0);
+  data.row_ptr.resize(data.num_points + 1);
   int total_neighbors = tbb::parallel_scan(
       tbb::blocked_range<int>(0, data.num_points), 0,
       [&](const tbb::blocked_range<int> &range, int sum, bool is_final_scan) {
@@ -442,7 +442,7 @@ CrossNeighborSearchData build_cross_neighbor_search_data(
       },
       [](int left, int right) { return left + right; });
   data.row_ptr[data.num_points] = total_neighbors;
-  data.col_idx.assign(total_neighbors, 0);
+  data.col_idx.resize(total_neighbors);
 
   return data;
 }
