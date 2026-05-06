@@ -3,6 +3,7 @@
 #include "kernel_ispc.h"
 
 #include <cmath>
+#include <cstdint>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_scan.h>
@@ -11,6 +12,13 @@
 namespace apfrnn {
 
 namespace {
+
+struct PointKey {
+  uint64_t key;
+  int index;
+
+  bool operator<(const PointKey &other) const { return key < other.key; }
+};
 
 inline uint64_t make_key(int cx, int cy, int cz) {
   uint64_t ux = static_cast<uint64_t>(static_cast<uint32_t>(cx)) & 0x1FFFFFULL;
@@ -47,6 +55,101 @@ inline int find_cell_index(const std::vector<uint64_t> &ht_keys,
   }
 }
 
+inline int collect_neighbor_cells(const std::vector<uint64_t> &ht_keys,
+                                  const std::vector<int> &ht_vals,
+                                  uint64_t empty_key, uint32_t hash_mask,
+                                  int cx, int cy, int cz,
+                                  int neighbor_cells[27]) {
+  int count = 0;
+  for (int dz = -1; dz <= 1; ++dz) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        int neighbor_cell =
+            find_cell_index(ht_keys, ht_vals, empty_key, hash_mask,
+                            make_key(cx + dx, cy + dy, cz + dz));
+        if (neighbor_cell != -1) {
+          neighbor_cells[count++] = neighbor_cell;
+        }
+      }
+    }
+  }
+
+  for (int i = 1; i < count; ++i) {
+    int cell = neighbor_cells[i];
+    int j = i - 1;
+    while (j >= 0 && neighbor_cells[j] > cell) {
+      neighbor_cells[j + 1] = neighbor_cells[j];
+      --j;
+    }
+    neighbor_cells[j + 1] = cell;
+  }
+
+  return count;
+}
+
+inline int count_merged_neighbor_ranges(const NeighborSearchData &data,
+                                        const int neighbor_cells[27],
+                                        int count) {
+  int merged = 0;
+  int current_end = -1;
+
+  for (int i = 0; i < count; ++i) {
+    int neighbor_cell = neighbor_cells[i];
+    int neighbor_start = data.cell_starts[neighbor_cell];
+    int neighbor_end = data.cell_ends[neighbor_cell];
+
+    if (current_end == neighbor_start) {
+      current_end = neighbor_end;
+      continue;
+    }
+
+    if (current_end != -1) {
+      ++merged;
+    }
+    current_end = neighbor_end;
+  }
+
+  if (current_end != -1) {
+    ++merged;
+  }
+
+  return merged;
+}
+
+inline void write_merged_neighbor_ranges(const NeighborSearchData &data,
+                                         const int neighbor_cells[27],
+                                         int count, int offset,
+                                         int *neighbor_starts,
+                                         int *neighbor_ends) {
+  int current_start = -1;
+  int current_end = -1;
+
+  for (int i = 0; i < count; ++i) {
+    int neighbor_cell = neighbor_cells[i];
+    int neighbor_start = data.cell_starts[neighbor_cell];
+    int neighbor_end = data.cell_ends[neighbor_cell];
+
+    if (current_end == neighbor_start) {
+      current_end = neighbor_end;
+      continue;
+    }
+
+    if (current_start != -1) {
+      neighbor_starts[offset] = current_start;
+      neighbor_ends[offset] = current_end;
+      ++offset;
+    }
+
+    current_start = neighbor_start;
+    current_end = neighbor_end;
+  }
+
+  if (current_start != -1) {
+    neighbor_starts[offset] = current_start;
+    neighbor_ends[offset] = current_end;
+  }
+}
+
 } // namespace
 
 NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
@@ -59,23 +162,21 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
   float inv_radius = 1.0f / radius;
 
   if (data.num_points == 0) {
+    data.row_ptr.push_back(0);
     return data;
   }
 
-  std::vector<uint64_t> keys(data.num_points);
-  std::vector<int> sort_idx(data.num_points);
+  std::vector<PointKey> point_keys(data.num_points);
 
   tbb::parallel_for(0, data.num_points, [&](int i) {
     int cx = static_cast<int>(std::floor(x[i] * inv_radius));
     int cy = static_cast<int>(std::floor(y[i] * inv_radius));
     int cz = static_cast<int>(std::floor(z[i] * inv_radius));
-    keys[i] = make_key(cx, cy, cz);
-    sort_idx[i] = i;
+    point_keys[i].key = make_key(cx, cy, cz);
+    point_keys[i].index = i;
   });
 
-  tbb::parallel_sort(
-      sort_idx.begin(), sort_idx.end(),
-      [&](int left, int right) { return keys[left] < keys[right]; });
+  tbb::parallel_sort(point_keys.begin(), point_keys.end());
 
   data.sorted_x.resize(data.num_points);
   data.sorted_y.resize(data.num_points);
@@ -84,12 +185,12 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
   std::vector<uint64_t> sorted_keys(data.num_points);
 
   tbb::parallel_for(0, data.num_points, [&](int i) {
-    int idx = sort_idx[i];
+    int idx = point_keys[i].index;
     data.sorted_x[i] = x[idx];
     data.sorted_y[i] = y[idx];
     data.sorted_z[i] = z[idx];
     data.original_index[i] = idx;
-    sorted_keys[i] = keys[idx];
+    sorted_keys[i] = point_keys[i].key;
   });
 
   std::vector<uint64_t> unique_keys;
@@ -140,18 +241,11 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
     int cy = unpack_coord(key, 21);
     int cz = unpack_coord(key, 0);
 
-    int neighbors = 0;
-    for (int dz = -1; dz <= 1; ++dz) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-          if (find_cell_index(ht_keys, ht_vals, empty_key, hash_mask,
-                              make_key(cx + dx, cy + dy, cz + dz)) != -1) {
-            ++neighbors;
-          }
-        }
-      }
-    }
-    data.cell_num_neighbors[cell] = neighbors;
+    int neighbor_cells[27];
+    int neighbor_count = collect_neighbor_cells(
+        ht_keys, ht_vals, empty_key, hash_mask, cx, cy, cz, neighbor_cells);
+    data.cell_num_neighbors[cell] =
+        count_merged_neighbor_ranges(data, neighbor_cells, neighbor_count);
   });
 
   int total_cell_neighbors = tbb::parallel_scan(
@@ -178,20 +272,12 @@ NeighborSearchData build_neighbor_search_data(const std::vector<float> &x,
     int cz = unpack_coord(key, 0);
     int offset = data.cell_neighbor_offset[cell];
 
-    for (int dz = -1; dz <= 1; ++dz) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-          int neighbor_cell =
-              find_cell_index(ht_keys, ht_vals, empty_key, hash_mask,
-                              make_key(cx + dx, cy + dy, cz + dz));
-          if (neighbor_cell != -1) {
-            data.cell_neighbor_starts[offset] = data.cell_starts[neighbor_cell];
-            data.cell_neighbor_ends[offset] = data.cell_ends[neighbor_cell];
-            ++offset;
-          }
-        }
-      }
-    }
+    int neighbor_cells[27];
+    int neighbor_count = collect_neighbor_cells(
+        ht_keys, ht_vals, empty_key, hash_mask, cx, cy, cz, neighbor_cells);
+    write_merged_neighbor_ranges(data, neighbor_cells, neighbor_count, offset,
+                                 data.cell_neighbor_starts.data(),
+                                 data.cell_neighbor_ends.data());
   });
 
   data.counts.assign(data.num_points, 0);

@@ -26,6 +26,7 @@ inline void neighbor_search_core(
         uniform int n_start = cell_neighbor_starts[neighbor_offset + n];
         uniform int n_end = cell_neighbor_ends[neighbor_offset + n];
 
+#pragma unroll 4
         for (uniform int j = n_start; j < n_end; ++j) {
           uniform float xj = X[j];
           uniform float yj = Y[j];
@@ -35,10 +36,12 @@ inline void neighbor_search_core(
           float dz = zj - qz;
           float dist2 = dx * dx + dy * dy + dz * dz;
 
-          if ((i != j) && (dist2 <= R2)) {
+          if (dist2 <= R2) {
             if (is_write) {
-              uniform int o_idx = orig_idx[j];
-              col_idx[write_offset++] = o_idx;
+              if (i != j) {
+                uniform int o_idx = orig_idx[j];
+                col_idx[write_offset++] = o_idx;
+              }
             } else {
               ++local_count;
             }
@@ -47,7 +50,7 @@ inline void neighbor_search_core(
       }
 
       if (!is_write) {
-        counts[i] = local_count;
+        counts[i] = local_count - 1;
       }
     }
   }
