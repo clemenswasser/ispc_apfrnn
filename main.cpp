@@ -516,3 +516,166 @@ TEST_CASE("cross-set neighbors are monotonic with increasing radius") {
     }
   }
 }
+
+TEST_CASE("same-set randomized stress cases remain exact across seeds") {
+  const std::vector<int> point_counts = {1, 2, 7, 31, 96};
+  const std::vector<float> radii = {0.0f, 0.35f, 0.9f, 1.8f};
+  const std::vector<uint32_t> seeds = {1201u, 1202u, 1203u, 1204u};
+
+  for (int num_points : point_counts) {
+    for (float radius : radii) {
+      for (uint32_t seed : seeds) {
+        auto cloud = apfrnn::support::make_point_cloud(num_points, 5.0f, seed);
+        auto neighbor_data = apfrnn::build_neighbor_search_data(
+            cloud.x, cloud.y, cloud.z, radius);
+        apfrnn::write_neighbors_parallel(neighbor_data);
+
+        CHECK(apfrnn::support::has_valid_row_ptr(neighbor_data));
+
+        for (int point_index = 0; point_index < num_points; ++point_index) {
+          CHECK(
+              apfrnn::support::exact_neighbors_for(cloud, point_index,
+                                                   radius) ==
+              apfrnn::support::ispc_neighbors_for(neighbor_data, point_index));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("cross-set randomized stress cases remain exact across seeds") {
+  const std::vector<int> query_counts = {0, 1, 5, 17, 48};
+  const std::vector<int> target_counts = {1, 3, 19, 64};
+  const std::vector<float> radii = {0.0f, 0.25f, 0.75f, 1.5f};
+  const std::vector<uint32_t> seeds = {2201u, 2202u, 2203u};
+
+  for (int query_points : query_counts) {
+    for (int target_points : target_counts) {
+      for (float radius : radii) {
+        for (uint32_t seed : seeds) {
+          auto query =
+              apfrnn::support::make_point_cloud(query_points, 4.0f, seed);
+          auto target = apfrnn::support::make_point_cloud(target_points, 4.0f,
+                                                          seed + 97u);
+
+          auto target_data = apfrnn::build_neighbor_search_data(
+              target.x, target.y, target.z, radius);
+          auto cross_data = apfrnn::build_cross_neighbor_search_data(
+              query.x, query.y, query.z, target_data, radius);
+          apfrnn::write_cross_neighbors_parallel(cross_data, target_data);
+
+          CHECK(apfrnn::support::has_valid_row_ptr(target_data));
+          CHECK(apfrnn::support::has_valid_row_ptr(cross_data));
+
+          for (int point_index = 0; point_index < query_points; ++point_index) {
+            CHECK(apfrnn::support::exact_cross_neighbors_for(query, point_index,
+                                                             target, radius) ==
+                  apfrnn::support::ispc_neighbors_for(cross_data, point_index));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("same-set chunked range writes match a full parallel write") {
+  constexpr int num_points = 256;
+  constexpr float radius = 1.1f;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 13.0f, 1301);
+  auto chunked =
+      apfrnn::build_neighbor_search_data(cloud.x, cloud.y, cloud.z, radius);
+  auto parallel = chunked;
+
+  const int first_split = chunked.num_cells / 3;
+  const int second_split = (2 * chunked.num_cells) / 3;
+  apfrnn::write_neighbors_range(chunked, 0, first_split);
+  apfrnn::write_neighbors_range(chunked, first_split, second_split);
+  apfrnn::write_neighbors_range(chunked, second_split, chunked.num_cells);
+  apfrnn::write_neighbors_parallel(parallel);
+
+  CHECK(chunked.original_index == parallel.original_index);
+  CHECK(chunked.row_ptr == parallel.row_ptr);
+  CHECK(chunked.col_idx == parallel.col_idx);
+}
+
+TEST_CASE("cross-set chunked range writes match a full parallel write") {
+  constexpr int query_points = 96;
+  constexpr int target_points = 320;
+  constexpr float radius = 1.0f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 9.0f, 1401);
+  auto target = apfrnn::support::make_point_cloud(target_points, 9.0f, 1402);
+  auto target_data =
+      apfrnn::build_neighbor_search_data(target.x, target.y, target.z, radius);
+  auto chunked = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  auto parallel = chunked;
+
+  const int first_split = chunked.num_cells / 3;
+  const int second_split = (2 * chunked.num_cells) / 3;
+  apfrnn::write_cross_neighbors_range(chunked, target_data, 0, first_split);
+  apfrnn::write_cross_neighbors_range(chunked, target_data, first_split,
+                                      second_split);
+  apfrnn::write_cross_neighbors_range(chunked, target_data, second_split,
+                                      chunked.num_cells);
+  apfrnn::write_cross_neighbors_parallel(parallel, target_data);
+
+  CHECK(chunked.original_index == parallel.original_index);
+  CHECK(chunked.row_ptr == parallel.row_ptr);
+  CHECK(chunked.col_idx == parallel.col_idx);
+}
+
+TEST_CASE("translated negative-coordinate clouds preserve same-set neighbors") {
+  constexpr int num_points = 84;
+  constexpr float radius = 0.95f;
+
+  auto base = apfrnn::support::make_point_cloud(num_points, 3.5f, 1501);
+  auto translated = base;
+  translate_cloud(translated, -8.25f, -3.5f, -11.75f);
+
+  auto base_data =
+      apfrnn::build_neighbor_search_data(base.x, base.y, base.z, radius);
+  auto translated_data = apfrnn::build_neighbor_search_data(
+      translated.x, translated.y, translated.z, radius);
+  apfrnn::write_neighbors_parallel(base_data);
+  apfrnn::write_neighbors_parallel(translated_data);
+
+  for (int point_index = 0; point_index < num_points; ++point_index) {
+    CHECK(apfrnn::support::ispc_neighbors_for(base_data, point_index) ==
+          apfrnn::support::ispc_neighbors_for(translated_data, point_index));
+  }
+}
+
+TEST_CASE(
+    "translated negative-coordinate clouds preserve cross-set neighbors") {
+  constexpr int query_points = 40;
+  constexpr int target_points = 72;
+  constexpr float radius = 0.85f;
+
+  auto query = apfrnn::support::make_point_cloud(query_points, 3.0f, 1601);
+  auto target = apfrnn::support::make_point_cloud(target_points, 3.0f, 1602);
+  auto translated_query = query;
+  auto translated_target = target;
+  translate_cloud(translated_query, -6.0f, -9.0f, -2.5f);
+  translate_cloud(translated_target, -6.0f, -9.0f, -2.5f);
+
+  auto target_data =
+      apfrnn::build_neighbor_search_data(target.x, target.y, target.z, radius);
+  auto cross_data = apfrnn::build_cross_neighbor_search_data(
+      query.x, query.y, query.z, target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(cross_data, target_data);
+
+  auto translated_target_data = apfrnn::build_neighbor_search_data(
+      translated_target.x, translated_target.y, translated_target.z, radius);
+  auto translated_cross = apfrnn::build_cross_neighbor_search_data(
+      translated_query.x, translated_query.y, translated_query.z,
+      translated_target_data, radius);
+  apfrnn::write_cross_neighbors_parallel(translated_cross,
+                                         translated_target_data);
+
+  for (int point_index = 0; point_index < query_points; ++point_index) {
+    CHECK(apfrnn::support::ispc_neighbors_for(cross_data, point_index) ==
+          apfrnn::support::ispc_neighbors_for(translated_cross, point_index));
+  }
+}
