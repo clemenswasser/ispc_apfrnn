@@ -2,7 +2,6 @@
 
 #include "kernel_ispc.h"
 
-#include <cmath>
 #include <cstdint>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -20,20 +19,24 @@ inline uint64_t make_key(int cx, int cy, int cz) {
   return (ux << 42) | (uy << 21) | uz;
 }
 
+inline int floor_to_cell(float value) {
+  int cell = static_cast<int>(value);
+  return cell - static_cast<int>(cell > value);
+}
+
 inline void sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
     const std::vector<float> &z, float inv_radius, std::vector<float> &sorted_x,
     std::vector<float> &sorted_y, std::vector<float> &sorted_z,
     IntBuffer &original_index, IntBuffer &cell_starts, IntBuffer &cell_ends,
-    std::vector<SortPointKey> &point_keys, std::vector<uint64_t> &sorted_keys,
-    std::vector<uint64_t> &unique_keys) {
+    std::vector<SortPointKey> &point_keys, std::vector<uint64_t> &unique_keys) {
   int const num_points = static_cast<int>(x.size());
   point_keys.resize(num_points);
 
   tbb::parallel_for(0, num_points, [&](int i) {
-    int cx = static_cast<int>(std::floor(x[i] * inv_radius));
-    int cy = static_cast<int>(std::floor(y[i] * inv_radius));
-    int cz = static_cast<int>(std::floor(z[i] * inv_radius));
+    int cx = floor_to_cell(x[i] * inv_radius);
+    int cy = floor_to_cell(y[i] * inv_radius);
+    int cz = floor_to_cell(z[i] * inv_radius);
     point_keys[i].key = make_key(cx, cy, cz);
     point_keys[i].index = i;
   });
@@ -44,7 +47,6 @@ inline void sort_point_set(
   sorted_y.resize(num_points);
   sorted_z.resize(num_points);
   original_index.resize(num_points);
-  sorted_keys.resize(num_points);
 
   tbb::parallel_for(0, num_points, [&](int i) {
     int idx = point_keys[i].index;
@@ -52,7 +54,6 @@ inline void sort_point_set(
     sorted_y[i] = y[idx];
     sorted_z[i] = z[idx];
     original_index[i] = idx;
-    sorted_keys[i] = point_keys[i].key;
   });
 
   cell_starts.clear();
@@ -62,13 +63,13 @@ inline void sort_point_set(
   cell_ends.reserve(num_points);
   unique_keys.reserve(num_points);
   cell_starts.push_back(0);
-  unique_keys.push_back(sorted_keys[0]);
+  unique_keys.push_back(point_keys[0].key);
 
   for (int i = 1; i < num_points; ++i) {
-    if (sorted_keys[i] != sorted_keys[i - 1]) {
+    if (point_keys[i].key != point_keys[i - 1].key) {
       cell_ends.push_back(i);
       cell_starts.push_back(i);
-      unique_keys.push_back(sorted_keys[i]);
+      unique_keys.push_back(point_keys[i].key);
     }
   }
   cell_ends.push_back(num_points);
@@ -136,7 +137,7 @@ void build_neighbor_search_data_inplace(NeighborSearchData &data,
   sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
                  data.sorted_z, data.original_index, data.cell_starts,
                  data.cell_ends, data.scratch_point_keys,
-                 data.scratch_sorted_keys, data.scratch_unique_keys);
+                 data.scratch_unique_keys);
   auto const &unique_keys = data.scratch_unique_keys;
 
   int num_cells = static_cast<int>(data.cell_starts.size());
@@ -268,7 +269,7 @@ void build_cross_neighbor_search_data_inplace(
   sort_point_set(query_x, query_y, query_z, inv_radius, data.sorted_x,
                  data.sorted_y, data.sorted_z, data.original_index,
                  data.cell_starts, data.cell_ends, data.scratch_point_keys,
-                 data.scratch_sorted_keys, data.scratch_unique_keys);
+                 data.scratch_unique_keys);
   auto const &unique_keys = data.scratch_unique_keys;
 
   data.num_cells = static_cast<int>(data.cell_starts.size());

@@ -60,7 +60,6 @@ struct NeighborSearchData {
   std::vector<uint64_t> hash_keys;
   IntBuffer hash_vals;
   std::vector<SortPointKey> scratch_point_keys;
-  std::vector<uint64_t> scratch_sorted_keys;
   std::vector<uint64_t> scratch_unique_keys;
   IntBuffer scratch_cached_neighbor_cells;
   IntBuffer scratch_cached_neighbor_counts;
@@ -86,7 +85,6 @@ struct CrossNeighborSearchData {
   IntBuffer row_ptr;
   IntBuffer col_idx;
   std::vector<SortPointKey> scratch_point_keys;
-  std::vector<uint64_t> scratch_sorted_keys;
   std::vector<uint64_t> scratch_unique_keys;
   IntBuffer scratch_cached_neighbor_cells;
   IntBuffer scratch_cached_neighbor_counts;
