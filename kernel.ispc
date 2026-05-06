@@ -71,13 +71,14 @@ export void write_neighbors_ispc(
     uniform const int row_ptr[],
     uniform int col_idx[]
 ) {
+    uniform float invR = 1.0f / R;
     for (uniform int i = start_query; i < end_query; ++i) {
         uniform float qx = X[i], qy = Y[i], qz = Z[i];
         uniform int q_orig = orig_idx[i];
         
-        uniform int cx = (int)floor(qx / R);
-        uniform int cy = (int)floor(qy / R);
-        uniform int cz = (int)floor(qz / R);
+        uniform int cx = (int)(qx * invR);
+        uniform int cy = (int)(qy * invR);
+        uniform int cz = (int)(qz * invR);
 
         // Fetch exact starting offset for this particle based on prefix-sum
         uniform int write_offset = row_ptr[q_orig];
