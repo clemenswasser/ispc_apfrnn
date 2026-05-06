@@ -95,9 +95,8 @@ export void write_neighbors_ispc(
                         float dy_p = Y[j] - qy;
                         float dz_p = Z[j] - qz;
                         float dist2 = dx_p*dx_p + dy_p*dy_p + dz_p*dz_p;
-                        if ((i != j) && (dist2 <= R2)) {
-                            col_idx[write_offset + exclusive_scan_add(1)] = orig_idx[j];
-                            write_offset += popcnt(lanemask());
+                        cif ((i != j) && (dist2 <= R2)) {
+                            write_offset += packed_store_active(&col_idx[write_offset], orig_idx[j]);
                         }
                     }
                 }
