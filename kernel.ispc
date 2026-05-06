@@ -95,17 +95,10 @@ export void write_neighbors_ispc(
                         float dy_p = Y[j] - qy;
                         float dz_p = Z[j] - qz;
                         float dist2 = dx_p*dx_p + dy_p*dy_p + dz_p*dz_p;
-                        
-                        bool valid = (i != j) && (dist2 <= R2);
-
-                        if (valid) {
-                            // Hardware-accelerated dense packing
-                            // Scans active lanes to find local vector insertion index (0,1,2..)
-                            int pack_idx = exclusive_scan_add(1);
-                            col_idx[write_offset + pack_idx] = orig_idx[j];
+                        if ((i != j) && (dist2 <= R2)) {
+                            col_idx[write_offset + exclusive_scan_add(1)] = orig_idx[j];
+                            write_offset += popcnt(lanemask());
                         }
-                        // Advance uniform base pointer by total active hits in this vector
-                        write_offset += popcnt(packmask(valid));
                     }
                 }
             }
