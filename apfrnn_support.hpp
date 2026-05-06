@@ -59,6 +59,24 @@ inline std::vector<int> exact_neighbors_for(const PointCloud &cloud,
   return neighbors;
 }
 
+inline std::vector<int>
+exact_cross_neighbors_for(const PointCloud &query_cloud, int query_index,
+                          const PointCloud &target_cloud, float radius) {
+  std::vector<int> neighbors;
+  for (int index = 0; index < static_cast<int>(target_cloud.x.size());
+       ++index) {
+    float dx = query_cloud.x[query_index] - target_cloud.x[index];
+    float dy = query_cloud.y[query_index] - target_cloud.y[index];
+    float dz = query_cloud.z[query_index] - target_cloud.z[index];
+    if (dx * dx + dy * dy + dz * dz <= radius * radius) {
+      neighbors.push_back(index);
+    }
+  }
+
+  std::sort(neighbors.begin(), neighbors.end());
+  return neighbors;
+}
+
 inline int sorted_index_for(const NeighborSearchData &neighbor_data,
                             int original_index) {
   auto sorted_it =
@@ -80,6 +98,50 @@ ispc_neighbors_for(const NeighborSearchData &neighbor_data,
 
   std::sort(neighbors.begin(), neighbors.end());
   return neighbors;
+}
+
+inline std::vector<int>
+ispc_neighbors_for(const CrossNeighborSearchData &neighbor_data,
+                   int original_index) {
+  std::vector<int> neighbors;
+  auto sorted_it =
+      std::find(neighbor_data.original_index.begin(),
+                neighbor_data.original_index.end(), original_index);
+  assert(sorted_it != neighbor_data.original_index.end());
+  int sorted_index =
+      static_cast<int>(sorted_it - neighbor_data.original_index.begin());
+  for (int index = neighbor_data.row_ptr[sorted_index];
+       index < neighbor_data.row_ptr[sorted_index + 1]; ++index) {
+    neighbors.push_back(neighbor_data.col_idx[index]);
+  }
+
+  std::sort(neighbors.begin(), neighbors.end());
+  return neighbors;
+}
+
+template <typename SearchData>
+inline bool has_valid_row_ptr(const SearchData &neighbor_data) {
+  if (neighbor_data.row_ptr.empty()) {
+    return neighbor_data.num_points == 0;
+  }
+
+  if (neighbor_data.row_ptr.size() !=
+      static_cast<std::size_t>(neighbor_data.num_points + 1)) {
+    return false;
+  }
+
+  if (neighbor_data.row_ptr.front() != 0) {
+    return false;
+  }
+
+  for (std::size_t index = 1; index < neighbor_data.row_ptr.size(); ++index) {
+    if (neighbor_data.row_ptr[index] < neighbor_data.row_ptr[index - 1]) {
+      return false;
+    }
+  }
+
+  return neighbor_data.row_ptr.back() ==
+         static_cast<int>(neighbor_data.col_idx.size());
 }
 
 inline std::size_t
