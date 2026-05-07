@@ -20,55 +20,6 @@ inline uint64_t make_key(int cx, int cy, int cz) {
   return (ux << 42) | (uy << 21) | uz;
 }
 
-inline int unpack_coord(uint64_t key, int shift) {
-  int coord =
-      static_cast<int>(static_cast<uint32_t>((key >> shift) & 0x1FFFFF));
-  if (coord & 0x100000) {
-    coord |= 0xFFE00000;
-  }
-  return coord;
-}
-
-inline int find_cell_index(const std::vector<uint64_t> &ht_keys,
-                           const IntBuffer &ht_vals, uint64_t empty_key,
-                           uint32_t hash_mask, uint64_t key) {
-  uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
-  h64 ^= h64 >> 33;
-  uint32_t h = static_cast<uint32_t>(h64) & hash_mask;
-
-  while (true) {
-    uint64_t ht_key = ht_keys[h];
-    if (ht_key == key) {
-      return ht_vals[h];
-    }
-    if (ht_key == empty_key) {
-      return -1;
-    }
-    h = (h + 1) & hash_mask;
-  }
-}
-
-inline int collect_neighbor_cells(const std::vector<uint64_t> &ht_keys,
-                                  const IntBuffer &ht_vals, uint64_t empty_key,
-                                  uint32_t hash_mask, int cx, int cy, int cz,
-                                  int neighbor_cells[27]) {
-  int count = 0;
-  for (int dx = -1; dx <= 1; ++dx) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        int neighbor_cell =
-            find_cell_index(ht_keys, ht_vals, empty_key, hash_mask,
-                            make_key(cx + dx, cy + dy, cz + dz));
-        if (neighbor_cell != -1) {
-          neighbor_cells[count++] = neighbor_cell;
-        }
-      }
-    }
-  }
-
-  return count;
-}
-
 inline int count_merged_neighbor_ranges(const IntBuffer &cell_starts,
                                         const IntBuffer &cell_ends,
                                         const int neighbor_cells[27],
@@ -264,18 +215,20 @@ void build_neighbor_search_data_inplace(NeighborSearchData &data,
   data.cell_num_neighbors.resize(num_cells);
   data.cell_neighbor_offset.resize(num_cells);
 
-  tbb::parallel_for(0, num_cells, [&](int cell) {
-    uint64_t key = unique_keys[cell];
-    int cx = unpack_coord(key, 42);
-    int cy = unpack_coord(key, 21);
-    int cz = unpack_coord(key, 0);
+  tbb::parallel_for(tbb::blocked_range<int>(0, num_cells, 64),
+                    [&](const tbb::blocked_range<int> &range) {
+                      ispc::collect_neighbor_cells_ispc(
+                          range.begin(), range.end(), unique_keys.data(),
+                          data.hash_keys.data(), data.hash_vals.data(),
+                          data.empty_key, data.hash_mask,
+                          data.scratch_cached_neighbor_cells.data(),
+                          data.scratch_cached_neighbor_counts.data());
+                    });
 
+  tbb::parallel_for(0, num_cells, [&](int cell) {
     int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
                           static_cast<std::size_t>(cell) * 27;
-    int neighbor_count =
-        collect_neighbor_cells(data.hash_keys, data.hash_vals, data.empty_key,
-                               data.hash_mask, cx, cy, cz, neighbor_cells);
-    data.scratch_cached_neighbor_counts[cell] = neighbor_count;
+    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
     data.cell_num_neighbors[cell] = count_merged_neighbor_ranges(
         data.cell_starts, data.cell_ends, neighbor_cells, neighbor_count);
   });
@@ -298,12 +251,7 @@ void build_neighbor_search_data_inplace(NeighborSearchData &data,
   data.cell_neighbor_ends.resize(total_cell_neighbors);
 
   tbb::parallel_for(0, num_cells, [&](int cell) {
-    uint64_t key = unique_keys[cell];
-    int cx = unpack_coord(key, 42);
-    int cy = unpack_coord(key, 21);
-    int cz = unpack_coord(key, 0);
     int offset = data.cell_neighbor_offset[cell];
-
     int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
                           static_cast<std::size_t>(cell) * 27;
     int neighbor_count = data.scratch_cached_neighbor_counts[cell];
@@ -393,18 +341,21 @@ void build_cross_neighbor_search_data_inplace(
   data.cell_num_neighbors.resize(data.num_cells);
   data.cell_neighbor_offset.resize(data.num_cells);
 
-  tbb::parallel_for(0, data.num_cells, [&](int cell) {
-    uint64_t key = unique_keys[cell];
-    int cx = unpack_coord(key, 42);
-    int cy = unpack_coord(key, 21);
-    int cz = unpack_coord(key, 0);
+  tbb::parallel_for(tbb::blocked_range<int>(0, data.num_cells, 64),
+                    [&](const tbb::blocked_range<int> &range) {
+                      ispc::collect_neighbor_cells_ispc(
+                          range.begin(), range.end(), unique_keys.data(),
+                          target_data.hash_keys.data(),
+                          target_data.hash_vals.data(), target_data.empty_key,
+                          target_data.hash_mask,
+                          data.scratch_cached_neighbor_cells.data(),
+                          data.scratch_cached_neighbor_counts.data());
+                    });
 
+  tbb::parallel_for(0, data.num_cells, [&](int cell) {
     int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
                           static_cast<std::size_t>(cell) * 27;
-    int neighbor_count = collect_neighbor_cells(
-        target_data.hash_keys, target_data.hash_vals, target_data.empty_key,
-        target_data.hash_mask, cx, cy, cz, neighbor_cells);
-    data.scratch_cached_neighbor_counts[cell] = neighbor_count;
+    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
     data.cell_num_neighbors[cell] = count_merged_neighbor_ranges(
         target_data.cell_starts, target_data.cell_ends, neighbor_cells,
         neighbor_count);
@@ -428,12 +379,7 @@ void build_cross_neighbor_search_data_inplace(
   data.cell_neighbor_ends.resize(total_cell_neighbors);
 
   tbb::parallel_for(0, data.num_cells, [&](int cell) {
-    uint64_t key = unique_keys[cell];
-    int cx = unpack_coord(key, 42);
-    int cy = unpack_coord(key, 21);
-    int cz = unpack_coord(key, 0);
     int offset = data.cell_neighbor_offset[cell];
-
     int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
                           static_cast<std::size_t>(cell) * 27;
     int neighbor_count = data.scratch_cached_neighbor_counts[cell];

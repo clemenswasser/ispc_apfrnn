@@ -1,3 +1,76 @@
+inline varying uint64 make_key_ispc(varying int cx, varying int cy,
+                                    varying int cz) {
+  varying uint64 ux = ((varying uint64)((varying uint32)cx)) & 0x1FFFFFULL;
+  varying uint64 uy = ((varying uint64)((varying uint32)cy)) & 0x1FFFFFULL;
+  varying uint64 uz = ((varying uint64)((varying uint32)cz)) & 0x1FFFFFULL;
+  return (ux << 42) | (uy << 21) | uz;
+}
+
+inline varying int unpack_coord_ispc(varying uint64 key,
+                                     uniform int coord_shift) {
+  varying int coord =
+      (varying int)((varying uint32)((key >> coord_shift) & 0x1FFFFFULL));
+  varying bool is_negative = (coord & 0x100000) != 0;
+  coord = select(is_negative, (varying int)(coord | 0xFFE00000), coord);
+  return coord;
+}
+
+inline varying int find_cell_index_ispc(uniform const uint64 ht_keys[],
+                                        uniform const int ht_vals[],
+                                        uniform uint64 empty_key,
+                                        uniform uint32 hash_mask,
+                                        varying uint64 key) {
+  varying uint64 h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+  h64 ^= h64 >> 33;
+  varying uint32 h = (varying uint32)h64 & hash_mask;
+
+  while (true) {
+    varying uint64 ht_key = ht_keys[h];
+    if (ht_key == key) {
+      return ht_vals[h];
+    }
+    if (ht_key == empty_key) {
+      return -1;
+    }
+    h = (h + 1) & hash_mask;
+  }
+}
+
+export void collect_neighbor_cells_ispc(
+    uniform int start_cell, uniform int end_cell,
+    uniform const uint64 unique_keys[], uniform const uint64 ht_keys[],
+    uniform const int ht_vals[], uniform uint64 empty_key,
+    uniform uint32 hash_mask, uniform int scratch_cached_neighbor_cells[],
+    uniform int scratch_cached_neighbor_counts[]) {
+  foreach (cell = start_cell... end_cell) {
+    varying uint64 key = unique_keys[cell];
+    varying int cx = unpack_coord_ispc(key, 42);
+    varying int cy = unpack_coord_ispc(key, 21);
+    varying int cz = unpack_coord_ispc(key, 0);
+    varying int count = 0;
+
+    for (uniform int dx = -1; dx <= 1; ++dx) {
+      for (uniform int dy = -1; dy <= 1; ++dy) {
+        for (uniform int dz = -1; dz <= 1; ++dz) {
+          varying uint64 neighbor_key =
+              make_key_ispc(cx + dx, cy + dy, cz + dz);
+          varying int neighbor_cell = find_cell_index_ispc(
+              ht_keys, ht_vals, empty_key, hash_mask, neighbor_key);
+
+          varying bool is_present = neighbor_cell != -1;
+          if (is_present) {
+            varying int write_index = cell * 27 + count;
+            scratch_cached_neighbor_cells[write_index] = neighbor_cell;
+          }
+          count += select(is_present, 1, 0);
+        }
+      }
+    }
+
+    scratch_cached_neighbor_counts[cell] = count;
+  }
+}
+
 inline void neighbor_search_core(
     uniform int start_cell, uniform int end_cell,
     uniform const int cell_starts[], uniform const int cell_ends[],
