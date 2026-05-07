@@ -16,12 +16,15 @@ target_compile_options(ispc_apfrnn_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>)
 target_sources(ispc_apfrnn_kernels PUBLIC FILE_SET HEADERS FILES apfrnn.hpp)
 target_link_libraries(ispc_apfrnn_kernels PUBLIC TBB::tbb TBB::tbbmalloc $<TARGET_NAME_IF_EXISTS:TBB::tbbmalloc_proxy>)
+target_compile_features(ispc_apfrnn_kernels PRIVATE cxx_std_17)
 
 add_executable(ispc_apfrnn main.cpp)
 find_package(TBB CONFIG REQUIRED)
 find_package(doctest CONFIG REQUIRED)
 target_link_libraries(ispc_apfrnn PRIVATE ispc_apfrnn_kernels doctest::doctest)
+target_compile_features(ispc_apfrnn PRIVATE cxx_std_17)
 
 add_executable(ispc_apfrnn_bench bench.cpp)
 find_package(benchmark CONFIG REQUIRED)
 target_link_libraries(ispc_apfrnn_bench PRIVATE benchmark::benchmark benchmark::benchmark_main ispc_apfrnn_kernels)
+target_compile_features(ispc_apfrnn_bench PRIVATE cxx_std_17)
