@@ -71,6 +71,38 @@ export void collect_neighbor_cells_ispc(
   }
 }
 
+export void
+count_merged_neighbor_ranges_ispc(uniform int start_cell, uniform int end_cell,
+                                  uniform const int cell_starts[],
+                                  uniform const int cell_ends[],
+                                  uniform const int scratch_neighbor_cells[],
+                                  uniform const int scratch_neighbor_counts[],
+                                  uniform int cell_num_neighbors[]) {
+  foreach (cell = start_cell... end_cell) {
+    varying int count = scratch_neighbor_counts[cell];
+    varying int merged = 0;
+    varying int current_end = -1;
+
+    for (uniform int i = 0; i < 27; ++i) {
+      if (i < count) {
+        varying int neighbor_idx = scratch_neighbor_cells[cell * 27 + i];
+        varying int neighbor_start = cell_starts[neighbor_idx];
+        varying int neighbor_end = cell_ends[neighbor_idx];
+
+        if (current_end == neighbor_start) {
+          current_end = neighbor_end;
+        } else {
+          merged += select(current_end != -1, 1, 0);
+          current_end = neighbor_end;
+        }
+      }
+    }
+
+    merged += select(current_end != -1, 1, 0);
+    cell_num_neighbors[cell] = merged;
+  }
+}
+
 export void write_merged_neighbor_ranges_ispc(
     uniform int start_cell, uniform int end_cell,
     uniform const int cell_starts[], uniform const int cell_ends[],

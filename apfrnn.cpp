@@ -20,36 +20,6 @@ inline uint64_t make_key(int cx, int cy, int cz) {
   return (ux << 42) | (uy << 21) | uz;
 }
 
-inline int count_merged_neighbor_ranges(const IntBuffer &cell_starts,
-                                        const IntBuffer &cell_ends,
-                                        const int neighbor_cells[27],
-                                        int count) {
-  int merged = 0;
-  int current_end = -1;
-
-  for (int i = 0; i < count; ++i) {
-    int neighbor_cell = neighbor_cells[i];
-    int neighbor_start = cell_starts[neighbor_cell];
-    int neighbor_end = cell_ends[neighbor_cell];
-
-    if (current_end == neighbor_start) {
-      current_end = neighbor_end;
-      continue;
-    }
-
-    if (current_end != -1) {
-      ++merged;
-    }
-    current_end = neighbor_end;
-  }
-
-  if (current_end != -1) {
-    ++merged;
-  }
-
-  return merged;
-}
-
 inline void sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
     const std::vector<float> &z, float inv_radius, std::vector<float> &sorted_x,
@@ -190,13 +160,15 @@ void build_neighbor_search_data_inplace(NeighborSearchData &data,
                           data.scratch_cached_neighbor_counts.data());
                     });
 
-  tbb::parallel_for(0, num_cells, [&](int cell) {
-    int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
-                          static_cast<std::size_t>(cell) * 27;
-    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
-    data.cell_num_neighbors[cell] = count_merged_neighbor_ranges(
-        data.cell_starts, data.cell_ends, neighbor_cells, neighbor_count);
-  });
+  tbb::parallel_for(tbb::blocked_range<int>(0, num_cells, 64),
+                    [&](const tbb::blocked_range<int> &range) {
+                      ispc::count_merged_neighbor_ranges_ispc(
+                          range.begin(), range.end(), data.cell_starts.data(),
+                          data.cell_ends.data(),
+                          data.scratch_cached_neighbor_cells.data(),
+                          data.scratch_cached_neighbor_counts.data(),
+                          data.cell_num_neighbors.data());
+                    });
 
   int total_cell_neighbors = tbb::parallel_scan(
       tbb::blocked_range<int>(0, num_cells), 0,
@@ -317,14 +289,16 @@ void build_cross_neighbor_search_data_inplace(
                           data.scratch_cached_neighbor_counts.data());
                     });
 
-  tbb::parallel_for(0, data.num_cells, [&](int cell) {
-    int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
-                          static_cast<std::size_t>(cell) * 27;
-    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
-    data.cell_num_neighbors[cell] = count_merged_neighbor_ranges(
-        target_data.cell_starts, target_data.cell_ends, neighbor_cells,
-        neighbor_count);
-  });
+  tbb::parallel_for(tbb::blocked_range<int>(0, data.num_cells, 64),
+                    [&](const tbb::blocked_range<int> &range) {
+                      ispc::count_merged_neighbor_ranges_ispc(
+                          range.begin(), range.end(),
+                          target_data.cell_starts.data(),
+                          target_data.cell_ends.data(),
+                          data.scratch_cached_neighbor_cells.data(),
+                          data.scratch_cached_neighbor_counts.data(),
+                          data.cell_num_neighbors.data());
+                    });
 
   int total_cell_neighbors = tbb::parallel_scan(
       tbb::blocked_range<int>(0, data.num_cells), 0,
