@@ -71,6 +71,47 @@ export void collect_neighbor_cells_ispc(
   }
 }
 
+export void write_merged_neighbor_ranges_ispc(
+    uniform int start_cell, uniform int end_cell,
+    uniform const int cell_starts[], uniform const int cell_ends[],
+    uniform const int scratch_neighbor_cells[],
+    uniform const int scratch_neighbor_counts[],
+    uniform const int cell_neighbor_offsets[],
+    uniform int global_neighbor_starts[], uniform int global_neighbor_ends[]) {
+  foreach (cell = start_cell... end_cell) {
+    varying int count = scratch_neighbor_counts[cell];
+    varying int offset = cell_neighbor_offsets[cell];
+    varying int current_start = -1;
+    varying int current_end = -1;
+
+    for (uniform int i = 0; i < 27; ++i) {
+      if (i < count) {
+        varying int neighbor_idx = scratch_neighbor_cells[cell * 27 + i];
+        varying int neighbor_start = cell_starts[neighbor_idx];
+        varying int neighbor_end = cell_ends[neighbor_idx];
+
+        if (current_end == neighbor_start) {
+          current_end = neighbor_end;
+        } else {
+          if (current_start != -1) {
+            global_neighbor_starts[offset] = current_start;
+            global_neighbor_ends[offset] = current_end;
+            ++offset;
+          }
+
+          current_start = neighbor_start;
+          current_end = neighbor_end;
+        }
+      }
+    }
+
+    if (current_start != -1) {
+      global_neighbor_starts[offset] = current_start;
+      global_neighbor_ends[offset] = current_end;
+    }
+  }
+}
+
 inline void neighbor_search_core(
     uniform int start_cell, uniform int end_cell,
     uniform const int cell_starts[], uniform const int cell_ends[],

@@ -50,41 +50,6 @@ inline int count_merged_neighbor_ranges(const IntBuffer &cell_starts,
   return merged;
 }
 
-inline void write_merged_neighbor_ranges(const IntBuffer &cell_starts,
-                                         const IntBuffer &cell_ends,
-                                         const int neighbor_cells[27],
-                                         int count, int offset,
-                                         int *neighbor_starts,
-                                         int *neighbor_ends) {
-  int current_start = -1;
-  int current_end = -1;
-
-  for (int i = 0; i < count; ++i) {
-    int neighbor_cell = neighbor_cells[i];
-    int neighbor_start = cell_starts[neighbor_cell];
-    int neighbor_end = cell_ends[neighbor_cell];
-
-    if (current_end == neighbor_start) {
-      current_end = neighbor_end;
-      continue;
-    }
-
-    if (current_start != -1) {
-      neighbor_starts[offset] = current_start;
-      neighbor_ends[offset] = current_end;
-      ++offset;
-    }
-
-    current_start = neighbor_start;
-    current_end = neighbor_end;
-  }
-
-  if (current_start != -1) {
-    neighbor_starts[offset] = current_start;
-    neighbor_ends[offset] = current_end;
-  }
-}
-
 inline void sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
     const std::vector<float> &z, float inv_radius, std::vector<float> &sorted_x,
@@ -250,16 +215,16 @@ void build_neighbor_search_data_inplace(NeighborSearchData &data,
   data.cell_neighbor_starts.resize(total_cell_neighbors);
   data.cell_neighbor_ends.resize(total_cell_neighbors);
 
-  tbb::parallel_for(0, num_cells, [&](int cell) {
-    int offset = data.cell_neighbor_offset[cell];
-    int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
-                          static_cast<std::size_t>(cell) * 27;
-    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
-    write_merged_neighbor_ranges(data.cell_starts, data.cell_ends,
-                                 neighbor_cells, neighbor_count, offset,
-                                 data.cell_neighbor_starts.data(),
-                                 data.cell_neighbor_ends.data());
-  });
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_cells, 64),
+      [&](const tbb::blocked_range<int> &range) {
+        ispc::write_merged_neighbor_ranges_ispc(
+            range.begin(), range.end(), data.cell_starts.data(),
+            data.cell_ends.data(), data.scratch_cached_neighbor_cells.data(),
+            data.scratch_cached_neighbor_counts.data(),
+            data.cell_neighbor_offset.data(), data.cell_neighbor_starts.data(),
+            data.cell_neighbor_ends.data());
+      });
 
   data.counts.resize(data.num_points);
   tbb::parallel_for(
@@ -378,16 +343,17 @@ void build_cross_neighbor_search_data_inplace(
   data.cell_neighbor_starts.resize(total_cell_neighbors);
   data.cell_neighbor_ends.resize(total_cell_neighbors);
 
-  tbb::parallel_for(0, data.num_cells, [&](int cell) {
-    int offset = data.cell_neighbor_offset[cell];
-    int *neighbor_cells = data.scratch_cached_neighbor_cells.data() +
-                          static_cast<std::size_t>(cell) * 27;
-    int neighbor_count = data.scratch_cached_neighbor_counts[cell];
-    write_merged_neighbor_ranges(target_data.cell_starts, target_data.cell_ends,
-                                 neighbor_cells, neighbor_count, offset,
-                                 data.cell_neighbor_starts.data(),
-                                 data.cell_neighbor_ends.data());
-  });
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, data.num_cells, 64),
+      [&](const tbb::blocked_range<int> &range) {
+        ispc::write_merged_neighbor_ranges_ispc(
+            range.begin(), range.end(), target_data.cell_starts.data(),
+            target_data.cell_ends.data(),
+            data.scratch_cached_neighbor_cells.data(),
+            data.scratch_cached_neighbor_counts.data(),
+            data.cell_neighbor_offset.data(), data.cell_neighbor_starts.data(),
+            data.cell_neighbor_ends.data());
+      });
 
   data.counts.resize(data.num_points);
   tbb::parallel_for(
