@@ -12,6 +12,9 @@ endif()
 project(ispc_apfrnn LANGUAGES CXX ISPC)
 
 option(APFRNN_BUILD_TESTS "Build the doctest suite" ${PROJECT_IS_TOP_LEVEL})
+option(APFRNN_BUILD_BENCHMARKS "Build the Google Benchmark targets" ${PROJECT_IS_TOP_LEVEL})
+option(APFRNN_BUILD_BASELINES
+  "Build the CompactNSearch/TreeNSearch comparison benchmarks" OFF)
 # The SYCL backend needs the whole tree to be configured with icpx: one CMake
 # tree has one C++ compiler, and CPU and GPU code are linked statically.
 option(APFRNN_ENABLE_SYCL "Build the optional static SYCL GPU backend (requires icpx)" OFF)
@@ -65,4 +68,8 @@ endif()
 if(APFRNN_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(APFRNN_BUILD_BENCHMARKS OR APFRNN_BUILD_BASELINES)
+  add_subdirectory(bench)
 endif()
