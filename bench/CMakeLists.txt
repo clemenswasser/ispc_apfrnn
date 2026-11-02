@@ -1,7 +1,7 @@
 find_package(benchmark CONFIG REQUIRED)
 
 if(APFRNN_BUILD_BENCHMARKS)
-  add_executable(ispc_apfrnn_bench search_bench.cpp)
+  add_executable(ispc_apfrnn_bench search_bench.cpp api_bench.cpp)
   target_link_libraries(ispc_apfrnn_bench PRIVATE
     apfrnn_support benchmark::benchmark)
 endif()

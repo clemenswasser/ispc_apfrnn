@@ -1,16 +1,18 @@
-// Frame-time benchmark of every neighbor-search backend on every scene.
+// Frame-time benchmark of every neighbor-search backend on every scene, plus
+// the NSearch-API scenarios (Api/...).
 //
-// Benchmarks are named Frame/<backend>/<scene> and Threads/<backend>/
-// uniform_200k/<threads>, so --benchmark_filter selects by backend or scene.
-// Each run times frames after one warm-up frame. That first frame is also
-// validated (see validate()): the label carries a checksum of the neighbor
-// pairs clearly within the radius, which must be equal for all backends on a
-// scene, and FalsePositives must be 0.
+// Benchmarks are named Frame/<backend>/<scene>, Threads/<backend>/<scene>/
+// <threads> and Api/<scenario>/<scene>, so --benchmark_filter selects by
+// family, backend or scene. Each Frame run times frames after one warm-up
+// frame. That first frame is also validated (see validate()): the label
+// carries a checksum of the neighbor pairs clearly within the radius, which
+// must be equal for all backends on a scene, and FalsePositives must be 0.
 //
 //   --learnsph_res=DIR  learnsph/res with the saved frames (default
 //                       ../learnsph/res); scenes whose files are missing are
 //                       skipped.
 
+#include "api_bench.hpp"
 #include "backends.hpp"
 #include "scenes.hpp"
 
@@ -31,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -224,21 +227,34 @@ int main(int argc, char **argv) {
           ->UseRealTime();
     }
   }
-  const SceneSpec scaling = apfrnn::bench::synthetic_scene(
-      apfrnn::bench::Distribution::Uniform, 200000);
-  for (const BackendSpec &backend : backends) {
-    if (!backend.uses_cpu_threads) {
-      continue;
-    }
-    for (int threads : {1, 2, 4, 8, 16}) {
-      benchmark::RegisterBenchmark("Threads/" + backend.name + "/" +
-                                       scaling.name + "/" +
-                                       std::to_string(threads),
-                                   frames, scaling, backend, threads)
-          ->Unit(benchmark::kMillisecond)
-          ->UseRealTime();
+  // Thread scaling on the CPU backends: the 200k scene across the core counts,
+  // and 1M where the memory system starts to matter. Scenes are registered in
+  // groups so cached_scene() keeps the scene alive between backends.
+  const std::vector<std::pair<SceneSpec, std::vector<int>>> scaling = {
+      {apfrnn::bench::synthetic_scene(apfrnn::bench::Distribution::Uniform,
+                                      200000),
+       {1, 2, 4, 8, 16}},
+      {apfrnn::bench::synthetic_scene(apfrnn::bench::Distribution::Uniform,
+                                      1000000),
+       {8, 16}},
+  };
+  for (const auto &[scaling_scene, thread_counts] : scaling) {
+    for (const BackendSpec &backend : backends) {
+      if (!backend.uses_cpu_threads) {
+        continue;
+      }
+      for (int threads : thread_counts) {
+        benchmark::RegisterBenchmark("Threads/" + backend.name + "/" +
+                                         scaling_scene.name + "/" +
+                                         std::to_string(threads),
+                                     frames, scaling_scene, backend, threads)
+            ->Unit(benchmark::kMillisecond)
+            ->UseRealTime();
+      }
     }
   }
+
+  apfrnn::bench::register_api_benchmarks();
 
   benchmark::RunSpecifiedBenchmarks();
   benchmark::Shutdown();
