@@ -12,6 +12,9 @@ endif()
 project(ispc_apfrnn LANGUAGES CXX ISPC)
 
 option(APFRNN_BUILD_TESTS "Build the doctest suite" ${PROJECT_IS_TOP_LEVEL})
+# The SYCL backend needs the whole tree to be configured with icpx: one CMake
+# tree has one C++ compiler, and CPU and GPU code are linked statically.
+option(APFRNN_ENABLE_SYCL "Build the optional static SYCL GPU backend (requires icpx)" OFF)
 
 find_package(TBB CONFIG REQUIRED)
 
@@ -30,6 +33,26 @@ target_compile_options(ispc_apfrnn_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>)
 target_link_libraries(ispc_apfrnn_kernels PUBLIC
   TBB::tbb TBB::tbbmalloc $<TARGET_NAME_IF_EXISTS:TBB::tbbmalloc_proxy>)
+
+if(APFRNN_ENABLE_SYCL)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
+    message(FATAL_ERROR
+      "APFRNN_ENABLE_SYCL=ON requires the Intel oneAPI C++ compiler. "
+      "Configure with -DCMAKE_CXX_COMPILER=icpx after sourcing setvars.sh.")
+  endif()
+  find_package(IntelSYCL REQUIRED)
+
+  add_library(apfrnn_sycl STATIC src/sycl/apfrnn_sycl.cpp)
+  target_include_directories(apfrnn_sycl PUBLIC src/sycl)
+  target_link_libraries(apfrnn_sycl PUBLIC IntelSYCL::SYCL_CXX)
+  target_compile_features(apfrnn_sycl PRIVATE cxx_std_17)
+  set_target_properties(apfrnn_sycl PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  target_compile_definitions(ispc_apfrnn_kernels PUBLIC APFRNN_HAVE_SYCL=1)
+  # Link-only: the SYCL runtime is needed at the final link, but its -fsycl
+  # usage requirements must not reach the ISPC kernel source.
+  target_link_libraries(ispc_apfrnn_kernels PRIVATE $<LINK_ONLY:apfrnn_sycl>)
+endif()
 
 if(APFRNN_BUILD_TESTS OR APFRNN_BUILD_BENCHMARKS OR APFRNN_BUILD_BASELINES)
   # Synthetic scenes and VTK loading shared by tests and benchmarks, which also
