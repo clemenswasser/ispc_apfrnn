@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 31,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "cpu-release",
+      "displayName": "CPU Exact (default compiler, no SYCL)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APFRNN_ENABLE_SYCL": "OFF"
+      }
+    },
+    {
+      "name": "sycl-release",
+      "displayName": "Static SYCL backend (Intel oneAPI icpx)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-sycl",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "icpx",
+        "APFRNN_ENABLE_SYCL": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release"
+    },
+    {
+      "name": "sycl-release",
+      "configurePreset": "sycl-release"
+    }
+  ]
+}
