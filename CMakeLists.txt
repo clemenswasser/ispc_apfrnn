@@ -15,9 +15,12 @@ find_package(TBB CONFIG REQUIRED)
 
 add_library(ispc_apfrnn_kernels
   src/apfrnn.cpp
+  src/neighbor_search.cpp
   src/plan.cpp
   src/sweep.cpp
   src/kernel.ispc)
+target_sources(ispc_apfrnn_kernels PUBLIC
+  FILE_SET HEADERS BASE_DIRS include FILES include/apfrnn/neighbor_search.hpp)
 target_compile_features(ispc_apfrnn_kernels PUBLIC cxx_std_17)
 target_compile_options(ispc_apfrnn_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Debug>>:-O3>>
