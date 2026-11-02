@@ -35,6 +35,7 @@ struct DeviceGrid {
   AosPoint *aos = nullptr;
   int *starts = nullptr;
   int *counts = nullptr;
+  int max_cell = 0;
 };
 
 inline int cell_coord(float v, float origin, float inv_radius, int count) {
@@ -374,6 +375,7 @@ DeviceGrid build_grid_gpu(sycl::queue &q, const float *xyz, int n,
   for (std::size_t c = 0; c < g.cell_count; ++c) {
     starts[c] = sum;
     sum += counts[c];
+    g.max_cell = std::max(g.max_cell, counts[c]);
   }
   q.memcpy(g.starts, starts.data(), g.cell_count * sizeof(int));
   q.memcpy(dcursor, starts.data(), g.cell_count * sizeof(int));
@@ -1071,26 +1073,54 @@ int apfrnn_sycl_exact_pair(ApfrnnSyclContext *ctx,
       }
     }
 
-    int64_t total = -1;
-    if (target_grid != nullptr && query_grid != nullptr) {
-      // Grouped-query ESIMD for same-set grids up to 500k (the ones built
-      // with an AoS copy), the cell-major SIMT kernel otherwise.
-      const bool defer_same = defer_copy != 0 && same_set != 0;
-      if (same_set == 0) {
-        total = search_pair_cross_cell_major(*q, *ctx, *query_grid,
-                                             *target_grid, slot);
-      } else if (target_grid->aos != nullptr) {
-        total = search_pair_same_group16(*q, *ctx, *target_grid, slot,
-                                         defer_same);
-      } else {
-        total = search_pair_same_cell_major(*q, *ctx, *target_grid, slot,
-                                            defer_same);
+    // The temporary grids are still needed by the kernels below. Free them
+    // when this scope ends, including when a launch throws.
+    struct FreeTemporaries {
+      sycl::queue &queue;
+      CachedGrid &target;
+      CachedGrid &query;
+      ~FreeTemporaries() {
+        free_grid(queue, target.grid);
+        free_grid(queue, query.grid);
       }
-    }
-    free_grid(*q, target_tmp.grid);
-    free_grid(*q, query_tmp.grid);
+    } free_temporaries{*q, target_tmp, query_tmp};
     if (target_grid == nullptr || query_grid == nullptr) {
       return 3;
+    }
+    // One work item walks one cell's queries against the 27 neighboring
+    // cells, so a dense cell concentrates its whole neighborhood in a single
+    // item and can reset the device (which then stays lost for the rest of
+    // the process). Reject it and let the caller fall back to the CPU.
+    constexpr int64_t kMaxCellComparisons = 64LL * 1024 * 1024;
+    const auto neighborhood_bound = [](const DeviceGrid &grid) {
+      return std::min<int64_t>(int64_t{27} * grid.max_cell,
+                               static_cast<int64_t>(grid.n));
+    };
+    const bool too_dense =
+        same_set != 0
+            ? static_cast<int64_t>(target_grid->max_cell) *
+                      neighborhood_bound(*target_grid) >
+                  kMaxCellComparisons
+            : static_cast<int64_t>(query_grid->max_cell) *
+                      neighborhood_bound(*target_grid) >
+                  kMaxCellComparisons;
+    if (too_dense) {
+      return 8;
+    }
+
+    int64_t total = -1;
+    // Grouped-query ESIMD for same-set grids up to 500k (the ones built with
+    // an AoS copy), the cell-major SIMT kernel otherwise.
+    const bool defer_same = defer_copy != 0 && same_set != 0;
+    if (same_set == 0) {
+      total = search_pair_cross_cell_major(*q, *ctx, *query_grid,
+                                           *target_grid, slot);
+    } else if (target_grid->aos != nullptr) {
+      total = search_pair_same_group16(*q, *ctx, *target_grid, slot,
+                                       defer_same);
+    } else {
+      total = search_pair_same_cell_major(*q, *ctx, *target_grid, slot,
+                                          defer_same);
     }
     if (total < 0) {
       return 7;
