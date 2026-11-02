@@ -15,6 +15,7 @@ find_package(TBB CONFIG REQUIRED)
 
 add_library(ispc_apfrnn_kernels
   src/apfrnn.cpp
+  src/sweep.cpp
   src/kernel.ispc)
 target_compile_features(ispc_apfrnn_kernels PUBLIC cxx_std_17)
 target_compile_options(ispc_apfrnn_kernels PRIVATE
