@@ -785,14 +785,22 @@ export void csr_rows(
     foreach (i = queries.starts[cell]... queries.ends[cell]) {
       const float<3> q = point_at(qpts, i);
       int count = 0;
-      int slot = write ? row_ptr[i] : 0;
+      // Keep the row-local offset small and form the row base in 64-bit:
+      // a CSR offset past 2^29 entries would otherwise sign-extend a 32-bit
+      // byte offset and address before the buffer.
+      int slot = 0;
+      int * row = write ? col_idx + (int64)row_ptr[i] : NULL;
       for (uniform int run = 0; run < num_runs; ++run) {
         const uniform int end = ranges.ends[first + run];
 #pragma unroll 4
         for (uniform int j = ranges.starts[first + run]; j < end; ++j) {
-          if (length_sq(point_at(tpts, j) - q) <= r2 && (!same_set || i != j)) {
+          // Compute the predicate once: the count and write passes must agree
+          // exactly, or the write can run past the counted row.
+          const bool hit =
+              length_sq(point_at(tpts, j) - q) <= r2 && (!same_set || i != j);
+          if (hit) {
             if (write) {
-              col_idx[slot++] = tpts.index[j];
+              row[slot++] = tpts.index[j];
             } else {
               ++count;
             }

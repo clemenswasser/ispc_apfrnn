@@ -33,7 +33,8 @@ target_compile_features(ispc_apfrnn_kernels PUBLIC cxx_std_17)
 target_compile_options(ispc_apfrnn_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Debug>>:-O3>>
   $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Release>>:-g>>
-  $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>)
+  $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>
+  $<$<COMPILE_LANGUAGE:ISPC>:--addressing=64>)
 target_link_libraries(ispc_apfrnn_kernels PUBLIC
   TBB::tbb TBB::tbbmalloc $<TARGET_NAME_IF_EXISTS:TBB::tbbmalloc_proxy>)
 

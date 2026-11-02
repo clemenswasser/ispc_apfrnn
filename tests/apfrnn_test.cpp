@@ -1,8 +1,18 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 
 #include "point_cloud.hpp"
+#include "kernel_ispc.h"
 
 #include <doctest/doctest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -32,6 +42,75 @@ void translate_cloud(apfrnn::support::PointCloud &cloud, float dx, float dy,
 }
 
 } // namespace
+
+TEST_CASE("CSR writer forms the row base in 64-bit") {
+  // The 32-bit addressing bug only appears when a row offset passes 2^29
+  // int32 entries (2 GiB). Reserve 4 GiB of address space, map only the
+  // target and the address the old 32-bit arithmetic would wrap to, and call
+  // the real ISPC kernel with row_ptr = 2^29. No 2 GiB allocation is needed.
+#if defined(__linux__)
+  constexpr std::size_t kPage = 4096;
+  constexpr std::size_t kDelta = std::size_t{1} << 31;   // 2 GiB of bytes
+  constexpr std::size_t kTargetOffset = std::size_t{4} << 30;  // 4 GiB
+  const std::size_t reserve = kTargetOffset + kPage;
+
+  void *base = mmap(nullptr, reserve, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  REQUIRE(base != MAP_FAILED);
+  void *wrong = mmap(base, kPage, PROT_READ | PROT_WRITE,
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *target = mmap(static_cast<char *>(base) + kTargetOffset, kPage,
+                      PROT_READ | PROT_WRITE,
+                      MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(wrong != MAP_FAILED);
+  REQUIRE(target != MAP_FAILED);
+
+  constexpr int kWrongSentinel = 0x5a5a5a5a;
+  int *wrong_page = static_cast<int *>(wrong);
+  int *target_page = static_cast<int *>(target);
+  *wrong_page = kWrongSentinel;
+  *target_page = 0;
+
+  int cell_starts[1] = {0};
+  int cell_ends[1] = {1};
+  uint64_t cell_keys[1] = {0};
+  ispc::Cells queries{cell_starts, cell_ends, cell_keys};
+
+  int range_offset[1] = {0};
+  int range_count[1] = {1};
+  int range_starts[1] = {0};
+  int range_ends[1] = {1};
+  ispc::CellRanges ranges{range_offset, range_count, range_starts,
+                          range_ends};
+
+  float qx[1] = {0.0f};
+  float qy[1] = {0.0f};
+  float qz[1] = {0.0f};
+  int qindex[1] = {0};
+  ispc::Points qpts{qx, qy, qz, qindex};
+
+  float tx[1] = {0.0f};
+  float ty[1] = {0.0f};
+  float tz[1] = {0.0f};
+  int tindex[1] = {42};
+  ispc::Points tpts{tx, ty, tz, tindex};
+
+  int counts[1] = {0};
+  const int row_ptr[1] = {1 << 29};
+  int *col_idx =
+      reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(target) - kDelta);
+
+  ispc::csr_rows(0, 1, &queries, &ranges, &qpts, &tpts, false, 1.0f, counts,
+                 row_ptr, col_idx);
+
+  // The 64-bit row base must land on the target page. The old 32-bit byte
+  // arithmetic wraps to target - 4 GiB, i.e. the wrong page.
+  CHECK(target_page[0] == 42);
+  CHECK(wrong_page[0] == kWrongSentinel);
+
+  munmap(base, reserve);
+#endif
+}
 
 TEST_CASE(
     "neighbor search matches brute force for a deterministic point cloud") {
