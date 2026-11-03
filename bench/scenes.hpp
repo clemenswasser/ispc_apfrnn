@@ -105,13 +105,40 @@ inline SceneSpec vtk_scene(const std::string &name, const std::string &fluid,
           }};
 }
 
+// Uniformly distributed point sets with every pair active; tests per-pair
+// overhead and grid reuse across many sets.
+inline SceneSpec many_set_scene(const std::string &name, int sets,
+                                int points_per_set) {
+  return {name, [=] {
+            SceneData data;
+            data.radius = 2.0f;
+            const float side =
+                std::cbrt(static_cast<float>(sets * points_per_set));
+            for (int set = 0; set < sets; ++set) {
+              data.xyz.push_back(interleave(apfrnn::support::make_point_cloud(
+                  points_per_set, side, 1001 + 17 * set)));
+            }
+            data.is_static.assign(static_cast<std::size_t>(sets), false);
+            for (int query = 0; query < sets; ++query) {
+              for (int target = 0; target < sets; ++target) {
+                data.pairs.emplace_back(query, target);
+              }
+            }
+            return data;
+          }};
+}
+
 inline std::vector<SceneSpec> synthetic_scenes() {
   using D = Distribution;
   std::vector<SceneSpec> scenes;
+  for (int n : {1000, 10000}) {
+    scenes.push_back(synthetic_scene(D::Uniform, n));
+  }
+  scenes.push_back(synthetic_scene(D::Clustered, 10000));
   for (int n : {50000, 200000}) {
-    for (D d : {D::Uniform, D::JitteredLattice, D::Clustered, D::Slab,
-                D::SlabThin, D::HugeDomain, D::Surface, D::ThinPipe,
-                D::TwoScale}) {
+    for (D d : {D::Uniform, D::JitteredLattice, D::Lattice, D::Clustered,
+                D::Slab, D::SlabThin, D::HugeDomain, D::Surface,
+                D::ThinPipe, D::TwoScale}) {
       scenes.push_back(synthetic_scene(d, n));
     }
     scenes.push_back(synthetic_scene(D::Uniform, n, Motion::SmallMove));
@@ -119,6 +146,22 @@ inline std::vector<SceneSpec> synthetic_scenes() {
   }
   scenes.push_back(synthetic_scene(D::Uniform, 1000000));
   scenes.push_back(synthetic_scene(D::Pathological, 10000));
+  return scenes;
+}
+
+// Regimes outside the headline matrix: large high-degree sets where the
+// default memory budget forces CSR, larger uniform sets, and many point sets
+// with every pair active. Kept separate so a normal run stays focused.
+inline std::vector<SceneSpec> stress_scenes() {
+  using D = Distribution;
+  std::vector<SceneSpec> scenes;
+  scenes.push_back(synthetic_scene(D::Clustered, 500000));
+  scenes.push_back(synthetic_scene(D::Clustered, 1000000));
+  scenes.push_back(synthetic_scene(D::TwoScale, 1000000));
+  scenes.push_back(synthetic_scene(D::Uniform, 2000000));
+  scenes.push_back(many_set_scene("many_sets_20k", 8, 2500));
+  scenes.push_back(many_set_scene("many_sets_100k", 8, 12500));
+  scenes.push_back(many_set_scene("many_sets_16x1250", 16, 1250));
   return scenes;
 }
 

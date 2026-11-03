@@ -42,6 +42,12 @@ struct BackendSpec {
   bool uses_cpu_threads = true;
 };
 
+// Set by --memory_budget_mb=N; 0 keeps the library default.
+inline int64_t &benchmark_memory_budget_mb() {
+  static int64_t mb = 0;
+  return mb;
+}
+
 class ApfrnnBackend final : public Backend {
 public:
   explicit ApfrnnBackend(SearchBackend backend) : backend_(backend) {}
@@ -49,6 +55,9 @@ public:
   void setup(const SceneData &scene) override {
     search_ = std::make_unique<NSearch>(scene.radius);
     search_->set_search_backend(backend_);
+    if (benchmark_memory_budget_mb() > 0) {
+      search_->set_memory_budget(benchmark_memory_budget_mb() << 20);
+    }
     for (std::size_t set = 0; set < scene.xyz.size(); ++set) {
       search_->add_point_set(scene.xyz[set].data(),
                              scene.points(static_cast<int>(set)),

@@ -1,16 +1,20 @@
-// Frame-time benchmark of every neighbor-search backend on every scene, plus
-// the NSearch-API scenarios (Api/...).
+// Frame-time benchmark of every neighbor-search backend on the headline and
+// stress scenes, plus the NSearch-API scenarios (Api/...).
 //
-// Benchmarks are named Frame/<backend>/<scene>, Threads/<backend>/<scene>/
-// <threads> and Api/<scenario>/<scene>, so --benchmark_filter selects by
-// family, backend or scene. Each Frame run times frames after one warm-up
-// frame. That first frame is also validated (see validate()): the label
-// carries a checksum of the neighbor pairs clearly within the radius, which
-// must be equal for all backends on a scene, and FalsePositives must be 0.
+// Benchmarks are named Frame/<backend>/<scene>, Stress/<backend>/<scene>,
+// Threads/<backend>/<scene>/<threads> and Api/<scenario>/<scene>, so
+// --benchmark_filter selects by family, backend or scene. Each Frame run
+// times frames after one warm-up frame. That first frame is also validated
+// (see validate()): the label carries a checksum of the neighbor pairs
+// clearly within the radius, which must be equal for all backends on a
+// scene, and FalsePositives must be 0. Stress holds the regimes outside the
+// headline matrix (large high-degree sets, many active pairs).
 //
-//   --learnsph_res=DIR  learnsph/res with the saved frames (default
-//                       ../learnsph/res); scenes whose files are missing are
-//                       skipped.
+//   --learnsph_res=DIR       learnsph/res with the saved frames (default
+//                            ../learnsph/res); scenes whose files are missing
+//                            are skipped.
+//   --memory_budget_mb=N     cap on one fixed-row allocation (library default
+//                            when omitted); useful to compare CSR fallback.
 
 #include "api_bench.hpp"
 #include "backends.hpp"
@@ -199,8 +203,12 @@ int main(int argc, char **argv) {
   std::vector<char *> args;
   for (int i = 0; i < argc; ++i) {
     constexpr const char *kRes = "--learnsph_res=";
+    constexpr const char *kBudget = "--memory_budget_mb=";
     if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
       learnsph_res = argv[i] + std::strlen(kRes);
+    } else if (std::strncmp(argv[i], kBudget, std::strlen(kBudget)) == 0) {
+      apfrnn::bench::benchmark_memory_budget_mb() =
+          std::stoll(argv[i] + std::strlen(kBudget));
     } else {
       args.push_back(argv[i]);
     }
@@ -218,15 +226,20 @@ int main(int argc, char **argv) {
     scenes.push_back(std::move(scene));
   }
 
-  for (const SceneSpec &scene : scenes) {
-    for (const BackendSpec &backend : backends) {
-      benchmark::RegisterBenchmark(
-          "Frame/" + backend.name + "/" + scene.name, frames, scene, backend,
-          0)
-          ->Unit(benchmark::kMillisecond)
-          ->UseRealTime();
+  auto register_family = [&](const char *family,
+                             const std::vector<SceneSpec> &family_scenes) {
+    for (const SceneSpec &scene : family_scenes) {
+      for (const BackendSpec &backend : backends) {
+        benchmark::RegisterBenchmark(
+            std::string(family) + "/" + backend.name + "/" + scene.name, frames,
+            scene, backend, 0)
+            ->Unit(benchmark::kMillisecond)
+            ->UseRealTime();
+      }
     }
-  }
+  };
+  register_family("Frame", scenes);
+  register_family("Stress", apfrnn::bench::stress_scenes());
   // Thread scaling on the CPU backends: the 200k scene across the core counts,
   // and 1M where the memory system starts to matter. Scenes are registered in
   // groups so cached_scene() keeps the scene alive between backends.

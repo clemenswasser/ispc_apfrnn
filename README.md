@@ -237,12 +237,16 @@ scene list when their files exist.
 ```sh
 ./scripts/bench.sh build        # headline comparison against the baselines
 ./scripts/bench_gpu.sh build-sycl  # CPU vs GPU vs Auto (SYCL build)
+./build/bench/ispc_apfrnn_bench --benchmark_filter='^Stress/'
 ./build/bench/ispc_apfrnn_bench --benchmark_filter='^Api/'
 ```
 
-`ispc_apfrnn_bench` has three benchmark families:
+`ispc_apfrnn_bench` has four benchmark families:
 
-- `Frame/<backend>/<scene>` runs every backend on every scene.
+- `Frame/<backend>/<scene>` runs every backend on the headline scenes.
+- `Stress/<backend>/<scene>` extends the matrix to 500k-2M high-degree sets
+  and 8-16 point sets with every pair active; these are the regimes outside
+  the headline scenes.
 - `Threads/<backend>/<scene>/<threads>` is CPU thread scaling (200k across 1,
   2, 4, 8 and 16 threads, 1M across 8 and 16).
 - `Api/<scenario>/<scene>` covers the NSearch-API scenarios: static, small and
@@ -253,11 +257,21 @@ scene list when their files exist.
 `--benchmark_filter` selects by family, backend or scene. The backends are
 `apfrnn_cpu`, `apfrnn_gpu` and `apfrnn_auto` (the GPU pair only in a SYCL build
 with a GPU), plus `tree` and `compact` in a baseline build. The Frame scenes
-are the synthetic distributions uniform, jittered lattice, clustered, slab,
-lattice, pathological, huge domain, surface, thin pipe, two-scale and thin slab
-at 50k and 200k, uniform at 1M, the moving variants, and any learnsph frames
-found under `--learnsph_res` (default `../learnsph/res`). `scripts/bench.sh`
-accepts `APFRNN_FILTER` and `APFRNN_CPUS`.
+are the synthetic distributions uniform, jittered lattice, lattice, clustered,
+slab, thin slab, huge domain, surface, thin pipe and two-scale at 50k and
+200k, uniform at 1k/10k/1M, clustered at 10k, pathological at 10k, the moving
+variants, and any learnsph frames found under `--learnsph_res` (default
+`../learnsph/res`). `scripts/bench.sh` accepts `APFRNN_FILTER` and
+`APFRNN_CPUS`.
+
+`--memory_budget_mb=N` overrides the library's fixed-row cap. The default is
+3 GiB, and raising it keeps large high-degree scenes on the fixed-row writer
+instead of the slower CSR fallback.
+
+The Stress scenes are deliberately outside the headline set: they include the
+current scaling gaps (large high-degree sets on the CSR fallback and many
+all-pairs sets), so improvements can be measured without changing the headline
+comparison.
 
 ## Development
 
