@@ -253,6 +253,8 @@ inline std::vector<SceneSpec> synthetic_scenes() {
     scenes.push_back(synthetic_scene(d, 200000, Motion::LargeMove));
     scenes.push_back(jittered_scene(d, 200000));
   }
+  scenes.push_back(jittered_scene(D::Clustered, 200000));
+  scenes.push_back(jittered_scene(D::ThinPipe, 50000));
   scenes.push_back(boundary_query_scene(D::Slab, 200000));
   scenes.push_back(probe_scene(200000));
   scenes.push_back(probe_scene(1000000));
