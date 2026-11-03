@@ -24,6 +24,8 @@ namespace apfrnn {
 
 namespace {
 
+constexpr int kPairParallelMaxPoints = 32768;
+
 SearchBackend search_backend_from_env() {
   const char *backend = std::getenv("APFRNN_BACKEND");
   if (backend == nullptr) {
@@ -354,43 +356,155 @@ void NSearch::run() {
   build_point_sets(is_source, needs_same_set);
   last_stats_.sync_build_ms = elapsed_ms(build_start);
 
+  auto build_cpu_pair = [&](Pair &pair, int set_i, int set_j) {
+    if (set_i == set_j) {
+      build_same_pair(pair, set_i);
+    } else {
+      build_cross_pair(pair, set_i, set_j);
+    }
+  };
+
+  int pair_count = 0;
+  int max_pair_points = 0;
   for (int set_i = 0; set_i < set_count; ++set_i) {
     for (int set_j = 0; set_j < set_count; ++set_j) {
-      Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
-                         [static_cast<std::size_t>(set_j)];
+      const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                               [static_cast<std::size_t>(set_j)];
       if (!pair.active || pair.valid) {
         continue;
       }
+      ++pair_count;
+      max_pair_points = std::max(
+          max_pair_points,
+          std::max(sets_[static_cast<std::size_t>(set_i)].data.num_points,
+                   sets_[static_cast<std::size_t>(set_j)].data.num_points));
+    }
+  }
 
-      const auto pair_start = std::chrono::steady_clock::now();
-      if (effective_backend_ == SearchBackend::GpuExact) {
-        const bool defer_same = set_i == set_j;
-        if (!build_gpu_pair(pair, set_i, set_j, defer_same)) {
-          // The GPU path is an opt-in accelerator; on any failure restart the
-          // run on the canonical CPU Exact path. Drain any copy already
-          // queued for an earlier pair first.
-#ifdef APFRNN_HAVE_SYCL
-          apfrnn_sycl_wait(gpu_ ? gpu_->context : nullptr);
-#endif
-          set_search_backend(SearchBackend::CpuExact);
-          run();
-          return;
-        }
-      } else if (set_i == set_j) {
-        build_same_pair(pair, set_i);
-      } else {
-        build_cross_pair(pair, set_i, set_j);
+  // Small pairs each start their own TBB region, so a scene with many sets
+  // spends more time waking workers than searching. Run those pairs as one
+  // parallel job; large pairs keep the intra-pair parallelism.
+  bool pair_parallel =
+      effective_backend_ == SearchBackend::CpuExact && pair_count > 4 &&
+      max_pair_points <= kPairParallelMaxPoints;
+  if (pair_parallel) {
+    for (const PointSet &point_set : sets_) {
+      if (point_set.use_sweep) {
+        pair_parallel = false;
+        break;
       }
+    }
+  }
+  if (pair_parallel) {
+    struct Job {
+      int set_i;
+      int set_j;
+    };
+    std::vector<Job> jobs;
+    jobs.reserve(static_cast<std::size_t>(pair_count));
+    for (int set_i = 0; set_i < set_count; ++set_i) {
+      for (int set_j = 0; set_j < set_count; ++set_j) {
+        const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                                 [static_cast<std::size_t>(set_j)];
+        if (pair.active && !pair.valid) {
+          jobs.push_back(Job{set_i, set_j});
+        }
+      }
+    }
+    for (const Job &job : jobs) {
+      ensure_point_blocks(sets_[static_cast<std::size_t>(job.set_j)].data);
+    }
 
-      const double pair_ms = elapsed_ms(pair_start);
-      if (set_i == set_j) {
+    std::vector<double> pair_times(jobs.size(), 0.0);
+    parallel_pairs_ = true;
+    parallel_overflows_.store(0, std::memory_order_relaxed);
+    // Same-set pairs establish each source's fitted capacity and write the
+    // point-set rows. They touch one set each, so run them in parallel, then
+    // let cross pairs read the settled sets.
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, jobs.size(), 1),
+        [&](const tbb::blocked_range<std::size_t> &range) {
+          for (std::size_t index = range.begin(); index < range.end();
+               ++index) {
+            const Job job = jobs[index];
+            if (job.set_i != job.set_j) {
+              continue;
+            }
+            Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
+                               [static_cast<std::size_t>(job.set_j)];
+            const auto pair_start = std::chrono::steady_clock::now();
+            build_cpu_pair(pair, job.set_i, job.set_j);
+            pair_times[index] = elapsed_ms(pair_start);
+          }
+        });
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, jobs.size(), 1),
+        [&](const tbb::blocked_range<std::size_t> &range) {
+          for (std::size_t index = range.begin(); index < range.end();
+               ++index) {
+            const Job job = jobs[index];
+            if (job.set_i == job.set_j) {
+              continue;
+            }
+            Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
+                               [static_cast<std::size_t>(job.set_j)];
+            const auto pair_start = std::chrono::steady_clock::now();
+            build_cpu_pair(pair, job.set_i, job.set_j);
+            pair_times[index] = elapsed_ms(pair_start);
+          }
+        });
+    parallel_pairs_ = false;
+    last_stats_.fixed_overflows += parallel_overflows_.exchange(0);
+
+    for (std::size_t index = 0; index < jobs.size(); ++index) {
+      const Job job = jobs[index];
+      const double pair_ms = pair_times[index];
+      if (job.set_i == job.set_j) {
         last_stats_.same_set_ms += pair_ms;
       } else {
         last_stats_.cross_set_ms += pair_ms;
       }
-      last_stats_.pair_ms[static_cast<std::size_t>(set_i) *
+      last_stats_.pair_ms[static_cast<std::size_t>(job.set_i) *
                               static_cast<std::size_t>(set_count) +
-                          static_cast<std::size_t>(set_j)] += pair_ms;
+                          static_cast<std::size_t>(job.set_j)] += pair_ms;
+    }
+  } else {
+    for (int set_i = 0; set_i < set_count; ++set_i) {
+      for (int set_j = 0; set_j < set_count; ++set_j) {
+        Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                           [static_cast<std::size_t>(set_j)];
+        if (!pair.active || pair.valid) {
+          continue;
+        }
+
+        const auto pair_start = std::chrono::steady_clock::now();
+        if (effective_backend_ == SearchBackend::GpuExact) {
+          const bool defer_same = set_i == set_j;
+          if (!build_gpu_pair(pair, set_i, set_j, defer_same)) {
+            // The GPU path is an opt-in accelerator; on any failure restart the
+            // run on the canonical CPU Exact path. Drain any copy already
+            // queued for an earlier pair first.
+#ifdef APFRNN_HAVE_SYCL
+            apfrnn_sycl_wait(gpu_ ? gpu_->context : nullptr);
+#endif
+            set_search_backend(SearchBackend::CpuExact);
+            run();
+            return;
+          }
+        } else {
+          build_cpu_pair(pair, set_i, set_j);
+        }
+
+        const double pair_ms = elapsed_ms(pair_start);
+        if (set_i == set_j) {
+          last_stats_.same_set_ms += pair_ms;
+        } else {
+          last_stats_.cross_set_ms += pair_ms;
+        }
+        last_stats_.pair_ms[static_cast<std::size_t>(set_i) *
+                                static_cast<std::size_t>(set_count) +
+                            static_cast<std::size_t>(set_j)] += pair_ms;
+      }
     }
   }
 
@@ -606,7 +720,11 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     if (grown > 0 && try_fixed(grown)) {
       return;
     }
-    ++last_stats_.fixed_overflows;
+    if (parallel_pairs_) {
+      parallel_overflows_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ++last_stats_.fixed_overflows;
+    }
     pair.fixed_neighbors.clear();
     pair.fixed_counts.clear();
   }
@@ -1053,7 +1171,11 @@ void NSearch::build_grid_same_lists(int set) {
     if (grown > 0 && try_fixed(grown)) {
       return;
     }
-    ++last_stats_.fixed_overflows;
+    if (parallel_pairs_) {
+      parallel_overflows_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ++last_stats_.fixed_overflows;
+    }
     point_set.fixed_neighbors.clear();
     point_set.fixed_counts.clear();
   }

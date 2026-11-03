@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -166,6 +167,8 @@ private:
   std::vector<std::vector<Pair>> pairs_;
   std::unique_ptr<GpuState> gpu_;
   RunStats last_stats_;
+  bool parallel_pairs_ = false;
+  std::atomic<int> parallel_overflows_{0};
 };
 
 } // namespace apfrnn
