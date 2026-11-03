@@ -2010,7 +2010,6 @@ void write_cross_neighbors_target_major_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, int capacity,
     IntBuffer &fixed_neighbors, IntBuffer &counts) {
-  (void)query_data;
   const int num_source = source_data.num_points;
   const int num_target = target_data.num_points;
   const int row_stride = capacity + 8;
@@ -2023,8 +2022,11 @@ void write_cross_neighbors_target_major_parallel(
   if (!source_data.dense_valid || source_data.cell_stencil != 1) {
     return;
   }
-  const float inv_radius = 1.0f / source_data.radius;
-  const float r2 = source_data.radius * source_data.radius;
+  // Cells come from the source grid's own cell size; the search radius is
+  // the pair's (source_data.radius is the set's last same-set radius, which
+  // the exact-radius CSR fallback lowers below the grid's build radius).
+  const float inv_radius = 1.0f / source_data.cell_radius;
+  const float r2 = query_data.radius * query_data.radius;
   const int* dense_cells = source_data.dense_cells.data();
   const int nx = source_data.dense_nx;
   const int ny = source_data.dense_ny;
@@ -2119,7 +2121,6 @@ void write_cross_neighbors_fixed_query_pair_dense_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, int capacity,
     IntBuffer &fixed_neighbors, IntBuffer &counts) {
-  (void)query_data;
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(source_data.num_points),
                      capacity + 8);
@@ -2139,7 +2140,7 @@ void write_cross_neighbors_fixed_query_pair_dense_parallel(
   const ispc::Cells targets = cells_of(target_data);
   const ispc::Points qpts = points_of(source_data);
   const ispc::Points tpts = points_of(target_data);
-  const float r2 = source_data.radius * source_data.radius;
+  const float r2 = query_data.radius * query_data.radius;
   write_rows_parallel(
       source_data.num_cells, cell_grain(source_data.num_cells), capacity,
       false, counts, fixed_neighbors,

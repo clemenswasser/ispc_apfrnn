@@ -800,6 +800,8 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       plan::cross_set(source.data, source.last_fixed_capacity, target.data,
                       pair.last_fixed_capacity, memory_budget_);
 
+  // Writers that skip the range build still read the pair's radius.
+  pair.cross.radius = build_radius();
   auto try_fixed = [&](int capacity) {
     switch (cross_plan.writer) {
     case plan::CrossWriter::TargetMajor:
@@ -1276,6 +1278,10 @@ void NSearch::build_grid_same_lists(int set) {
     return;
   }
   NeighborSearchData &data = point_set.data;
+  // The CSR and block-row fallbacks search at the exact radius; a static
+  // set's grid is not rebuilt between frames, so restore the build radius
+  // (radius + skin) that fixed and skin rows are written with.
+  data.radius = build_radius();
   point_set.fixed_valid = false;
   if (point_set.block_rows) {
     if (build_same_block_rows(set)) {

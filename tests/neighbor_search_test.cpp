@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -1631,4 +1632,39 @@ TEST_CASE("a sweep set converted to a grid mid-run keeps earlier pairs exact") {
   check_same_set(search, s, sparse, radius);
   check_cross_set(search, s, d, sparse, dense, radius);
   check_cross_set(search, d, s, dense, sparse, radius);
+}
+
+TEST_CASE("cross rows with a skin stay exact after a same-set CSR fallback") {
+  // The small budget sends the high-degree same-set pair to the exact-radius
+  // CSR fallback, which lowers the set's search radius below the grid's
+  // radius + skin cell size. The cross writers that skip the range build
+  // (target-major, pair-dense) must still use the grid's cells and the
+  // pair's radius.
+  constexpr float radius = 0.6f;
+  const float side = std::cbrt(1500.0f / 6.0f);
+  for (uint32_t seed = 1; seed <= 3; ++seed) {
+    for (int64_t budget : {int64_t(1) << 18, int64_t(1) << 20}) {
+      CAPTURE(seed);
+      CAPTURE(budget);
+      auto fluid = apfrnn::bench::make_two_scale(1500, side, seed);
+      auto probes = apfrnn::support::make_point_cloud(40, side, seed + 100);
+      auto fluid_xyz = interleave(fluid);
+      auto probe_xyz = interleave(probes);
+
+      apfrnn::NSearch search(radius);
+      search.set_skin(0.3f * radius);
+      search.set_memory_budget(budget);
+      const int f = search.add_point_set(fluid_xyz.data(),
+                                         static_cast<int>(fluid.x.size()));
+      const int p = search.add_point_set(probe_xyz.data(),
+                                         static_cast<int>(probes.x.size()));
+      search.set_all_searches(false);
+      search.set_active_search(f, f, true);
+      search.set_active_search(f, p, true);
+      search.run();
+
+      check_same_set(search, f, fluid, radius);
+      check_cross_set(search, f, p, fluid, probes, radius);
+    }
+  }
 }
