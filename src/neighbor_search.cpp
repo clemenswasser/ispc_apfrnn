@@ -1472,9 +1472,8 @@ bool NSearch::build_same_block_rows(int set) {
     for (int count : data.counts) {
       exact_neighbors += count;
     }
-    const int64_t exact_bytes = exact_neighbors * 4;
     const int64_t output_budget =
-        exact_bytes + static_cast<int64_t>(num_points) * 32 + static_cast<int64_t>(64) << 20;
+        plan::block_output_budget(exact_neighbors, num_points);
     if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
       block_budget = std::max(memory_budget_, output_budget);
     }
@@ -1516,8 +1515,7 @@ bool NSearch::build_same_block_rows(int set) {
     if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
       block_budget = std::max(
           memory_budget_,
-          exact_neighbors * 4 + static_cast<int64_t>(num_points) * 32 +
-              static_cast<int64_t>(64) << 20);
+          plan::block_output_budget(exact_neighbors, num_points));
     }
   }
 

@@ -120,6 +120,12 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
   return plan;
 }
 
+int64_t block_output_budget(int64_t exact_neighbors, int num_points) {
+  return exact_neighbors * static_cast<int64_t>(sizeof(int)) +
+         static_cast<int64_t>(num_points) * 32 +
+         (static_cast<int64_t>(64) << 20);
+}
+
 int same_grown_capacity(int max_count, int num_points, int64_t memory_budget) {
   return grown_capacity(max_count, num_points, kSameMaxCapacity, memory_budget);
 }

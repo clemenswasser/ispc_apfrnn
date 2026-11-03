@@ -87,3 +87,12 @@ TEST_CASE("grown capacities respect limits and budget") {
   CHECK(apfrnn::plan::cross_grown_capacity(5000, 1000, kBudget) == 0);
   CHECK(apfrnn::plan::cross_grown_capacity(130, 1000, 1000) == 0);
 }
+
+TEST_CASE("block row budget adds the 64 MiB slack after the per-point term") {
+  constexpr int64_t kSlack = int64_t(64) << 20;
+  CHECK(apfrnn::plan::block_output_budget(0, 0) == kSlack);
+  CHECK(apfrnn::plan::block_output_budget(1000, 10) ==
+        1000 * 4 + 10 * 32 + kSlack);
+  // The slack must not multiply the exact-neighbor term.
+  CHECK(apfrnn::plan::block_output_budget(1, 1) < kSlack + 1024);
+}
