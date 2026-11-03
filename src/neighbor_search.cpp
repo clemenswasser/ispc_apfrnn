@@ -354,7 +354,6 @@ void NSearch::run() {
   build_point_sets(is_source, needs_same_set);
   last_stats_.sync_build_ms = elapsed_ms(build_start);
 
-  bool gpu_deferred = false;
   for (int set_i = 0; set_i < set_count; ++set_i) {
     for (int set_j = 0; set_j < set_count; ++set_j) {
       Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
@@ -366,7 +365,6 @@ void NSearch::run() {
       const auto pair_start = std::chrono::steady_clock::now();
       if (effective_backend_ == SearchBackend::GpuExact) {
         const bool defer_same = set_i == set_j;
-        gpu_deferred = gpu_deferred || defer_same;
         if (!build_gpu_pair(pair, set_i, set_j, defer_same)) {
           // The GPU path is an opt-in accelerator; on any failure restart the
           // run on the canonical CPU Exact path. Drain any copy already
@@ -396,13 +394,13 @@ void NSearch::run() {
     }
   }
 
-#ifdef APFRNN_HAVE_SYCL
-  if (gpu_deferred) {
-    apfrnn_sycl_wait(gpu_ ? gpu_->context : nullptr);
-  }
-#endif
-
   if (skin_ > 0.0f) {
+#ifdef APFRNN_HAVE_SYCL
+    // Skin filtering reads the rows; make any deferred copy visible first.
+    if (gpu_) {
+      apfrnn_sycl_wait(gpu_->context);
+    }
+#endif
     const auto filter_start = std::chrono::steady_clock::now();
     filter_skin_lists();
     last_stats_.filter_ms = elapsed_ms(filter_start);
@@ -736,6 +734,11 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
   }
 
   if (pair.gpu_rows) {
+#ifdef APFRNN_HAVE_SYCL
+    if (gpu_) {
+      apfrnn_sycl_wait(gpu_->context);
+    }
+#endif
     if (point >= pair.gpu_nq) {
       return {};
     }

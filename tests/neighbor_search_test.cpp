@@ -562,6 +562,36 @@ TEST_CASE("GPU backend rebuilds a static set's grid when it changes") {
   check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
 }
 
+TEST_CASE("GPU backend handles repeated deferred runs") {
+  constexpr float radius = 1.0f;
+  auto fluid = apfrnn::support::make_point_cloud(20000, 25.0f, 1951);
+  auto boundary = apfrnn::support::make_point_cloud(5000, 25.0f, 1952);
+  auto fluid_xyz = interleave(fluid);
+  auto boundary_xyz = interleave(boundary);
+
+  apfrnn::NSearch search(radius);
+  if (!search.set_search_backend(apfrnn::SearchBackend::GpuExact)) {
+    return;
+  }
+  const int fluid_id = search.add_point_set(
+      fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_id = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(false);
+  search.set_active_search(fluid_id, fluid_id, true);
+  search.set_active_search(fluid_id, boundary_id, true);
+  search.run();
+
+  // Queue several same-set output copies without reading rows in between;
+  // the backend must double-buffer them and the read below must wait.
+  for (int frame = 0; frame < 6; ++frame) {
+    search.run();
+  }
+  CHECK(search.search_backend() == apfrnn::SearchBackend::GpuExact);
+  check_same_set(search, fluid_id, fluid, radius);
+  check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+}
+
 TEST_CASE("GPU backend keeps independent searches separate") {
   constexpr float radius = 1.0f;
   auto first = apfrnn::support::make_point_cloud(20000, 20.0f, 1901);

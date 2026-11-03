@@ -21,6 +21,17 @@ struct alignas(16) AosPoint {
   int32_t id;
 };
 
+// One 16-query block of a non-empty cell.
+struct alignas(8) QueryBlock {
+  int32_t cell;
+  int32_t q0;
+};
+
+struct alignas(8) CellMeta {
+  int32_t start;
+  int32_t count;
+};
+
 struct DeviceGrid {
   int n = 0;
   float radius = 0.0f;
@@ -35,6 +46,9 @@ struct DeviceGrid {
   AosPoint *aos = nullptr;
   int *starts = nullptr;
   int *counts = nullptr;
+  CellMeta *meta = nullptr;
+  QueryBlock *blocks = nullptr;
+  int block_count = 0;
   int max_cell = 0;
 };
 
@@ -76,10 +90,10 @@ bool output_within_limit(int64_t total) {
   return true;
 }
 
-// The grouped-query ESIMD kernel wins on the 200k Auto scenes but its extra
-// AoS grid layout costs more than it saves at 1M, where the exact-neighbor
-// frame is dominated by the output copy. Keep it for grids up to 500k and
-// use the cell-major SIMT kernel above that.
+// The grouped-query ESIMD kernel wins on the 200k-500k scenes. At 1M the
+// frame is output-copy-bound and the two same-set kernels are within ~1%, so
+// keep the cell-major SIMT path as the >500k fallback until larger/high-degree
+// cases are re-measured with the same work-list and meta optimizations.
 bool group16_enabled(int n) { return n <= 500000; }
 
 sycl::queue *gpu_queue() {
@@ -176,9 +190,14 @@ struct ApfrnnSyclContext {
   std::size_t doffsets_cap = 0;
   int32_t *dout = nullptr;
   std::size_t dout_cap = 0;
-  // Output of a same-set search whose host copy may still be in flight.
-  int32_t *dout_async = nullptr;
-  std::size_t dout_async_cap = 0;
+  // Double-buffered output for a same-set search whose host copy may still be
+  // in flight while the next frame searches. The write pass of a reused
+  // buffer depends on the copy that previously read it.
+  int32_t *dout_async[2] = {nullptr, nullptr};
+  std::size_t dout_async_cap[2] = {0, 0};
+  sycl::event async_copy_event[2];
+  bool async_copy_valid[2] = {false, false};
+  int async_buf = 0;
   bool async_pending = false;
   int async_slot = -1;
   std::vector<int32_t> counts;
@@ -199,9 +218,14 @@ void free_grid(sycl::queue &q, DeviceGrid &g) {
   if (g.aos) sycl::free(g.aos, q);
   if (g.starts) sycl::free(g.starts, q);
   if (g.counts) sycl::free(g.counts, q);
+  if (g.meta) sycl::free(g.meta, q);
+  if (g.blocks) sycl::free(g.blocks, q);
   g.x = g.y = g.z = nullptr;
   g.original = g.starts = g.counts = nullptr;
   g.aos = nullptr;
+  g.meta = nullptr;
+  g.blocks = nullptr;
+  g.block_count = 0;
 }
 
 DeviceGrid build_grid_gpu(sycl::queue &q, const float *xyz, int n,
@@ -377,6 +401,32 @@ DeviceGrid build_grid_gpu(sycl::queue &q, const float *xyz, int n,
     sum += counts[c];
     g.max_cell = std::max(g.max_cell, counts[c]);
   }
+  // One work item per 16-query block of a non-empty cell. For clustered
+  // scenes most grid cells are empty and a few are very dense; this keeps
+  // the empty cells out of the launch and lets dense cells run in parallel.
+  constexpr int kBlockQueries = 16;
+  std::vector<QueryBlock> blocks;
+  blocks.reserve(static_cast<std::size_t>(n) / kBlockQueries + 1);
+  for (std::size_t c = 0; c < g.cell_count; ++c) {
+    const int begin = starts[c];
+    const int end = begin + counts[c];
+    for (int q0 = begin; q0 < end; q0 += kBlockQueries) {
+      blocks.push_back(QueryBlock{static_cast<int32_t>(c), q0});
+    }
+  }
+  g.block_count = static_cast<int>(blocks.size());
+  if (g.block_count > 0) {
+    g.blocks = sycl::malloc_device<QueryBlock>(
+        static_cast<std::size_t>(g.block_count), q);
+    q.memcpy(g.blocks, blocks.data(),
+             static_cast<std::size_t>(g.block_count) * sizeof(QueryBlock));
+  }
+  std::vector<CellMeta> meta(g.cell_count);
+  for (std::size_t c = 0; c < g.cell_count; ++c) {
+    meta[c] = CellMeta{starts[c], counts[c]};
+  }
+  g.meta = sycl::malloc_device<CellMeta>(g.cell_count, q);
+  q.memcpy(g.meta, meta.data(), g.cell_count * sizeof(CellMeta));
   q.memcpy(g.starts, starts.data(), g.cell_count * sizeof(int));
   q.memcpy(dcursor, starts.data(), g.cell_count * sizeof(int));
   if (with_aos) {
@@ -429,7 +479,8 @@ SlotBuffers &slot_buffers(ApfrnnSyclContext &ctx, int slot) {
 // host buffer and on the device) and sizes the device output. Returns the
 // total, or -1 when the output would exceed the limit.
 int64_t prepare_rows(sycl::queue &q, ApfrnnSyclContext &ctx, int nq, int slot,
-                     bool async_output, int32_t *&dout, int64_t *&doffsets) {
+                     bool async_output, int32_t *&dout, int64_t *&doffsets,
+                     int *async_index = nullptr) {
   ctx.counts.resize(static_cast<std::size_t>(nq));
   q.memcpy(ctx.counts.data(), ctx.dcounts,
            static_cast<std::size_t>(nq) * sizeof(int))
@@ -451,9 +502,18 @@ int64_t prepare_rows(sycl::queue &q, ApfrnnSyclContext &ctx, int nq, int slot,
   q.memcpy(ctx.doffsets, buffers.offsets,
            (static_cast<std::size_t>(nq) + 1) * sizeof(int64_t));
   if (async_output) {
-    ensure_device<int32_t>(q, ctx.dout_async, ctx.dout_async_cap,
-                           static_cast<std::size_t>(total) + 1);
-    dout = ctx.dout_async;
+    const int idx = ctx.async_buf;
+    const std::size_t needed = static_cast<std::size_t>(total) + 1;
+    if (ctx.dout_async_cap[idx] < needed && ctx.async_copy_valid[idx]) {
+      ctx.async_copy_event[idx].wait();
+      ctx.async_copy_valid[idx] = false;
+    }
+    ensure_device<int32_t>(q, ctx.dout_async[idx], ctx.dout_async_cap[idx],
+                           needed);
+    dout = ctx.dout_async[idx];
+    if (async_index != nullptr) {
+      *async_index = idx;
+    }
   } else {
     ensure_device<int32_t>(q, ctx.dout, ctx.dout_cap,
                            static_cast<std::size_t>(total) + 1);
@@ -466,16 +526,20 @@ int64_t prepare_rows(sycl::queue &q, ApfrnnSyclContext &ctx, int nq, int slot,
 // Copies the rows to the slot's host buffer. With async_output the copy runs
 // on the copy queue and apfrnn_sycl_wait() completes it.
 void copy_rows(sycl::queue &q, ApfrnnSyclContext &ctx, int slot,
-               const int32_t *dout, int64_t total, bool async_output) {
+               const int32_t *dout, int64_t total, bool async_output,
+               int async_index = -1) {
   SlotBuffers &buffers = slot_buffers(ctx, slot);
   ensure_host<int32_t>(q, buffers.rows, buffers.rows_cap,
                        static_cast<std::size_t>(total) + 1);
   const std::size_t bytes = static_cast<std::size_t>(total) * sizeof(int32_t);
   sycl::queue *copy_q = async_output ? gpu_copy_queue() : nullptr;
-  if (copy_q != nullptr) {
-    copy_q->memcpy(buffers.rows, dout, bytes);
+  if (copy_q != nullptr && async_index >= 0) {
+    ctx.async_copy_event[async_index] =
+        copy_q->memcpy(buffers.rows, dout, bytes);
+    ctx.async_copy_valid[async_index] = true;
     ctx.async_pending = true;
     ctx.async_slot = slot;
+    ctx.async_buf = 1 - async_index;
   } else {
     q.memcpy(buffers.rows, dout, bytes).wait();
   }
@@ -487,8 +551,7 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
   constexpr int kWG = 32;
   constexpr int kVec = 16;
   const int nq = target.n;
-  const std::size_t cell_count = target.cell_count;
-  if (nq == 0 || cell_count == 0) {
+  if (nq == 0 || target.block_count == 0) {
     return 0;
   }
   ensure_device<int>(q, ctx.dcounts, ctx.dcounts_cap,
@@ -498,12 +561,14 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
   const float *ty = target.y;
   const float *tz = target.z;
   const int *torig = target.original;
-  const AosPoint *aos = target.aos;
-  const int *tstarts = target.starts;
-  const int *tcounts = target.counts;
+  const int32_t *aos_i32 = reinterpret_cast<const int32_t *>(target.aos);
+  const CellMeta *tmeta = target.meta;
+  const QueryBlock *blocks = target.blocks;
+  const int block_count = target.block_count;
   const int nx = target.nx, ny = target.ny, nz = target.nz;
   int *dcounts = ctx.dcounts;
-  const std::size_t groups = (cell_count + kWG - 1) / kWG;
+  const std::size_t groups =
+      (static_cast<std::size_t>(block_count) + kWG - 1) / kWG;
 
   q.submit([&](sycl::handler &h) {
     h.parallel_for(
@@ -511,65 +576,68 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
                           sycl::range<1>(kWG)),
         [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
           using namespace sycl::ext::intel::esimd;
-          const int cell = static_cast<int>(item.get_group(0)) * kWG +
-                           static_cast<int>(item.get_local_id(0));
-          if (cell >= static_cast<int>(cell_count)) {
+          const int bid = static_cast<int>(item.get_group(0)) * kWG +
+                          static_cast<int>(item.get_local_id(0));
+          if (bid >= block_count) {
             return;
           }
+          const int cell = blocks[bid].cell;
+          const int q0 = blocks[bid].q0;
+          const CellMeta cm = tmeta[cell];
+          const int end = cm.start + cm.count;
+          const int m = (end - q0 < kVec) ? end - q0 : kVec;
           const int cz = cell / (nx * ny);
           const int rem = cell % (nx * ny);
           const int cy = rem / nx;
           const int cx = rem % nx;
-          const int begin = tstarts[cell];
-          const int end = begin + tcounts[cell];
           simd<unsigned, kVec> lane(0, 1);
-          for (int q0 = begin; q0 < end; q0 += kVec) {
-            const int m = (end - q0 < kVec) ? end - q0 : kVec;
-            const simd_mask<kVec> valid = lane < static_cast<unsigned>(m);
-            const simd<float, kVec> qx = block_load<float, kVec>(tx + q0);
-            const simd<float, kVec> qy = block_load<float, kVec>(ty + q0);
-            const simd<float, kVec> qz = block_load<float, kVec>(tz + q0);
-            const simd<int32_t, kVec> qorig =
-                block_load<int32_t, kVec>(torig + q0);
-            simd<int32_t, kVec> counts = 0;
-            for (int dz = -1; dz <= 1; ++dz) {
-              const int z = cz + dz;
-              if (z < 0 || z >= nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) {
-                const int y = cy + dy;
-                if (y < 0 || y >= ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
-                  const int x = cx + dx;
-                  if (x < 0 || x >= nx) continue;
-                  const int nc = (z * ny + y) * nx + x;
-                  const int nb = tstarts[nc];
-                  const int ne = nb + tcounts[nc];
-                  const int32_t *fp =
-                      reinterpret_cast<const int32_t *>(aos) + 4 * nb;
-                  const int32_t *fp_end =
-                      reinterpret_cast<const int32_t *>(aos) + 4 * ne;
-                  for (; fp < fp_end; fp += 4) {
-                    const simd<int32_t, 4> p = block_load<int32_t, 4>(fp);
-                    const simd<float, kVec> ddx =
-                        qx - sycl::bit_cast<float>(p[0]);
-                    const simd<float, kVec> ddy =
-                        qy - sycl::bit_cast<float>(p[1]);
-                    const simd<float, kVec> ddz =
-                        qz - sycl::bit_cast<float>(p[2]);
-                    simd_mask<kVec> hit =
-                        (ddx * ddx + ddy * ddy + ddz * ddz) <= radius2;
-                    hit &= valid;
-                    hit &= (qorig != p[3]);
-                    simd<int32_t, kVec> add = 0;
-                    add.merge(1, hit);
-                    counts += add;
-                  }
+          const simd_mask<kVec> valid = lane < static_cast<unsigned>(m);
+          const std::size_t qoff = static_cast<std::size_t>(q0) * sizeof(float);
+          const simd<float, kVec> qx = block_load<float, kVec>(tx, qoff);
+          const simd<float, kVec> qy = block_load<float, kVec>(ty, qoff);
+          const simd<float, kVec> qz = block_load<float, kVec>(tz, qoff);
+          const simd<int32_t, kVec> qorig =
+              block_load<int32_t, kVec>(torig, qoff);
+          simd<int32_t, kVec> counts = 0;
+          for (int dz = -1; dz <= 1; ++dz) {
+            const int z = cz + dz;
+            if (z < 0 || z >= nz) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+              const int y = cy + dy;
+              if (y < 0 || y >= ny) continue;
+              for (int dx = -1; dx <= 1; ++dx) {
+                const int x = cx + dx;
+                if (x < 0 || x >= nx) continue;
+                const int nc = (z * ny + y) * nx + x;
+                const CellMeta nm = tmeta[nc];
+                const int nb = nm.start;
+                const int ne = nb + nm.count;
+                std::size_t off = static_cast<std::size_t>(nb) * 16;
+                const std::size_t off_end = static_cast<std::size_t>(ne) * 16;
+                for (; off < off_end; off += 16) {
+                  const simd<int32_t, 4> p =
+                      block_load<int32_t, 4>(aos_i32, off);
+                  const simd<float, kVec> ddx =
+                      qx - sycl::bit_cast<float>(p[0]);
+                  const simd<float, kVec> ddy =
+                      qy - sycl::bit_cast<float>(p[1]);
+                  const simd<float, kVec> ddz =
+                      qz - sycl::bit_cast<float>(p[2]);
+                  simd_mask<kVec> hit =
+                      (ddx * ddx + ddy * ddy + ddz * ddz) <= radius2;
+                  hit &= valid;
+                  simd<int32_t, kVec> add = 0;
+                  add.merge(1, hit);
+                  counts += add;
                 }
               }
             }
-            for (int l = 0; l < m; ++l) {
-              dcounts[qorig[l]] = counts[l];
-            }
+          }
+          // A same-set query always matches itself; the self compare is
+          // removed from the count pass and compensated once here.
+          counts -= 1;
+          for (int l = 0; l < m; ++l) {
+            dcounts[qorig[l]] = counts[l];
           }
         });
   });
@@ -577,77 +645,82 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
 
   int32_t *dout = nullptr;
   int64_t *doffsets = nullptr;
+  int async_idx = -1;
   const int64_t total =
-      prepare_rows(q, ctx, nq, slot, async_output, dout, doffsets);
+      prepare_rows(q, ctx, nq, slot, async_output, dout, doffsets, &async_idx);
   if (total < 0) {
     return -1;
   }
 
   q.submit([&](sycl::handler &h) {
+    if (async_output && async_idx >= 0 && ctx.async_copy_valid[async_idx]) {
+      h.depends_on(ctx.async_copy_event[async_idx]);
+    }
     h.parallel_for(
         sycl::nd_range<1>(sycl::range<1>(groups * kWG),
                           sycl::range<1>(kWG)),
         [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
           using namespace sycl::ext::intel::esimd;
-          const int cell = static_cast<int>(item.get_group(0)) * kWG +
-                           static_cast<int>(item.get_local_id(0));
-          if (cell >= static_cast<int>(cell_count)) {
+          const int bid = static_cast<int>(item.get_group(0)) * kWG +
+                          static_cast<int>(item.get_local_id(0));
+          if (bid >= block_count) {
             return;
           }
+          const int cell = blocks[bid].cell;
+          const int q0 = blocks[bid].q0;
+          const CellMeta cm = tmeta[cell];
+          const int end = cm.start + cm.count;
+          const int m = (end - q0 < kVec) ? end - q0 : kVec;
           const int cz = cell / (nx * ny);
           const int rem = cell % (nx * ny);
           const int cy = rem / nx;
           const int cx = rem % nx;
-          const int begin = tstarts[cell];
-          const int end = begin + tcounts[cell];
           simd<unsigned, kVec> lane(0, 1);
-          for (int q0 = begin; q0 < end; q0 += kVec) {
-            const int m = (end - q0 < kVec) ? end - q0 : kVec;
-            const simd_mask<kVec> valid = lane < static_cast<unsigned>(m);
-            const simd<float, kVec> qx = block_load<float, kVec>(tx + q0);
-            const simd<float, kVec> qy = block_load<float, kVec>(ty + q0);
-            const simd<float, kVec> qz = block_load<float, kVec>(tz + q0);
-            const simd<int32_t, kVec> qorig =
-                block_load<int32_t, kVec>(torig + q0);
-            // Keep byte offsets: the scatter address is then ready to use
-            // without a per-candidate shift.
-            simd<uint32_t, kVec> pos = 0;
-            for (int l = 0; l < m; ++l) {
-              pos[l] = static_cast<uint32_t>(doffsets[qorig[l]] * 4);
-            }
-            for (int dz = -1; dz <= 1; ++dz) {
-              const int z = cz + dz;
-              if (z < 0 || z >= nz) continue;
-              for (int dy = -1; dy <= 1; ++dy) {
-                const int y = cy + dy;
-                if (y < 0 || y >= ny) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
-                  const int x = cx + dx;
-                  if (x < 0 || x >= nx) continue;
-                  const int nc = (z * ny + y) * nx + x;
-                  const int nb = tstarts[nc];
-                  const int ne = nb + tcounts[nc];
-                  const int32_t *fp =
-                      reinterpret_cast<const int32_t *>(aos) + 4 * nb;
-                  const int32_t *fp_end =
-                      reinterpret_cast<const int32_t *>(aos) + 4 * ne;
-                  for (; fp < fp_end; fp += 4) {
-                    const simd<int32_t, 4> p = block_load<int32_t, 4>(fp);
-                    const simd<float, kVec> ddx =
-                        qx - sycl::bit_cast<float>(p[0]);
-                    const simd<float, kVec> ddy =
-                        qy - sycl::bit_cast<float>(p[1]);
-                    const simd<float, kVec> ddz =
-                        qz - sycl::bit_cast<float>(p[2]);
-                    simd_mask<kVec> hit =
-                        (ddx * ddx + ddy * ddy + ddz * ddz) <= radius2;
-                    hit &= valid;
-                    hit &= (qorig != p[3]);
-                    scatter<int32_t, kVec>(dout, pos, p[3], hit);
-                    simd<uint32_t, kVec> inc = 0;
-                    inc.merge(4u, hit);
-                    pos += inc;
-                  }
+          const simd_mask<kVec> valid = lane < static_cast<unsigned>(m);
+          const std::size_t qoff = static_cast<std::size_t>(q0) * sizeof(float);
+          const simd<float, kVec> qx = block_load<float, kVec>(tx, qoff);
+          const simd<float, kVec> qy = block_load<float, kVec>(ty, qoff);
+          const simd<float, kVec> qz = block_load<float, kVec>(tz, qoff);
+          const simd<int32_t, kVec> qorig =
+              block_load<int32_t, kVec>(torig, qoff);
+          // Keep byte offsets: the scatter address is then ready to use
+          // without a per-candidate shift.
+          simd<uint32_t, kVec> pos = 0;
+          for (int l = 0; l < m; ++l) {
+            pos[l] = static_cast<uint32_t>(doffsets[qorig[l]] * 4);
+          }
+          for (int dz = -1; dz <= 1; ++dz) {
+            const int z = cz + dz;
+            if (z < 0 || z >= nz) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+              const int y = cy + dy;
+              if (y < 0 || y >= ny) continue;
+              for (int dx = -1; dx <= 1; ++dx) {
+                const int x = cx + dx;
+                if (x < 0 || x >= nx) continue;
+                const int nc = (z * ny + y) * nx + x;
+                const CellMeta nm = tmeta[nc];
+                const int nb = nm.start;
+                const int ne = nb + nm.count;
+                std::size_t off = static_cast<std::size_t>(nb) * 16;
+                const std::size_t off_end = static_cast<std::size_t>(ne) * 16;
+                for (; off < off_end; off += 16) {
+                  const simd<int32_t, 4> p =
+                      block_load<int32_t, 4>(aos_i32, off);
+                  const simd<float, kVec> ddx =
+                      qx - sycl::bit_cast<float>(p[0]);
+                  const simd<float, kVec> ddy =
+                      qy - sycl::bit_cast<float>(p[1]);
+                  const simd<float, kVec> ddz =
+                      qz - sycl::bit_cast<float>(p[2]);
+                  simd_mask<kVec> hit =
+                      (ddx * ddx + ddy * ddy + ddz * ddz) <= radius2;
+                  hit &= valid;
+                  hit &= (qorig != p[3]);
+                  scatter<int32_t, kVec>(dout, pos, p[3], hit);
+                  simd<uint32_t, kVec> inc = 0;
+                  inc.merge(4u, hit);
+                  pos += inc;
                 }
               }
             }
@@ -655,7 +728,7 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
         });
   });
   q.wait();
-  copy_rows(q, ctx, slot, dout, total, async_output);
+  copy_rows(q, ctx, slot, dout, total, async_output, async_idx);
   return total;
 }
 
@@ -738,13 +811,18 @@ int64_t search_pair_same_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
 
   int32_t *dout = nullptr;
   int64_t *doffsets = nullptr;
+  int async_idx = -1;
   const int64_t total =
-      prepare_rows(q, ctx, nq, slot, async_output, dout, doffsets);
+      prepare_rows(q, ctx, nq, slot, async_output, dout, doffsets, &async_idx);
   if (total < 0) {
     return -1;
   }
 
-  q.parallel_for(
+  q.submit([&](sycl::handler &h) {
+    if (async_output && async_idx >= 0 && ctx.async_copy_valid[async_idx]) {
+      h.depends_on(ctx.async_copy_event[async_idx]);
+    }
+    h.parallel_for(
       sycl::nd_range<1>(
           sycl::range<1>(((cell_count + kCellsPerWG - 1) / kCellsPerWG) * kWG),
           sycl::range<1>(kWG)),
@@ -795,8 +873,9 @@ int64_t search_pair_same_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
           }
         }
       });
+  });
   q.wait();
-  copy_rows(q, ctx, slot, dout, total, async_output);
+  copy_rows(q, ctx, slot, dout, total, async_output, async_idx);
   return total;
 }
 
@@ -804,11 +883,11 @@ int64_t search_pair_cross_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
                                            const DeviceGrid &query,
                                            const DeviceGrid &target,
                                            int slot) {
-  constexpr int kCellsPerWG = 4;
-  constexpr int kLanesPerCell = 8;
-  constexpr int kWG = kCellsPerWG * kLanesPerCell;
+  constexpr int kBlocksPerWG = 4;
+  constexpr int kLanesPerBlock = 8;
+  constexpr int kWG = kBlocksPerWG * kLanesPerBlock;
   const int nq = query.n;
-  if (nq == 0 || query.cell_count == 0 || target.cell_count == 0) {
+  if (nq == 0 || query.block_count == 0 || target.cell_count == 0) {
     return 0;
   }
   ensure_device<int>(q, ctx.dcounts, ctx.dcounts_cap,
@@ -824,6 +903,8 @@ int64_t search_pair_cross_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
   const int *qorig = query.original;
   const int *qstarts = query.starts;
   const int *qcounts = query.counts;
+  const QueryBlock *qblocks = query.blocks;
+  const int qblock_count = query.block_count;
   const float *tx = target.x;
   const float *ty = target.y;
   const float *tz = target.z;
@@ -831,60 +912,69 @@ int64_t search_pair_cross_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
   const int *tstarts = target.starts;
   const int *tcounts = target.counts;
   int *dcounts = ctx.dcounts;
+  const std::size_t groups =
+      (2 * static_cast<std::size_t>(qblock_count) + kBlocksPerWG - 1) /
+      kBlocksPerWG;
 
   q.parallel_for(
       sycl::nd_range<1>(
-          sycl::range<1>(((query.cell_count + kCellsPerWG - 1) /
-                          kCellsPerWG) * kWG),
+          sycl::range<1>(groups * kWG),
           sycl::range<1>(kWG)),
       [=](sycl::nd_item<1> item) {
         const int group = static_cast<int>(item.get_group(0));
         const int lane = static_cast<int>(item.get_local_id(0));
-        const int sub = lane / kLanesPerCell;
-        const int qlane = lane % kLanesPerCell;
-        const int cell = group * kCellsPerWG + sub;
-        if (cell >= static_cast<int>(query.cell_count)) {
+        const int sub = lane / kLanesPerBlock;
+        const int qlane = lane % kLanesPerBlock;
+        const int wid = group * kBlocksPerWG + sub;
+        const int bid = wid >> 1;
+        const int half = wid & 1;
+        if (bid >= qblock_count) {
           return;
         }
-        const int begin = qstarts[cell];
-        const int end = begin + qcounts[cell];
-        for (int qidx = begin + qlane; qidx < end; qidx += kLanesPerCell) {
-          const int qi = qorig[qidx];
-          const float px = qx[qidx];
-          const float py = qy[qidx];
-          const float pz = qz[qidx];
-          const int tcx = static_cast<int>(std::floor((px - to_x) * target.inv_radius));
-          const int tcy = static_cast<int>(std::floor((py - to_y) * target.inv_radius));
-          const int tcz = static_cast<int>(std::floor((pz - to_z) * target.inv_radius));
-          int count = 0;
-          if (tcx >= 0 && tcx < tnx && tcy >= 0 && tcy < tny && tcz >= 0 &&
-              tcz < tnz) {
-            for (int dz = -1; dz <= 1; ++dz) {
-              const int z = tcz + dz;
-              if (z < 0 || z >= tnz) continue;
-              for (int dy = -1; dy <= 1; ++dy) {
-                const int y = tcy + dy;
-                if (y < 0 || y >= tny) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
-                  const int x = tcx + dx;
-                  if (x < 0 || x >= tnx) continue;
-                  const int nc = (z * tny + y) * tnx + x;
-                  const int nb = tstarts[nc];
-                  const int ne = nb + tcounts[nc];
-                  for (int j = nb; j < ne; ++j) {
-                    const float ddx = tx[j] - px;
-                    const float ddy = ty[j] - py;
-                    const float ddz = tz[j] - pz;
-                    if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2) {
-                      ++count;
-                    }
+        const int cell = qblocks[bid].cell;
+        const int q0 = qblocks[bid].q0 + half * kLanesPerBlock;
+        const int end = qstarts[cell] + qcounts[cell];
+        const int m =
+            (end - q0 < kLanesPerBlock) ? end - q0 : kLanesPerBlock;
+        if (qlane >= m) {
+          return;
+        }
+        const int qidx = q0 + qlane;
+        const int qi = qorig[qidx];
+        const float px = qx[qidx];
+        const float py = qy[qidx];
+        const float pz = qz[qidx];
+        const int tcx = static_cast<int>(std::floor((px - to_x) * target.inv_radius));
+        const int tcy = static_cast<int>(std::floor((py - to_y) * target.inv_radius));
+        const int tcz = static_cast<int>(std::floor((pz - to_z) * target.inv_radius));
+        int count = 0;
+        if (tcx >= 0 && tcx < tnx && tcy >= 0 && tcy < tny && tcz >= 0 &&
+            tcz < tnz) {
+          for (int dz = -1; dz <= 1; ++dz) {
+            const int z = tcz + dz;
+            if (z < 0 || z >= tnz) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+              const int y = tcy + dy;
+              if (y < 0 || y >= tny) continue;
+              for (int dx = -1; dx <= 1; ++dx) {
+                const int x = tcx + dx;
+                if (x < 0 || x >= tnx) continue;
+                const int nc = (z * tny + y) * tnx + x;
+                const int nb = tstarts[nc];
+                const int ne = nb + tcounts[nc];
+                for (int j = nb; j < ne; ++j) {
+                  const float ddx = tx[j] - px;
+                  const float ddy = ty[j] - py;
+                  const float ddz = tz[j] - pz;
+                  if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2) {
+                    ++count;
                   }
                 }
               }
             }
           }
-          dcounts[qi] = count;
         }
+        dcounts[qi] = count;
       });
   q.wait();
 
@@ -898,50 +988,56 @@ int64_t search_pair_cross_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
 
   q.parallel_for(
       sycl::nd_range<1>(
-          sycl::range<1>(((query.cell_count + kCellsPerWG - 1) /
-                          kCellsPerWG) * kWG),
+          sycl::range<1>(groups * kWG),
           sycl::range<1>(kWG)),
       [=](sycl::nd_item<1> item) {
         const int group = static_cast<int>(item.get_group(0));
         const int lane = static_cast<int>(item.get_local_id(0));
-        const int sub = lane / kLanesPerCell;
-        const int qlane = lane % kLanesPerCell;
-        const int cell = group * kCellsPerWG + sub;
-        if (cell >= static_cast<int>(query.cell_count)) {
+        const int sub = lane / kLanesPerBlock;
+        const int qlane = lane % kLanesPerBlock;
+        const int wid = group * kBlocksPerWG + sub;
+        const int bid = wid >> 1;
+        const int half = wid & 1;
+        if (bid >= qblock_count) {
           return;
         }
-        const int begin = qstarts[cell];
-        const int end = begin + qcounts[cell];
-        for (int qidx = begin + qlane; qidx < end; qidx += kLanesPerCell) {
-          const int qi = qorig[qidx];
-          const float px = qx[qidx];
-          const float py = qy[qidx];
-          const float pz = qz[qidx];
-          const int tcx = static_cast<int>(std::floor((px - to_x) * target.inv_radius));
-          const int tcy = static_cast<int>(std::floor((py - to_y) * target.inv_radius));
-          const int tcz = static_cast<int>(std::floor((pz - to_z) * target.inv_radius));
-          int64_t pos = doffsets[qi];
-          if (tcx >= 0 && tcx < tnx && tcy >= 0 && tcy < tny && tcz >= 0 &&
-              tcz < tnz) {
-            for (int dz = -1; dz <= 1; ++dz) {
-              const int z = tcz + dz;
-              if (z < 0 || z >= tnz) continue;
-              for (int dy = -1; dy <= 1; ++dy) {
-                const int y = tcy + dy;
-                if (y < 0 || y >= tny) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
-                  const int x = tcx + dx;
-                  if (x < 0 || x >= tnx) continue;
-                  const int nc = (z * tny + y) * tnx + x;
-                  const int nb = tstarts[nc];
-                  const int ne = nb + tcounts[nc];
-                  for (int j = nb; j < ne; ++j) {
-                    const float ddx = tx[j] - px;
-                    const float ddy = ty[j] - py;
-                    const float ddz = tz[j] - pz;
-                    if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2) {
-                      dout[pos++] = torig[j];
-                    }
+        const int cell = qblocks[bid].cell;
+        const int q0 = qblocks[bid].q0 + half * kLanesPerBlock;
+        const int end = qstarts[cell] + qcounts[cell];
+        const int m =
+            (end - q0 < kLanesPerBlock) ? end - q0 : kLanesPerBlock;
+        if (qlane >= m) {
+          return;
+        }
+        const int qidx = q0 + qlane;
+        const int qi = qorig[qidx];
+        const float px = qx[qidx];
+        const float py = qy[qidx];
+        const float pz = qz[qidx];
+        const int tcx = static_cast<int>(std::floor((px - to_x) * target.inv_radius));
+        const int tcy = static_cast<int>(std::floor((py - to_y) * target.inv_radius));
+        const int tcz = static_cast<int>(std::floor((pz - to_z) * target.inv_radius));
+        int64_t pos = doffsets[qi];
+        if (tcx >= 0 && tcx < tnx && tcy >= 0 && tcy < tny && tcz >= 0 &&
+            tcz < tnz) {
+          for (int dz = -1; dz <= 1; ++dz) {
+            const int z = tcz + dz;
+            if (z < 0 || z >= tnz) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+              const int y = tcy + dy;
+              if (y < 0 || y >= tny) continue;
+              for (int dx = -1; dx <= 1; ++dx) {
+                const int x = tcx + dx;
+                if (x < 0 || x >= tnx) continue;
+                const int nc = (z * tny + y) * tnx + x;
+                const int nb = tstarts[nc];
+                const int ne = nb + tcounts[nc];
+                for (int j = nb; j < ne; ++j) {
+                  const float ddx = tx[j] - px;
+                  const float ddy = ty[j] - py;
+                  const float ddz = tz[j] - pz;
+                  if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2) {
+                    dout[pos++] = torig[j];
                   }
                 }
               }
@@ -975,7 +1071,8 @@ void apfrnn_sycl_destroy(ApfrnnSyclContext *ctx) {
     sycl::free(ctx->dcounts, *q);
     sycl::free(ctx->doffsets, *q);
     sycl::free(ctx->dout, *q);
-    sycl::free(ctx->dout_async, *q);
+    sycl::free(ctx->dout_async[0], *q);
+    sycl::free(ctx->dout_async[1], *q);
     for (SlotBuffers &buffers : ctx->slots) {
       sycl::free(buffers.rows, *q);
       sycl::free(buffers.offsets, *q);
@@ -998,6 +1095,8 @@ void apfrnn_sycl_wait(ApfrnnSyclContext *ctx) {
   }
   ctx->async_pending = false;
   ctx->async_slot = -1;
+  ctx->async_copy_valid[0] = false;
+  ctx->async_copy_valid[1] = false;
 }
 
 int apfrnn_sycl_exact_pair(ApfrnnSyclContext *ctx,
@@ -1018,10 +1117,6 @@ int apfrnn_sycl_exact_pair(ApfrnnSyclContext *ctx,
   sycl::queue *q = gpu_queue();
   if (q == nullptr) {
     return 2;
-  }
-  // The in-flight copy may target this slot, and dout_async is reused.
-  if (ctx->async_pending && (defer_copy || slot == ctx->async_slot)) {
-    apfrnn_sycl_wait(ctx);
   }
 
   // Returns the grid of `points`: a still-valid cached one, or a rebuilt
