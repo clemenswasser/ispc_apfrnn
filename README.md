@@ -52,8 +52,8 @@ for (uint32_t j : search.get_neighbors(fluid, boundary, i)) {
 - `run()` re-reads dynamic sets every time. Static sets are cached until they
   are resized or toggled with `set_point_set_static`.
 - `set_skin(s)` builds lists with `radius + s` and reuses them while no point
-  has moved more than `s / 2`. `get_neighbors` still returns exact-radius
-  lists.
+  has moved more than `s / 2` from the positions they were built at.
+  `get_neighbors` still returns exact-radius lists.
 - `set_memory_budget(bytes)` caps one fixed-row allocation (default 3 GiB).
   Larger requests fall back to CSR rows.
 - `last_stats()` breaks down the last run (build, grid, same-set and
@@ -142,7 +142,7 @@ Level Zero 1.17.39758+11), 5 x 1 s repetitions with the CPU threads pinned to
 
 Steady-state frame times, wall clock, i7-12700K pinned to its 8 P-cores (16
 threads). The baselines use OpenMP, so the comparison is wall time, not CPU
-time. Each benchmark ran for 2 s after a warm-up frame (see
+time. Each benchmark ran for 2 s after two warm-up frames (see
 [Methodology](#methodology)).
 
 ### Synthetic scenes
@@ -169,6 +169,32 @@ there.
 | pathological (10k, one cell) | 10000 | 37.6 ms | 54.7 ms | 345 ms | 1.5x | 9.2x |
 
 At 50k points the ratios are similar (1.45x to 5.5x against TreeNSearch).
+
+### Motion
+
+The timed loop advances the scene before every `backend->run()`, so the
+dynamic fluid set is re-read and searched on every frame. `_moving` and
+`_fast` translate the whole set rigidly (3% and 35% of the radius per frame),
+which leaves relative geometry unchanged and is the easy case. `_jitter`
+moves every point independently by up to a quarter radius per axis, changing
+cell occupancy and the maximum degree, and is closer to real flow.
+
+| Scene | jitter vs static | maximum row, static -> jitter |
+|---|---:|---:|
+| uniform 200k | +20% | 62 -> 61 |
+| slab 200k | +13% | 92 -> 95 |
+| clustered 200k | +7% | 1717 -> 1694 |
+| thin pipe 50k | +40% | 2475 -> 3429 |
+
+The largest increase is on the high-degree thin pipe, where the neighbour
+count itself rises. Rigid translation does not cover this case. The `Frame`
+numbers exclude the O(n) `scene.advance()`; `Api/Frame` times it inside the
+loop and the small-move case is 6.38 ms against 5.96 ms static at 200k.
+
+The warm-up is not hiding motion: it only removes one-time allocation and
+capacity fitting. `Cold/` times setup plus the first frame, 11.6 ms for
+uniform 200k and 12.2 ms for slab 200k, against 5.8 ms and 7.6 ms in steady
+state.
 
 ### Saved learnsph frames
 
@@ -267,7 +293,8 @@ are the synthetic distributions uniform, jittered lattice, lattice, clustered,
 slab, thin slab, huge domain, surface, thin pipe and two-scale at 50k and
 200k, uniform at 1k/10k/1M, clustered at 10k, pathological at 10k, the moving
 variants (`_moving`: small rigid motion, `_fast`: large rigid motion,
-`_jitter`: non-rigid per-point motion), slab with the boundary also querying
+`_jitter`: non-rigid per-point motion, covering uniform, slab and clustered at
+200k and thin pipe at 50k), slab with the boundary also querying
 (`_boundary_queries`), a 1k probe set queried into 200k/1M points, and any
 learnsph frames found under `--learnsph_res` (default `../learnsph/res`). `scripts/bench.sh` accepts `APFRNN_FILTER` and
 `APFRNN_CPUS`.
