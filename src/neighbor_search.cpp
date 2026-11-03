@@ -74,6 +74,38 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
       .count();
 }
 
+// Largest squared displacement from the positions a set was last built at.
+// Skin reuse is only safe while this stays within skin / 2; comparing each
+// frame against the previous frame would let small steps accumulate.
+float max_distance_sq_to(const std::vector<float> &ax,
+                         const std::vector<float> &ay,
+                         const std::vector<float> &az,
+                         const std::vector<float> &bx,
+                         const std::vector<float> &by,
+                         const std::vector<float> &bz) {
+  const std::size_t count = ax.size();
+  if (bx.size() != count || ay.size() != count || by.size() != count ||
+      az.size() != count || bz.size() != count) {
+    return std::numeric_limits<float>::infinity();
+  }
+  const int n = static_cast<int>(count);
+  return tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, n, 16384), 0.0f,
+      [&](const tbb::blocked_range<int> &range, float acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const float dx = ax[static_cast<std::size_t>(i)] -
+                           bx[static_cast<std::size_t>(i)];
+          const float dy = ay[static_cast<std::size_t>(i)] -
+                           by[static_cast<std::size_t>(i)];
+          const float dz = az[static_cast<std::size_t>(i)] -
+                           bz[static_cast<std::size_t>(i)];
+          acc = std::max(acc, dx * dx + dy * dy + dz * dz);
+        }
+        return acc;
+      },
+      [](float a, float b) { return std::max(a, b); });
+}
+
 // Keeps the CSR neighbors within `radius` at the current positions. With a
 // skin, rows are searched at radius + skin over the sorted coordinates of the
 // last grid build, which a skin-reused set lags by up to skin / 2 (see
@@ -139,6 +171,12 @@ struct NSearch::PointSet {
   std::vector<float> cached_y;
   std::vector<float> cached_z;
   bool target_cache_valid = false;
+  // Positions at the last grid build for skin reuse. cached_* above serve the
+  // skin-free target cache; skin and target caching are mutually exclusive.
+  std::vector<float> skin_x;
+  std::vector<float> skin_y;
+  std::vector<float> skin_z;
+  bool skin_ref_valid = false;
   std::vector<float> gpu_xyz;
   bool gpu_xyz_valid = false;
   uint64_t gpu_version = 0;  // bumped whenever gpu_xyz is repacked
@@ -675,6 +713,18 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     }
     last_stats_.max_displacement_sq =
         std::max(last_stats_.max_displacement_sq, max_distance_sq);
+    // Skin lists are only valid while no point has moved more than skin / 2
+    // from the positions they were built at. A per-frame check misses slow
+    // motion that accumulates over several frames.
+    float build_distance_sq = max_distance_sq;
+    if (skin_ > 0.0f && !point_set.dirty) {
+      build_distance_sq =
+          point_set.skin_ref_valid
+              ? max_distance_sq_to(point_set.x, point_set.y, point_set.z,
+                                   point_set.skin_x, point_set.skin_y,
+                                   point_set.skin_z)
+              : std::numeric_limits<float>::infinity();
+    }
     const bool target_unchanged =
         target_cache && !is_source[static_cast<std::size_t>(set)] &&
         point_set.valid && point_set.target_cache_valid &&
@@ -686,7 +736,7 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
       note_path(kPathTargetReuse);
     } else if (skin_ <= 0.0f || point_set.dirty || !point_set.valid ||
                !point_set.skin_lists ||
-               max_distance_sq > reuse_distance_sq) {
+               build_distance_sq > reuse_distance_sq) {
       point_set.dirty = true;
       ++last_stats_.rebuilt_sets;
     } else {
@@ -742,6 +792,17 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
     }
     build_point_grid(set);
     grid_ms[static_cast<std::size_t>(set)] = elapsed_ms(grid_start);
+    if (skin_ > 0.0f) {
+      point_set.skin_x = point_set.x;
+      point_set.skin_y = point_set.y;
+      point_set.skin_z = point_set.z;
+      point_set.skin_ref_valid = true;
+    } else {
+      point_set.skin_x.clear();
+      point_set.skin_y.clear();
+      point_set.skin_z.clear();
+      point_set.skin_ref_valid = false;
+    }
     if (target_cache && !is_source[static_cast<std::size_t>(set)]) {
       point_set.cached_x = point_set.x;
       point_set.cached_y = point_set.y;

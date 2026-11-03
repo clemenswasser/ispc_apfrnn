@@ -417,6 +417,32 @@ TEST_CASE("native skin reuses and then rebuilds neighbor lists") {
   check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
 }
 
+TEST_CASE("skin rebuilds after slow motion accumulates past the threshold") {
+  constexpr float radius = 1.0f;
+  constexpr float skin = 0.2f;
+  // Two points 1.35 apart: outside radius + skin, so the first build has no
+  // candidate for the pair.
+  std::vector<float> xyz = {0.0f, 0.0f, 0.0f, 1.35f, 0.0f, 0.0f};
+
+  apfrnn::NSearch search(radius);
+  search.set_skin(skin);
+  const int set = search.add_point_set(xyz.data(), 2);
+  search.set_all_searches(false);
+  search.set_active_search(set, set, true);
+  search.run();
+  CHECK(sorted_neighbors(search.get_neighbors(set, set, 0)).empty());
+
+  // Each step is below skin / 2, but five steps total 0.4 and bring the
+  // points within radius. A per-frame displacement check would reuse the
+  // stale lists forever and miss the pair.
+  for (int frame = 0; frame < 5; ++frame) {
+    xyz[3] -= 0.08f;
+    search.run();
+  }
+  CHECK(sorted_neighbors(search.get_neighbors(set, set, 0)) ==
+        std::vector<int>{1});
+}
+
 TEST_CASE("native randomized activation matrix matches brute force") {
   std::mt19937 generator(424242);
   std::uniform_real_distribution<float> radius_distribution(0.4f, 1.8f);
