@@ -1524,3 +1524,71 @@ TEST_CASE("moving sweep sets rebuild their x order") {
     check_cross_set(search, fluid_id, target_id, fluid, target, radius);
   }
 }
+
+TEST_CASE("shared dense ranges are dropped when a set leaves the dense grid") {
+  // Frame 1 shares the dense range cache across several pairs; then one point
+  // per set moves far enough that the bounding box exceeds the dense grid
+  // limit (but not far enough for the sweep backend), so every set falls back
+  // to the hash grid, whose ranges must not be read through stale shared
+  // pointers.
+  constexpr float radius = 1.0f;
+  constexpr int kSets = 3;
+  std::vector<apfrnn::support::PointCloud> clouds;
+  std::vector<std::vector<float>> xyz;
+  for (int set = 0; set < kSets; ++set) {
+    clouds.push_back(apfrnn::support::make_point_cloud(2500, 13.6f, 77 + set));
+    xyz.push_back(interleave(clouds.back()));
+  }
+  apfrnn::NSearch search(radius);
+  for (int set = 0; set < kSets; ++set) {
+    search.add_point_set(xyz[static_cast<std::size_t>(set)].data(),
+                         static_cast<int>(clouds[0].x.size()));
+  }
+  search.set_all_searches(true);
+
+  auto check_all = [&] {
+    for (int query = 0; query < kSets; ++query) {
+      for (int target = 0; target < kSets; ++target) {
+        const auto &q = clouds[static_cast<std::size_t>(query)];
+        const auto &t = clouds[static_cast<std::size_t>(target)];
+        if (query == target) {
+          check_same_set(search, query, q, radius);
+        } else {
+          check_cross_set(search, query, target, q, t, radius);
+        }
+      }
+    }
+  };
+
+  search.run();
+  CHECK(search.last_stats().dense_sets == kSets);
+  CHECK((search.last_stats().paths &
+         apfrnn::NSearch::kPathRangeCacheShared) != 0);
+  check_all();
+
+  for (int set = 0; set < kSets; ++set) {
+    auto &cloud = clouds[static_cast<std::size_t>(set)];
+    cloud.x[0] = cloud.y[0] = cloud.z[0] = 270.0f;
+    // In place: a resize would rebuild the pair state from scratch.
+    const std::vector<float> moved =
+        interleave(clouds[static_cast<std::size_t>(set)]);
+    std::copy(moved.begin(), moved.end(),
+              xyz[static_cast<std::size_t>(set)].begin());
+  }
+  search.run();
+  CHECK(search.last_stats().hash_sets == kSets);
+  check_all();
+
+  // And back onto the dense grid.
+  for (int set = 0; set < kSets; ++set) {
+    clouds[static_cast<std::size_t>(set)] =
+        apfrnn::support::make_point_cloud(2500, 13.6f, 177 + set);
+    const std::vector<float> moved =
+        interleave(clouds[static_cast<std::size_t>(set)]);
+    std::copy(moved.begin(), moved.end(),
+              xyz[static_cast<std::size_t>(set)].begin());
+  }
+  search.run();
+  CHECK(search.last_stats().dense_sets == kSets);
+  check_all();
+}

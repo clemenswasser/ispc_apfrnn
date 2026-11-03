@@ -384,6 +384,19 @@ void NSearch::run() {
     needs_same_set[static_cast<std::size_t>(set)] =
         row[static_cast<std::size_t>(set)].active;
   }
+  // How many pairs read each set's ranges as a target; decides whether the
+  // grid build shares one range cache between them.
+  for (int target = 0; target < set_count; ++target) {
+    int uses = 0;
+    for (int query = 0; query < set_count; ++query) {
+      uses += pairs_[static_cast<std::size_t>(query)]
+                    [static_cast<std::size_t>(target)]
+                        .active
+                  ? 1
+                  : 0;
+    }
+    sets_[static_cast<std::size_t>(target)].data.range_cache_uses = uses;
+  }
 
   sync_dynamic_sets(is_source);
 

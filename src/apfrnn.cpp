@@ -561,6 +561,13 @@ ispc::HashGrid hash_of(const NeighborSearchData &data) {
           data.hash_mask};
 }
 
+// Ranges written into the data's own buffers; drops any shared cache ranges
+// a previous build pointed at.
+template <typename Data> inline void use_own_ranges(Data &data) {
+  data.shared_starts = nullptr;
+  data.shared_ends = nullptr;
+}
+
 // Debug builds check that the range tables the kernels will read through raw
 // pointers cover every cell: stale (cleared or shared) ranges are the bug
 // class the STL's own bounds checks cannot see.
@@ -770,6 +777,7 @@ template <typename Data>
 inline void build_dense_stencil9_ranges_impl(
     Data &data, const std::vector<uint64_t> &query_keys,
     const NeighborSearchData &target) {
+  use_own_ranges(data);
   const int num_cells = data.num_cells;
   data.cell_num_neighbors.assign(static_cast<std::size_t>(num_cells), 9);
   data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
@@ -845,6 +853,7 @@ inline void build_cross_cell_ranges_from_sorted_impl(
     CrossNeighborSearchData &data,
     const std::vector<uint64_t> &source_unique_keys,
     const NeighborSearchData &target_data, float radius) {
+  use_own_ranges(data);
   const int num_cells = data.num_cells;
   data.radius = radius;
 
@@ -1255,6 +1264,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
   data.cell_max_y.clear();
   data.cell_max_z.clear();
   // Invalidate any same-set neighbor rows from a previous grid build.
+  use_own_ranges(data);
   data.cell_neighbor_offset.clear();
   data.cell_num_neighbors.clear();
   data.cell_neighbor_starts.clear();
@@ -1399,7 +1409,14 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
   const int cx0 = data.dense_min_x - 1;
   const int cy0 = data.dense_min_y - 1;
   const int cz0 = data.dense_min_z - 1;
-  const int total = nx * ny * nz;
+  const int64_t padded = static_cast<int64_t>(nx) * ny * nz;
+  // Sparse boxes (a few clusters in a large domain) would pay for every
+  // empty cell; there the direct per-pair ranges are cheaper.
+  if (padded > static_cast<int64_t>(std::max(0, data.range_cache_uses)) *
+                   data.num_cells) {
+    return;
+  }
+  const int total = static_cast<int>(padded);
   std::vector<uint64_t> keys(static_cast<std::size_t>(total));
   for (int z = 0; z < nz; ++z) {
     for (int y = 0; y < ny; ++y) {
@@ -1460,6 +1477,7 @@ inline int find_cell_index_cpp(const NeighborSearchData &data,
 }
 
 void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
+  use_own_ranges(data);
   if (data.num_points == 0) {
     data.cell_neighbor_offset.clear();
     data.cell_num_neighbors.clear();
@@ -1515,6 +1533,7 @@ void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
 
 void build_same_set_cell_ranges_dense_fused_inplace(
     NeighborSearchData &data) {
+  use_own_ranges(data);
   if (data.num_points == 0) {
     data.cell_neighbor_offset.clear();
     data.cell_num_neighbors.clear();
@@ -1525,9 +1544,6 @@ void build_same_set_cell_ranges_dense_fused_inplace(
   if (!data.dense_valid || data.cell_stencil > 1) {
     build_same_set_cell_ranges_inplace(data);
     return;
-  }
-  if (!data.dense_cache_valid) {
-    build_dense_range_cache(data);
   }
   if (!data.dense_cache_valid) {
     build_dense_stencil9_ranges_impl(data, data.scratch_unique_keys, data);
@@ -1710,6 +1726,7 @@ static void build_cross_neighbor_search_data_inplace(
     CrossNeighborSearchData &data, const std::vector<float> &query_x,
     const std::vector<float> &query_y, const std::vector<float> &query_z,
     const NeighborSearchData &target_data, float radius) {
+  use_own_ranges(data);
   data.num_points = static_cast<int>(query_x.size());
   data.radius = radius;
   data.source = nullptr;
@@ -1749,6 +1766,7 @@ static void build_cross_neighbor_search_data_inplace(
 void build_cross_cell_ranges_from_sorted_inplace(
     CrossNeighborSearchData &data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, float radius) {
+  use_own_ranges(data);
   data.num_points = source_data.num_points;
   data.radius = radius;
 
@@ -1784,6 +1802,7 @@ void build_cross_cell_ranges_from_sorted_inplace(
 void build_cross_neighbor_search_data_from_sorted_inplace(
     CrossNeighborSearchData &data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, float radius) {
+  use_own_ranges(data);
   data.num_points = source_data.num_points;
   data.radius = radius;
 

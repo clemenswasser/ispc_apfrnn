@@ -143,6 +143,13 @@ int cross_fitted_capacity(int max_count, int capacity) {
 }
 
 bool same_set_isolated(const NeighborSearchData &data) {
+  // Ranges may live in a target's shared range cache instead of the data's
+  // own buffers.
+  const IntBuffer &starts = data.shared_starts != nullptr
+                                ? *data.shared_starts
+                                : data.cell_neighbor_starts;
+  const IntBuffer &ends = data.shared_ends != nullptr ? *data.shared_ends
+                                                      : data.cell_neighbor_ends;
   for (int cell = 0; cell < data.num_cells; ++cell) {
     const std::size_t c = static_cast<std::size_t>(cell);
     const int start = data.cell_starts[c];
@@ -150,8 +157,7 @@ bool same_set_isolated(const NeighborSearchData &data) {
     const std::size_t offset =
         static_cast<std::size_t>(data.cell_neighbor_offset[c]);
     if (end - start != 1 || data.cell_num_neighbors[c] != 1 ||
-        data.cell_neighbor_starts[offset] != start ||
-        data.cell_neighbor_ends[offset] != end) {
+        starts[offset] != start || ends[offset] != end) {
       return false;
     }
   }

@@ -184,6 +184,11 @@ struct NeighborSearchData {
   // Nine z-merged target ranges for every dense grid cell. Shared by every
   // source set that uses this set as a target.
   bool dense_cache_valid = false;
+  // Active pairs that read this set's ranges as their target in a run. The
+  // cache costs one stencil per cell of the padded bounding box, the direct
+  // ranges one per occupied cell and pair, so it is only built when
+  // padded cells <= range_cache_uses * occupied cells.
+  int range_cache_uses = 1;
   IntBuffer dense_cache_offsets;
   IntBuffer dense_cache_counts;
   IntBuffer dense_cache_starts;
