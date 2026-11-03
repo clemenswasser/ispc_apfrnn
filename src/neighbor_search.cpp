@@ -590,9 +590,10 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
 void NSearch::build_point_sets(const std::vector<bool> &is_source,
                                const std::vector<bool> &needs_same_set) {
   const bool target_cache = skin_ <= 0.0f;
-  for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
-    PointSet &point_set = sets_[static_cast<std::size_t>(set)];
-    if (effective_backend_ == SearchBackend::GpuExact) {
+  const int set_count = static_cast<int>(sets_.size());
+  if (effective_backend_ == SearchBackend::GpuExact) {
+    for (int set = 0; set < set_count; ++set) {
+      PointSet &point_set = sets_[static_cast<std::size_t>(set)];
       if (point_set.is_static && (!point_set.valid || point_set.dirty)) {
         sync_source(set);
       }
@@ -601,31 +602,72 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
       }
       point_set.valid = true;
       point_set.dirty = false;
-      continue;
     }
+    return;
+  }
+
+  std::vector<int> build_sets;
+  int max_points = 0;
+  for (int set = 0; set < set_count; ++set) {
+    const PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     if (!point_set.dirty && point_set.valid) {
       continue;
     }
+    build_sets.push_back(set);
+    const int points =
+        point_set.is_static ? point_set.source_count
+                            : static_cast<int>(point_set.x.size());
+    max_points = std::max(max_points, points);
+  }
+  for (int set : build_sets) {
     invalidate_pairs_for_set(set);
+  }
 
+  std::vector<double> grid_ms(static_cast<std::size_t>(set_count), 0.0);
+  std::vector<double> same_ms(static_cast<std::size_t>(set_count), 0.0);
+  auto build_one = [&](int set) {
+    PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     const auto grid_start = std::chrono::steady_clock::now();
     if (point_set.is_static) {
       sync_source(set);
     }
     build_point_grid(set);
-    last_stats_.grid_ms += elapsed_ms(grid_start);
+    grid_ms[static_cast<std::size_t>(set)] = elapsed_ms(grid_start);
     if (target_cache && !is_source[static_cast<std::size_t>(set)]) {
       point_set.cached_x = point_set.x;
       point_set.cached_y = point_set.y;
       point_set.cached_z = point_set.z;
       point_set.target_cache_valid = true;
     }
-
     if (needs_same_set[static_cast<std::size_t>(set)]) {
       const auto same_start = std::chrono::steady_clock::now();
       build_same_lists(set);
-      last_stats_.same_build_ms += elapsed_ms(same_start);
+      same_ms[static_cast<std::size_t>(set)] = elapsed_ms(same_start);
     }
+  };
+
+  if (build_sets.size() > 1 && max_points <= 32768) {
+    parallel_pairs_ = true;
+    parallel_overflows_.store(0, std::memory_order_relaxed);
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, build_sets.size(), 1),
+        [&](const tbb::blocked_range<std::size_t> &range) {
+          for (std::size_t i = range.begin(); i < range.end(); ++i) {
+            build_one(build_sets[i]);
+          }
+        });
+    parallel_pairs_ = false;
+    last_stats_.fixed_overflows += parallel_overflows_.exchange(0);
+  } else {
+    for (int set : build_sets) {
+      build_one(set);
+    }
+  }
+  for (double ms : grid_ms) {
+    last_stats_.grid_ms += ms;
+  }
+  for (double ms : same_ms) {
+    last_stats_.same_build_ms += ms;
   }
 }
 
