@@ -116,6 +116,28 @@ to the CPU. It also falls back when one cell would hold so many points that a
 single GPU work item would scan the whole neighborhood (the pathological
 scene); that keeps a long-running kernel from resetting the device.
 
+### GPU frame times
+
+Median frame time on the machine below with an Intel Arc A770 (oneAPI 2026.2,
+Level Zero 1.17.39758+11), 5 x 1 s repetitions with the CPU threads pinned to
+0-15. These are raw neighbor-list frames; they do not include an SPH consumer.
+`Auto` applies the policy above.
+
+| Scene | CPU | GPU | Auto | GPU / CPU |
+|---|---:|---:|---:|---:|
+| uniform, 1M | 31.9 ms | 19.9 ms | 19.0 ms | 1.60x |
+| uniform, 200k | 5.62 ms | 4.67 ms | 4.73 ms | 1.20x |
+| SPH-like slab, 200k | 7.16 ms | 5.84 ms | 5.88 ms | 1.23x |
+| uniform, 50k | 1.19 ms | 2.03 ms | 1.20 ms | 0.59x |
+| surface, 200k | 15.0 ms | 19.0 ms | 15.6 ms | 0.79x |
+| clustered, 200k | 24.8 ms | 34.4 ms | 24.8 ms | 0.72x |
+| thin pipe, 200k | 107 ms | 104 ms* | 106 ms | 0.97x* |
+| learnsph wall | 3.41 ms | 2.25 ms | 3.42 ms | 1.52x |
+| learnsph bowl | 3.28 ms | 2.05 ms | 3.29 ms | 1.60x |
+
+\* Falls back to the CPU because the int32 output exceeds
+`APFRNN_SYCL_MAX_OUTPUT_MB`.
+
 ## Performance
 
 Steady-state frame times, wall clock, i7-12700K pinned to its 8 P-cores (16
@@ -214,7 +236,7 @@ scene list when their files exist.
 
 ```sh
 ./scripts/bench.sh build        # headline comparison against the baselines
-./build/bench/ispc_apfrnn_bench --benchmark_filter='^Frame/apfrnn_gpu/'
+./scripts/bench_gpu.sh build-sycl  # CPU vs GPU vs Auto (SYCL build)
 ./build/bench/ispc_apfrnn_bench --benchmark_filter='^Api/'
 ```
 
