@@ -1870,7 +1870,6 @@ void write_same_set_block_rows_parallel(
     return;
   }
   const ispc::Cells cells = cells_of(data);
-  const ispc::CellRanges ranges = ranges_of(data);
   const ispc::Points pts = points_of(data);
   const float r2 = data.radius * data.radius;
   if (data.max_cell_points > 32) {
@@ -1892,12 +1891,24 @@ void write_same_set_block_rows_parallel(
       return;
     }
   }
+  // With cached block capacities nothing has built this grid's ranges yet
+  // (every grid build clears them), and the cleared buffers still hold the
+  // previous grid's ranges.
+  if (data.cell_num_neighbors.size() !=
+      static_cast<std::size_t>(data.num_cells)) {
+    if (data.dense_valid && data.cell_stencil == 1) {
+      build_same_set_cell_ranges_dense_fused_inplace(data);
+    } else {
+      build_same_set_cell_ranges_inplace(data);
+    }
+  }
+  const ispc::CellRanges current_ranges = ranges_of(data);
   write_block_rows_parallel(
       data.num_cells, cell_grain(data.num_cells), capacity, counts, neighbors,
       row_offset, row_capacity,
       [&](int begin, int end, const ispc::FixedRows &rows) {
-        ispc::write_fixed_rows_pair(begin, end, &cells, &ranges, &pts, &pts,
-                                    true, r2, &rows);
+        ispc::write_fixed_rows_pair(begin, end, &cells, &current_ranges, &pts,
+                                    &pts, true, r2, &rows);
       });
 }
 

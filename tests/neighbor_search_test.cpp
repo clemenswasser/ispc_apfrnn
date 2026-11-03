@@ -1695,3 +1695,43 @@ TEST_CASE("sparse bounding boxes crossing zero keep z runs contiguous") {
     check_same_set(search, id, cloud, 1.7f);
   }
 }
+
+TEST_CASE("block rows with cached capacities rebuild the grid's ranges") {
+  // Frame 1 selects block rows and caches their capacities; frame 2 rebuilds
+  // the grid (smaller radius, points moved) and reuses the capacities, so
+  // the cell writer must build this grid's ranges instead of reading the
+  // cleared ones from frame 1.
+  int block_frames = 0;
+  // Clustered rows have very different lengths, so per-block capacities fit
+  // budgets that full fixed rows exceed.
+  for (int shift = 16; shift <= 26; ++shift) {
+    CAPTURE(shift);
+    auto cloud = apfrnn::bench::make_clustered(3000, 14.0f, 17);
+    auto xyz = interleave(cloud);
+    apfrnn::NSearch search(1.7f);
+    search.set_memory_budget(int64_t(1) << shift);
+    const int id =
+        search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+    search.set_all_searches(true);
+    search.run();
+    check_same_set(search, id, cloud, 1.7f);
+
+    std::mt19937 generator(5);
+    std::uniform_real_distribution<float> jitter(-0.6f, 0.6f);
+    for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+      cloud.x[i] += jitter(generator);
+      cloud.y[i] += jitter(generator);
+      cloud.z[i] += jitter(generator);
+    }
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.set_radius(1.0f);
+    search.run();
+    if ((search.last_stats().paths & apfrnn::NSearch::kPathSameBlockRows) !=
+        0) {
+      ++block_frames;
+    }
+    check_same_set(search, id, cloud, 1.0f);
+  }
+  CHECK(block_frames > 0);
+}
