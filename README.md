@@ -289,3 +289,12 @@ comparison.
 ./scripts/profile.sh build 50000 # samply profile of the NSearch benchmark
 ./scripts/ispc_analyze.sh        # ISPC asm/IR + llvm-mca per kernel
 ```
+
+The test suite includes a multi-frame fuzz test (`tests/fuzz_test.cpp`) that
+mutates random multi-set scenes between frames and checks every active pair
+against a reference on every frame. It also requires its seeds to take, enter
+and leave every code path recorded in `RunStats::paths`, so a new path needs
+fuzz coverage. `APFRNN_FUZZ_SEEDS`, `APFRNN_FUZZ_FIRST_SEED`,
+`APFRNN_FUZZ_SEED` (replay one seed) and `APFRNN_FUZZ_TRACE=1` control it; a
+long soak is `APFRNN_FUZZ_SEEDS=6000 ./build/tests/ispc_apfrnn_tests
+-tc='multi-frame fuzz*'`.

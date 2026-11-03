@@ -15,12 +15,16 @@ ctest --test-dir "${release_build}" --output-on-failure
 cmake -S . -B "${asan_build}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  -DCMAKE_CXX_FLAGS='-D_GLIBCXX_ASSERTIONS -fsanitize=address,undefined -fno-omit-frame-pointer' \
   -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
   -DAPFRNN_BUILD_BASELINES=OFF
 cmake --build "${asan_build}" -j 8
+# _GLIBCXX_ASSERTIONS bounds-checks every std::vector access, and the Debug
+# build checks the cell range tables the ISPC kernels read through raw
+# pointers. The fuzz test runs fewer seeds here (correctness only; the
+# Release run above checks that its seeds reach every code path).
 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ASAN_OPTIONS=detect_leaks=1 \
-  "./${asan_build}/tests/ispc_apfrnn_tests"
+  APFRNN_FUZZ_SEEDS=24 "./${asan_build}/tests/ispc_apfrnn_tests"
 
 # TSan is intentionally not part of the gate: the current oneTBB build reports
 # races inside its work-stealing partitioner. Re-enable after a TSan-compatible
