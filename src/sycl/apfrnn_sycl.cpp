@@ -90,12 +90,6 @@ bool output_within_limit(int64_t total) {
   return true;
 }
 
-// The grouped-query ESIMD kernel wins on the 200k-500k scenes. At 1M the
-// frame is output-copy-bound and the two same-set kernels are within ~1%, so
-// keep the cell-major SIMT path as the >500k fallback until larger/high-degree
-// cases are re-measured with the same work-list and meta optimizations.
-bool group16_enabled(int n) { return n <= 500000; }
-
 sycl::queue *gpu_queue() {
   static sycl::queue *queue = nullptr;
   static bool attempted = false;
@@ -367,11 +361,8 @@ DeviceGrid build_grid_gpu(sycl::queue &q, const float *xyz, int n,
   g.y = sycl::malloc_device<float>(static_cast<std::size_t>(n) + kVecPad, q);
   g.z = sycl::malloc_device<float>(static_cast<std::size_t>(n) + kVecPad, q);
   g.original = sycl::malloc_device<int>(static_cast<std::size_t>(n) + kVecPad, q);
-  const bool with_aos = group16_enabled(n);
-  if (with_aos) {
-    g.aos =
-        sycl::malloc_device<AosPoint>(static_cast<std::size_t>(n) + kVecPad, q);
-  }
+  g.aos =
+      sycl::malloc_device<AosPoint>(static_cast<std::size_t>(n) + kVecPad, q);
   g.starts = sycl::malloc_device<int>(g.cell_count, q);
   g.counts = dcounts;
   q.parallel_for(sycl::range<1>(g.cell_count),
@@ -429,38 +420,22 @@ DeviceGrid build_grid_gpu(sycl::queue &q, const float *xyz, int n,
   q.memcpy(g.meta, meta.data(), g.cell_count * sizeof(CellMeta));
   q.memcpy(g.starts, starts.data(), g.cell_count * sizeof(int));
   q.memcpy(dcursor, starts.data(), g.cell_count * sizeof(int));
-  if (with_aos) {
-    q.parallel_for(sycl::range<1>(static_cast<std::size_t>(n)),
-                   [=](sycl::id<1> id) {
-                     const int i = static_cast<int>(id[0]);
-                     const int c = dcell[i];
-                     sycl::atomic_ref<int, sycl::memory_order::relaxed,
-                                      sycl::memory_scope::device>
-                         cursor(dcursor[c]);
-                     const int dst = cursor.fetch_add(1);
-                     g.x[dst] = dxyz[3 * i + 0];
-                     g.y[dst] = dxyz[3 * i + 1];
-                     g.z[dst] = dxyz[3 * i + 2];
-                     g.original[dst] = i;
-                     g.aos[dst] = AosPoint{dxyz[3 * i + 0], dxyz[3 * i + 1],
-                                           dxyz[3 * i + 2],
-                                           static_cast<int32_t>(i)};
-                   });
-  } else {
-    q.parallel_for(sycl::range<1>(static_cast<std::size_t>(n)),
-                   [=](sycl::id<1> id) {
-                     const int i = static_cast<int>(id[0]);
-                     const int c = dcell[i];
-                     sycl::atomic_ref<int, sycl::memory_order::relaxed,
-                                      sycl::memory_scope::device>
-                         cursor(dcursor[c]);
-                     const int dst = cursor.fetch_add(1);
-                     g.x[dst] = dxyz[3 * i + 0];
-                     g.y[dst] = dxyz[3 * i + 1];
-                     g.z[dst] = dxyz[3 * i + 2];
-                     g.original[dst] = i;
-                   });
-  }
+  q.parallel_for(sycl::range<1>(static_cast<std::size_t>(n)),
+                 [=](sycl::id<1> id) {
+                   const int i = static_cast<int>(id[0]);
+                   const int c = dcell[i];
+                   sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                                    sycl::memory_scope::device>
+                       cursor(dcursor[c]);
+                   const int dst = cursor.fetch_add(1);
+                   g.x[dst] = dxyz[3 * i + 0];
+                   g.y[dst] = dxyz[3 * i + 1];
+                   g.z[dst] = dxyz[3 * i + 2];
+                   g.original[dst] = i;
+                   g.aos[dst] = AosPoint{dxyz[3 * i + 0], dxyz[3 * i + 1],
+                                         dxyz[3 * i + 2],
+                                         static_cast<int32_t>(i)};
+                 });
   q.wait();
   sycl::free(dxyz, q);
   sycl::free(dcell, q);
@@ -726,153 +701,6 @@ int64_t search_pair_same_group16(sycl::queue &q, ApfrnnSyclContext &ctx,
             }
           }
         });
-  });
-  q.wait();
-  copy_rows(q, ctx, slot, dout, total, async_output, async_idx);
-  return total;
-}
-
-int64_t search_pair_same_cell_major(sycl::queue &q, ApfrnnSyclContext &ctx,
-                                          const DeviceGrid &target, int slot,
-                                          bool async_output = false) {
-  constexpr int kCellsPerWG = 4;
-  constexpr int kLanesPerCell = 8;
-  constexpr int kWG = kCellsPerWG * kLanesPerCell;
-  const int nq = target.n;
-  const std::size_t cell_count = target.cell_count;
-  if (nq == 0 || cell_count == 0) {
-    return 0;
-  }
-  ensure_device<int>(q, ctx.dcounts, ctx.dcounts_cap,
-                     static_cast<std::size_t>(nq));
-  const float radius2 = target.radius * target.radius;
-  const int nx = target.nx, ny = target.ny, nz = target.nz;
-  const float *tx = target.x;
-  const float *ty = target.y;
-  const float *tz = target.z;
-  const int *torig = target.original;
-  const int *tstarts = target.starts;
-  const int *tcounts = target.counts;
-  int *dcounts = ctx.dcounts;
-
-  q.parallel_for(
-      sycl::nd_range<1>(
-          sycl::range<1>(((cell_count + kCellsPerWG - 1) / kCellsPerWG) * kWG),
-          sycl::range<1>(kWG)),
-      [=](sycl::nd_item<1> item) {
-        const int group = static_cast<int>(item.get_group(0));
-        const int lane = static_cast<int>(item.get_local_id(0));
-        const int sub = lane / kLanesPerCell;
-        const int qlane = lane % kLanesPerCell;
-        const int cell = group * kCellsPerWG + sub;
-        if (cell >= static_cast<int>(cell_count)) {
-          return;
-        }
-        const int cz = cell / (nx * ny);
-        const int rem = cell % (nx * ny);
-        const int cy = rem / nx;
-        const int cx = rem % nx;
-        const int begin = tstarts[cell];
-        const int end = begin + tcounts[cell];
-        for (int q = begin + qlane; q < end; q += kLanesPerCell) {
-          const int qi = torig[q];
-          const float qx = tx[q];
-          const float qy = ty[q];
-          const float qz = tz[q];
-          int count = 0;
-          for (int dz = -1; dz <= 1; ++dz) {
-            const int z = cz + dz;
-            if (z < 0 || z >= nz) continue;
-            for (int dy = -1; dy <= 1; ++dy) {
-              const int y = cy + dy;
-              if (y < 0 || y >= ny) continue;
-              for (int dx = -1; dx <= 1; ++dx) {
-                const int x = cx + dx;
-                if (x < 0 || x >= nx) continue;
-                const int nc = (z * ny + y) * nx + x;
-                const int nb = tstarts[nc];
-                const int ne = nb + tcounts[nc];
-                for (int j = nb; j < ne; ++j) {
-                  const float ddx = tx[j] - qx;
-                  const float ddy = ty[j] - qy;
-                  const float ddz = tz[j] - qz;
-                  if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2 &&
-                      torig[j] != qi) {
-                    ++count;
-                  }
-                }
-              }
-            }
-          }
-          dcounts[qi] = count;
-        }
-      });
-  q.wait();
-
-  int32_t *dout = nullptr;
-  int64_t *doffsets = nullptr;
-  int async_idx = -1;
-  const int64_t total =
-      prepare_rows(q, ctx, nq, slot, async_output, dout, doffsets, &async_idx);
-  if (total < 0) {
-    return -1;
-  }
-
-  q.submit([&](sycl::handler &h) {
-    if (async_output && async_idx >= 0 && ctx.async_copy_valid[async_idx]) {
-      h.depends_on(ctx.async_copy_event[async_idx]);
-    }
-    h.parallel_for(
-      sycl::nd_range<1>(
-          sycl::range<1>(((cell_count + kCellsPerWG - 1) / kCellsPerWG) * kWG),
-          sycl::range<1>(kWG)),
-      [=](sycl::nd_item<1> item) {
-        const int group = static_cast<int>(item.get_group(0));
-        const int lane = static_cast<int>(item.get_local_id(0));
-        const int sub = lane / kLanesPerCell;
-        const int qlane = lane % kLanesPerCell;
-        const int cell = group * kCellsPerWG + sub;
-        if (cell >= static_cast<int>(cell_count)) {
-          return;
-        }
-        const int cz = cell / (nx * ny);
-        const int rem = cell % (nx * ny);
-        const int cy = rem / nx;
-        const int cx = rem % nx;
-        const int begin = tstarts[cell];
-        const int end = begin + tcounts[cell];
-        for (int q = begin + qlane; q < end; q += kLanesPerCell) {
-          const int qi = torig[q];
-          const float qx = tx[q];
-          const float qy = ty[q];
-          const float qz = tz[q];
-          int64_t pos = doffsets[qi];
-          for (int dz = -1; dz <= 1; ++dz) {
-            const int z = cz + dz;
-            if (z < 0 || z >= nz) continue;
-            for (int dy = -1; dy <= 1; ++dy) {
-              const int y = cy + dy;
-              if (y < 0 || y >= ny) continue;
-              for (int dx = -1; dx <= 1; ++dx) {
-                const int x = cx + dx;
-                if (x < 0 || x >= nx) continue;
-                const int nc = (z * ny + y) * nx + x;
-                const int nb = tstarts[nc];
-                const int ne = nb + tcounts[nc];
-                for (int j = nb; j < ne; ++j) {
-                  const float ddx = tx[j] - qx;
-                  const float ddy = ty[j] - qy;
-                  const float ddz = tz[j] - qz;
-                  if (ddx * ddx + ddy * ddy + ddz * ddz <= radius2 &&
-                      torig[j] != qi) {
-                    dout[pos++] = torig[j];
-                  }
-                }
-              }
-            }
-          }
-        }
-      });
   });
   q.wait();
   copy_rows(q, ctx, slot, dout, total, async_output, async_idx);
@@ -1204,18 +1032,15 @@ int apfrnn_sycl_exact_pair(ApfrnnSyclContext *ctx,
     }
 
     int64_t total = -1;
-    // Grouped-query ESIMD for same-set grids up to 500k (the ones built with
-    // an AoS copy), the cell-major SIMT kernel otherwise.
+    // Same-set uses the grouped-query ESIMD kernel; cross uses the SIMT
+    // kernel because target-cell divergence does not fit the 16-query block.
     const bool defer_same = defer_copy != 0 && same_set != 0;
     if (same_set == 0) {
       total = search_pair_cross_cell_major(*q, *ctx, *query_grid,
                                            *target_grid, slot);
-    } else if (target_grid->aos != nullptr) {
+    } else {
       total = search_pair_same_group16(*q, *ctx, *target_grid, slot,
                                        defer_same);
-    } else {
-      total = search_pair_same_cell_major(*q, *ctx, *target_grid, slot,
-                                          defer_same);
     }
     if (total < 0) {
       return 7;
