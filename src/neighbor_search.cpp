@@ -441,6 +441,11 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
       continue;
     }
     const float max_distance_sq = sync_source(set);
+    if (max_distance_sq > 0.0f) {
+      // The packed GPU copy and the cached grid are stale once any point
+      // moved. A static frame keeps both across runs.
+      point_set.gpu_xyz_valid = false;
+    }
     last_stats_.max_displacement_sq =
         std::max(last_stats_.max_displacement_sq, max_distance_sq);
     const bool target_unchanged =
@@ -468,9 +473,6 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     if (effective_backend_ == SearchBackend::GpuExact) {
-      if (!point_set.is_static) {
-        point_set.gpu_xyz_valid = false;
-      }
       if (point_set.is_static && (!point_set.valid || point_set.dirty)) {
         sync_source(set);
       }
