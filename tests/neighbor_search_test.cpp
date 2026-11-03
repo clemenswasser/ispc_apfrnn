@@ -1781,3 +1781,36 @@ TEST_CASE("CSR fallback rows stay exact on a skin-reused target") {
 
   check_cross_set(search, p, f, probes, fluid, radius);
 }
+
+TEST_CASE("a set that switches from block rows to the sweep reads sweep rows") {
+  // Frame 1 writes block rows (per-block row offsets); frame 2 moves one
+  // point far enough for the sweep backend, whose rows use the plain fixed
+  // layout and must not be read through the old block offsets.
+  int block_frames = 0;
+  for (int shift = 16; shift <= 26; ++shift) {
+    CAPTURE(shift);
+    auto cloud = apfrnn::bench::make_clustered(3000, 14.0f, 17);
+    auto xyz = interleave(cloud);
+    apfrnn::NSearch search(1.7f);
+    search.set_memory_budget(int64_t(1) << shift);
+    const int id =
+        search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+    search.set_all_searches(true);
+    search.run();
+    if ((search.last_stats().paths & apfrnn::NSearch::kPathSameBlockRows) ==
+        0) {
+      continue;
+    }
+    ++block_frames;
+
+    // The sweep's fixed rows need the default budget.
+    search.set_memory_budget(int64_t(3) << 30);
+    apfrnn::support::set_extreme_outlier(cloud, 0);
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathSameSweep) != 0);
+    check_same_set(search, id, cloud, 1.7f);
+  }
+  CHECK(block_frames > 0);
+}

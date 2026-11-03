@@ -1316,6 +1316,9 @@ void NSearch::build_same_lists(int set) {
   }
   if (point_set.use_sweep) {
     if (build_sweep_same_lists(set)) {
+      // Sweep rows use the plain fixed layout; get_neighbors would read them
+      // through the block-row offsets of an earlier frame otherwise.
+      point_set.block_rows = false;
       note_path(kPathSameSweep);
       return;
     }
