@@ -3,6 +3,7 @@
 #include "kernel_ispc.h"
 
 #include <algorithm>
+#include <cassert>
 #include <atomic>
 #include <climits>
 #include <cmath>
@@ -560,7 +561,38 @@ ispc::HashGrid hash_of(const NeighborSearchData &data) {
           data.hash_mask};
 }
 
+// Debug builds check that the range tables the kernels will read through raw
+// pointers cover every cell: stale (cleared or shared) ranges are the bug
+// class the STL's own bounds checks cannot see.
+template <typename Data> void check_ranges(const Data &data) {
+#ifndef NDEBUG
+  const IntBuffer &starts = data.shared_starts != nullptr
+                                ? *data.shared_starts
+                                : data.cell_neighbor_starts;
+  const IntBuffer &ends =
+      data.shared_ends != nullptr ? *data.shared_ends : data.cell_neighbor_ends;
+  const std::size_t cells = static_cast<std::size_t>(data.num_cells);
+  assert(data.cell_neighbor_offset.size() >= cells);
+  assert(data.cell_num_neighbors.size() >= cells);
+  assert(starts.size() == ends.size());
+  for (std::size_t cell = 0; cell < cells; ++cell) {
+    const int offset = data.cell_neighbor_offset[cell];
+    const int count = data.cell_num_neighbors[cell];
+    assert(offset >= 0 && count >= 0);
+    assert(static_cast<std::size_t>(offset) + static_cast<std::size_t>(count) <=
+           starts.size());
+    for (int k = offset; k < offset + count; ++k) {
+      assert(starts[static_cast<std::size_t>(k)] <=
+             ends[static_cast<std::size_t>(k)]);
+    }
+  }
+#else
+  (void)data;
+#endif
+}
+
 template <typename Data> ispc::CellRanges ranges_of(const Data &data) {
+  check_ranges(data);
   const int *starts = data.shared_starts != nullptr
                           ? data.shared_starts->data()
                           : data.cell_neighbor_starts.data();

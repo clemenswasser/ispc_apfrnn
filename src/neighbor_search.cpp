@@ -320,14 +320,56 @@ void NSearch::update_point_sets() {
   }
 }
 
+const char *NSearch::path_name(uint64_t path) {
+  switch (path) {
+  case kPathGridDense: return "grid_dense";
+  case kPathGridHash: return "grid_hash";
+  case kPathSweep: return "sweep";
+  case kPathSmallCells: return "small_cells";
+  case kPathRangeCacheBuilt: return "range_cache_built";
+  case kPathRangeCacheShared: return "range_cache_shared";
+  case kPathTargetReuse: return "target_reuse";
+  case kPathSkinReuse: return "skin_reuse";
+  case kPathSkinFilter: return "skin_filter";
+  case kPathParallelBuild: return "parallel_build";
+  case kPathParallelPairs: return "parallel_pairs";
+  case kPathSameSweep: return "same_sweep";
+  case kPathSameBlockRows: return "same_block_rows";
+  case kPathSameIsolated: return "same_isolated";
+  case kPathSameRangesDenseFused: return "same_ranges_dense_fused";
+  case kPathSameRangesMerged: return "same_ranges_merged";
+  case kPathSamePairDense: return "same_pair_dense";
+  case kPathSameBlocked: return "same_blocked";
+  case kPathSameQueryPair: return "same_query_pair";
+  case kPathSameActive2: return "same_active2";
+  case kPathSameGrown: return "same_grown";
+  case kPathSameCsr: return "same_csr";
+  case kPathCrossSweep: return "cross_sweep";
+  case kPathCrossNoCandidates: return "cross_no_candidates";
+  case kPathCrossTargetMajor: return "cross_target_major";
+  case kPathCrossPairDense: return "cross_pair_dense";
+  case kPathCrossQueryPair: return "cross_query_pair";
+  case kPathCrossBlocked: return "cross_blocked";
+  case kPathCrossActive2: return "cross_active2";
+  case kPathCrossGrown: return "cross_grown";
+  case kPathCrossCsr: return "cross_csr";
+  case kPathGpu: return "gpu";
+  }
+  return "unknown";
+}
+
 void NSearch::run() {
   last_stats_ = RunStats{};
+  path_bits_.store(0, std::memory_order_relaxed);
   if (sets_.empty()) {
     return;
   }
 
   const int set_count = static_cast<int>(sets_.size());
   update_cell_size();
+  if (use_small_cells_) {
+    note_path(kPathSmallCells);
+  }
   last_stats_.pair_ms.assign(static_cast<std::size_t>(set_count) *
                                  static_cast<std::size_t>(set_count),
                              0.0);
@@ -404,6 +446,7 @@ void NSearch::run() {
     }
   }
   if (pair_parallel) {
+    note_path(kPathParallelPairs);
     struct Job {
       int set_i;
       int set_j;
@@ -488,7 +531,9 @@ void NSearch::run() {
         const auto pair_start = std::chrono::steady_clock::now();
         if (effective_backend_ == SearchBackend::GpuExact) {
           const bool defer_same = set_i == set_j;
-          if (!build_gpu_pair(pair, set_i, set_j, defer_same)) {
+          if (build_gpu_pair(pair, set_i, set_j, defer_same)) {
+            note_path(kPathGpu);
+          } else {
             // The GPU path is an opt-in accelerator; on any failure restart the
             // run on the canonical CPU Exact path. Drain any copy already
             // queued for an earlier pair first.
@@ -526,9 +571,11 @@ void NSearch::run() {
     const auto filter_start = std::chrono::steady_clock::now();
     filter_skin_lists();
     last_stats_.filter_ms = elapsed_ms(filter_start);
+    note_path(kPathSkinFilter);
   }
 
   collect_memory_stats();
+  last_stats_.paths = path_bits_.load(std::memory_order_relaxed);
 }
 
 void NSearch::update_cell_size() {
@@ -576,6 +623,7 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     if (target_unchanged) {
       point_set.dirty = false;
       ++last_stats_.reused_sets;
+      note_path(kPathTargetReuse);
     } else if (skin_ <= 0.0f || point_set.dirty || !point_set.valid ||
                !point_set.skin_lists ||
                max_distance_sq > reuse_distance_sq) {
@@ -583,6 +631,7 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
       ++last_stats_.rebuilt_sets;
     } else {
       ++last_stats_.reused_sets;
+      note_path(kPathSkinReuse);
     }
   }
 }
@@ -647,6 +696,7 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   };
 
   if (build_sets.size() > 1 && max_points <= 32768) {
+    note_path(kPathParallelBuild);
     parallel_pairs_ = true;
     parallel_overflows_.store(0, std::memory_order_relaxed);
     tbb::parallel_for(
@@ -661,6 +711,30 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   } else {
     for (int set : build_sets) {
       build_one(set);
+    }
+  }
+  // Counted after the builds: they may run in parallel, and a set's grid
+  // kind is only known once it is built.
+  for (int set : build_sets) {
+    const PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+    if (point_set.use_sweep) {
+      ++last_stats_.sweep_sets;
+      note_path(kPathSweep);
+      continue;
+    }
+    ++last_stats_.grid_sets;
+    last_stats_.grid_cells += point_set.data.num_cells;
+    last_stats_.dense_cells +=
+        static_cast<int>(point_set.data.dense_cells.size());
+    if (point_set.data.dense_valid) {
+      ++last_stats_.dense_sets;
+      note_path(kPathGridDense);
+    } else {
+      ++last_stats_.hash_sets;
+      note_path(kPathGridHash);
+    }
+    if (point_set.data.dense_cache_valid) {
+      note_path(kPathRangeCacheBuilt);
     }
   }
   for (double ms : grid_ms) {
@@ -692,6 +766,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
 
   if (source.use_sweep || target.use_sweep) {
     if (build_sweep_cross_lists(pair, source, target)) {
+      note_path(kPathCrossSweep);
       return;
     }
     ensure_grid(source);
@@ -708,26 +783,31 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   auto try_fixed = [&](int capacity) {
     switch (cross_plan.writer) {
     case plan::CrossWriter::TargetMajor:
+      note_path(kPathCrossTargetMajor);
       write_cross_neighbors_target_major_parallel(
           pair.cross, source.data, target.data, capacity,
           pair.fixed_neighbors, pair.fixed_counts);
       break;
     case plan::CrossWriter::PairDense:
+      note_path(kPathCrossPairDense);
       write_cross_neighbors_fixed_query_pair_dense_parallel(
           pair.cross, source.data, target.data, capacity,
           pair.fixed_neighbors, pair.fixed_counts);
       break;
     case plan::CrossWriter::QueryPair:
+      note_path(kPathCrossQueryPair);
       write_cross_neighbors_fixed_query_pair_parallel(
           pair.cross, target.data, capacity, pair.fixed_neighbors,
           pair.fixed_counts);
       break;
     case plan::CrossWriter::Blocked:
+      note_path(kPathCrossBlocked);
       write_cross_neighbors_fixed_query_blocked_parallel(
           pair.cross, target.data, source.data, capacity,
           pair.fixed_neighbors, pair.fixed_counts);
       break;
     case plan::CrossWriter::Active2:
+      note_path(kPathCrossActive2);
       write_cross_neighbors_fixed_query_active2_parallel(
           pair.cross, target.data, capacity, pair.fixed_neighbors,
           pair.fixed_counts);
@@ -749,7 +829,11 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     if (cross_plan.build_ranges) {
       build_cross_cell_ranges_from_sorted_inplace(pair.cross, source.data,
                                                   target.data, build_radius());
+      if (pair.cross.shared_starts != nullptr) {
+        note_path(kPathRangeCacheShared);
+      }
       if (plan::cross_has_no_candidates(pair.cross)) {
+        note_path(kPathCrossNoCandidates);
         pair.fixed_counts.assign(
             static_cast<std::size_t>(source.data.num_points), 0);
         pair.fixed_capacity = 1;
@@ -767,8 +851,11 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     const int grown = plan::cross_grown_capacity(
         max_row_count(pair.fixed_counts), source.data.num_points,
         memory_budget_);
-    if (grown > 0 && try_fixed(grown)) {
-      return;
+    if (grown > 0) {
+      note_path(kPathCrossGrown);
+      if (try_fixed(grown)) {
+        return;
+      }
     }
     if (parallel_pairs_) {
       parallel_overflows_.fetch_add(1, std::memory_order_relaxed);
@@ -779,6 +866,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.fixed_counts.clear();
   }
 
+  note_path(kPathCrossCsr);
   pair.skin_lists = false;
   pair.active_valid = false;
   build_cross_neighbor_search_data_from_sorted_inplace(pair.cross, source.data,
@@ -1123,16 +1211,7 @@ void NSearch::build_point_grid(int set) {
     sweep::ensure_index(point_set.sweep, point_set.x);
     point_set.use_sweep = true;
     point_set.valid = true;
-    ++last_stats_.sweep_sets;
     return;
-  }
-  ++last_stats_.grid_sets;
-  last_stats_.grid_cells += point_set.data.num_cells;
-  last_stats_.dense_cells += static_cast<int>(point_set.data.dense_cells.size());
-  if (point_set.data.dense_valid) {
-    ++last_stats_.dense_sets;
-  } else {
-    ++last_stats_.hash_sets;
   }
 
   point_set.use_sweep = false;
@@ -1152,6 +1231,7 @@ void NSearch::build_same_lists(int set) {
   }
   if (point_set.use_sweep) {
     if (build_sweep_same_lists(set)) {
+      note_path(kPathSameSweep);
       return;
     }
     ensure_grid(point_set);
@@ -1168,6 +1248,7 @@ void NSearch::build_grid_same_lists(int set) {
   point_set.fixed_valid = false;
   if (point_set.block_rows) {
     if (build_same_block_rows(set)) {
+      note_path(kPathSameBlockRows);
       return;
     }
     point_set.block_rows = false;
@@ -1178,18 +1259,22 @@ void NSearch::build_grid_same_lists(int set) {
   auto try_fixed = [&](int capacity) {
     switch (same_plan.writer) {
     case plan::SameWriter::PairDense:
+      note_path(kPathSamePairDense);
       write_neighbors_fixed_query_pair_dense_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
     case plan::SameWriter::Blocked:
+      note_path(kPathSameBlocked);
       write_neighbors_fixed_query_blocked_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
     case plan::SameWriter::QueryPair:
+      note_path(kPathSameQueryPair);
       write_neighbors_fixed_query_pair_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
     case plan::SameWriter::Active2:
+      note_path(kPathSameActive2);
       write_neighbors_fixed_query_active2_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
@@ -1214,14 +1299,20 @@ void NSearch::build_grid_same_lists(int set) {
     case plan::SameRanges::None:
       break;
     case plan::SameRanges::DenseFused:
+      note_path(kPathSameRangesDenseFused);
       build_same_set_cell_ranges_dense_fused_inplace(data);
       break;
     case plan::SameRanges::Merged:
+      note_path(kPathSameRangesMerged);
       build_same_set_cell_ranges_inplace(data);
       break;
     }
+    if (data.shared_starts != nullptr) {
+      note_path(kPathRangeCacheShared);
+    }
     if (same_plan.ranges != plan::SameRanges::None &&
         plan::same_set_isolated(data)) {
+      note_path(kPathSameIsolated);
       point_set.fixed_counts.assign(static_cast<std::size_t>(data.num_points),
                                     0);
       point_set.fixed_capacity = 1;
@@ -1239,8 +1330,11 @@ void NSearch::build_grid_same_lists(int set) {
     const int grown = plan::same_grown_capacity(
         max_row_count(point_set.fixed_counts), data.num_points,
         memory_budget_);
-    if (grown > 0 && try_fixed(grown)) {
-      return;
+    if (grown > 0) {
+      note_path(kPathSameGrown);
+      if (try_fixed(grown)) {
+        return;
+      }
     }
     if (parallel_pairs_) {
       parallel_overflows_.fetch_add(1, std::memory_order_relaxed);
@@ -1252,10 +1346,12 @@ void NSearch::build_grid_same_lists(int set) {
   }
 
   if (build_same_block_rows(set)) {
+    note_path(kPathSameBlockRows);
     return;
   }
   point_set.block_rows = false;
 
+  note_path(kPathSameCsr);
   point_set.skin_lists = false;
   point_set.active_valid = false;
   build_same_set_neighbor_lists_inplace(data, radius_);

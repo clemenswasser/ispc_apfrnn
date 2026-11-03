@@ -41,6 +41,47 @@ enum class SearchBackend {
 // user-side z-sorting, and top-k queries.
 class NSearch {
 public:
+  // Code paths one run() can take, as bits of RunStats::paths. Tests use them
+  // to check that every path (and every change of path between frames) is
+  // exercised; the bits are diagnostics, not a stable API.
+  enum Path : uint64_t {
+    kPathGridDense = 1ull << 0,       // a set built a dense cell lookup
+    kPathGridHash = 1ull << 1,        // a set built a hashed cell lookup
+    kPathSweep = 1ull << 2,           // a set uses the sweep backend
+    kPathSmallCells = 1ull << 3,      // half-radius cells for this run
+    kPathRangeCacheBuilt = 1ull << 4, // a set built the shared range cache
+    kPathRangeCacheShared = 1ull << 5,  // a pair read the shared cache
+    kPathTargetReuse = 1ull << 6,     // an unchanged target kept its grid
+    kPathSkinReuse = 1ull << 7,       // a set kept its skin lists
+    kPathSkinFilter = 1ull << 8,      // skin lists were filtered to radius
+    kPathParallelBuild = 1ull << 9,   // small sets were built in parallel
+    kPathParallelPairs = 1ull << 10,  // small pairs ran as one parallel job
+    kPathSameSweep = 1ull << 11,
+    kPathSameBlockRows = 1ull << 12,
+    kPathSameIsolated = 1ull << 13,
+    kPathSameRangesDenseFused = 1ull << 14,
+    kPathSameRangesMerged = 1ull << 15,
+    kPathSamePairDense = 1ull << 16,
+    kPathSameBlocked = 1ull << 17,
+    kPathSameQueryPair = 1ull << 18,
+    kPathSameActive2 = 1ull << 19,
+    kPathSameGrown = 1ull << 20,      // fixed rows overflowed and regrew
+    kPathSameCsr = 1ull << 21,
+    kPathCrossSweep = 1ull << 22,
+    kPathCrossNoCandidates = 1ull << 23,
+    kPathCrossTargetMajor = 1ull << 24,
+    kPathCrossPairDense = 1ull << 25,
+    kPathCrossQueryPair = 1ull << 26,
+    kPathCrossBlocked = 1ull << 27,
+    kPathCrossActive2 = 1ull << 28,
+    kPathCrossGrown = 1ull << 29,
+    kPathCrossCsr = 1ull << 30,
+    kPathGpu = 1ull << 31,
+  };
+  static constexpr int kPathBits = 32;
+  // Short name of one Path bit, e.g. "same_csr".
+  static const char *path_name(uint64_t path);
+
   struct RunStats {
     double sync_build_ms = 0.0;
     double grid_ms = 0.0;
@@ -67,6 +108,8 @@ public:
     int dense_sets = 0;
     int hash_sets = 0;
     float max_displacement_sq = 0.0f;
+    // Bits of Path for every code path this run took.
+    uint64_t paths = 0;
   };
 
   explicit NSearch(float radius);
@@ -158,6 +201,9 @@ private:
                       bool defer_same_copy);
   bool gpu_policy_ok();
   bool max_cell_occupancy(PointSet &set, int &max_points);
+  void note_path(uint64_t path) {
+    path_bits_.fetch_or(path, std::memory_order_relaxed);
+  }
 
   float radius_;
   SearchBackend search_backend_ = SearchBackend::CpuExact;
@@ -171,6 +217,8 @@ private:
   RunStats last_stats_;
   bool parallel_pairs_ = false;
   std::atomic<int> parallel_overflows_{0};
+  // Path bits of the current run; pairs and set builds may run in parallel.
+  std::atomic<uint64_t> path_bits_{0};
 };
 
 } // namespace apfrnn
