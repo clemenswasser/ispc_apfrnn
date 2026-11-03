@@ -164,7 +164,7 @@ there.
 | thin slab | 243 | 14.9 ms | 23.9 ms | 225 ms | 1.6x | 15x |
 | surface | 270 | 15.3 ms | 21.8 ms | 81.4 ms | 1.4x | 5.3x |
 | two-scale clusters | 575 | 26.0 ms | 36.5 ms | 684 ms | 1.4x | 26x |
-| clustered | 632 | 26.1 ms | 42.4 ms | 1125 ms | 1.6x | 43x |
+| clustered | 632 | 31.4 ms | 41.7 ms | 1107 ms | 1.3x | 35x |
 | thin pipe | 3400 | 112 ms | 156 ms | 1262 ms | 1.4x | 11x |
 | pathological (10k, one cell) | 10000 | 37.6 ms | 54.7 ms | 345 ms | 1.5x | 9.2x |
 
