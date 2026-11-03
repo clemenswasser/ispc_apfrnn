@@ -137,9 +137,12 @@ int cross_grown_capacity(int max_count, int num_points,
 }
 
 int same_fitted_capacity(int max_count, int capacity) {
-  // Rows up to 4096 are fitted exactly (rounded to 8); longer rows keep a
-  // margin so small degree changes do not force a regrow.
-  const int margin = max_count <= 4096 ? 0 : std::max(8, max_count / 16);
+  // Low-degree rows already have rounding slack and dominate memory, so keep
+  // them exact. Higher-degree rows keep a margin: a moving set whose maximum
+  // degree fluctuates would otherwise regrow and rewrite every row on
+  // alternate frames.
+  const int margin =
+      max_count <= 64 ? 0 : std::max(8, max_count / 16);
   return std::min(capacity, std::max(32, (max_count + margin + 7) & ~7));
 }
 

@@ -73,9 +73,9 @@ TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
   CHECK(plan.first_capacity == 4096);  // clamped to the cross maximum
 }
 
-TEST_CASE("fitted capacities keep a margin only where documented") {
+TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(10, 128) == 32);
-  CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 72);
+  CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 80);
   CHECK(apfrnn::plan::same_fitted_capacity(8000, 16384) == 8504);
   CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) == 80);
   CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == 64);
