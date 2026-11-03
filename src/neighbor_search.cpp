@@ -533,43 +533,50 @@ void NSearch::run() {
                           static_cast<std::size_t>(job.set_j)] += pair_ms;
     }
   } else {
-    for (int set_i = 0; set_i < set_count; ++set_i) {
-      for (int set_j = 0; set_j < set_count; ++set_j) {
-        Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
-                           [static_cast<std::size_t>(set_j)];
-        if (!pair.active || pair.valid) {
-          continue;
-        }
-
-        const auto pair_start = std::chrono::steady_clock::now();
-        if (effective_backend_ == SearchBackend::GpuExact) {
-          const bool defer_same = set_i == set_j;
-          if (build_gpu_pair(pair, set_i, set_j, defer_same)) {
-            note_path(kPathGpu);
-          } else {
-            // The GPU path is an opt-in accelerator; on any failure restart the
-            // run on the canonical CPU Exact path. Drain any copy already
-            // queued for an earlier pair first.
-#ifdef APFRNN_HAVE_SYCL
-            apfrnn_sycl_wait(gpu_ ? gpu_->context : nullptr);
-#endif
-            set_search_backend(SearchBackend::CpuExact);
-            run();
-            return;
+    // A pair that converts a sweep set to a grid invalidates that set's
+    // earlier pairs (see ensure_grid), so repeat until every active pair is
+    // valid. Each set converts at most once per run.
+    for (bool built = true; built;) {
+      built = false;
+      for (int set_i = 0; set_i < set_count; ++set_i) {
+        for (int set_j = 0; set_j < set_count; ++set_j) {
+          Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                             [static_cast<std::size_t>(set_j)];
+          if (!pair.active || pair.valid) {
+            continue;
           }
-        } else {
-          build_cpu_pair(pair, set_i, set_j);
-        }
+          built = true;
 
-        const double pair_ms = elapsed_ms(pair_start);
-        if (set_i == set_j) {
-          last_stats_.same_set_ms += pair_ms;
-        } else {
-          last_stats_.cross_set_ms += pair_ms;
+          const auto pair_start = std::chrono::steady_clock::now();
+          if (effective_backend_ == SearchBackend::GpuExact) {
+            const bool defer_same = set_i == set_j;
+            if (build_gpu_pair(pair, set_i, set_j, defer_same)) {
+              note_path(kPathGpu);
+            } else {
+              // The GPU path is an opt-in accelerator; on any failure restart the
+              // run on the canonical CPU Exact path. Drain any copy already
+              // queued for an earlier pair first.
+  #ifdef APFRNN_HAVE_SYCL
+              apfrnn_sycl_wait(gpu_ ? gpu_->context : nullptr);
+  #endif
+              set_search_backend(SearchBackend::CpuExact);
+              run();
+              return;
+            }
+          } else {
+            build_cpu_pair(pair, set_i, set_j);
+          }
+
+          const double pair_ms = elapsed_ms(pair_start);
+          if (set_i == set_j) {
+            last_stats_.same_set_ms += pair_ms;
+          } else {
+            last_stats_.cross_set_ms += pair_ms;
+          }
+          last_stats_.pair_ms[static_cast<std::size_t>(set_i) *
+                                  static_cast<std::size_t>(set_count) +
+                              static_cast<std::size_t>(set_j)] += pair_ms;
         }
-        last_stats_.pair_ms[static_cast<std::size_t>(set_i) *
-                                static_cast<std::size_t>(set_count) +
-                            static_cast<std::size_t>(set_j)] += pair_ms;
       }
     }
   }
@@ -782,8 +789,8 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       note_path(kPathCrossSweep);
       return;
     }
-    ensure_grid(source);
-    ensure_grid(target);
+    ensure_grid(source, &pair);
+    ensure_grid(target, &pair);
   }
 
   if (plan::cross_wants_target_blocks(source.data, target.data)) {
@@ -1165,9 +1172,20 @@ void NSearch::set_skin(float skin) {
   }
 }
 
-void NSearch::ensure_grid(PointSet &point_set) {
+void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   if (!point_set.use_sweep) {
     return;
+  }
+  // Rows already built from this set this run (its same-set pair and cross
+  // pairs with it as the source) are indexed by the sweep's identity order;
+  // the grid below re-sorts the set, so they are rebuilt by run().
+  const int set = static_cast<int>(&point_set - sets_.data());
+  for (int other = 0; other < static_cast<int>(sets_.size()); ++other) {
+    Pair &pair =
+        pairs_[static_cast<std::size_t>(set)][static_cast<std::size_t>(other)];
+    if (&pair != building && pair.valid) {
+      clear_pair(pair);
+    }
   }
   point_set.use_sweep = false;
   point_set.sweep.clear();

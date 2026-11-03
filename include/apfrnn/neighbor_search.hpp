@@ -188,7 +188,8 @@ private:
   void collect_memory_stats();
 
   void build_point_grid(int set);
-  void ensure_grid(PointSet &point_set);
+  // Converts a sweep set to a grid; `building` is the pair being built.
+  void ensure_grid(PointSet &point_set, const Pair *building = nullptr);
   void build_same_lists(int set);
   bool build_sweep_same_lists(int set);
   void build_grid_same_lists(int set);

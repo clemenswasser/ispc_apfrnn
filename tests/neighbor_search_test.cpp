@@ -1592,3 +1592,43 @@ TEST_CASE("shared dense ranges are dropped when a set leaves the dense grid") {
   CHECK(search.last_stats().dense_sets == kSets);
   check_all();
 }
+
+TEST_CASE("a sweep set converted to a grid mid-run keeps earlier pairs exact") {
+  // The tight cluster plus one far point makes `sparse` a sweep set. Pair
+  // (sparse, dense) is built first from the sweep, in the caller's order.
+  // Pair (dense, sparse) then cannot fit its sweep rows into the small memory
+  // budget and converts `sparse` to a grid, which re-sorts it; the earlier
+  // pair (and the same-set pair) must not be read through the new order.
+  constexpr float radius = 1.7f;
+  apfrnn::support::PointCloud sparse;
+  std::mt19937 generator(9);
+  std::uniform_real_distribution<float> jitter(-0.01f, 0.01f);
+  sparse.x.push_back(510.0f);
+  sparse.y.push_back(510.0f);
+  sparse.z.push_back(510.0f);
+  for (int i = 0; i < 11; ++i) {
+    sparse.x.push_back(0.95f + jitter(generator));
+    sparse.y.push_back(0.01f + jitter(generator));
+    sparse.z.push_back(-0.46f + jitter(generator));
+  }
+  auto dense = apfrnn::support::make_point_cloud(1500, 10.0f, 4);
+  auto sparse_xyz = interleave(sparse);
+  auto dense_xyz = interleave(dense);
+
+  apfrnn::NSearch search(radius);
+  search.set_memory_budget(1 << 16);
+  const int s = search.add_point_set(sparse_xyz.data(),
+                                     static_cast<int>(sparse.x.size()));
+  const int d = search.add_point_set(dense_xyz.data(),
+                                     static_cast<int>(dense.x.size()));
+  search.set_all_searches(false);
+  search.set_active_search(s, s, true);
+  search.set_active_search(s, d, true);
+  search.set_active_search(d, s, true);
+  search.run();
+  CHECK((search.last_stats().paths & apfrnn::NSearch::kPathSweep) != 0);
+
+  check_same_set(search, s, sparse, radius);
+  check_cross_set(search, s, d, sparse, dense, radius);
+  check_cross_set(search, d, s, dense, sparse, radius);
+}
