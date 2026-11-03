@@ -763,55 +763,105 @@ export void write_fixed_rows_blocked(
   }
 }
 
-// CSR rows: a count pass (row_ptr == NULL: writes counts[q]) and a write pass
-// (writes each query's neighbors from col_idx[row_ptr[q]] on). Queries are
-// vectorized, targets are visited one at a time.
-export void csr_rows(
+// CSR count pass: queries are vectorized and targets are visited one at a
+// time. This is faster than the target-vectorized write loop when runs are
+// short, and it is the predicate the row_ptr layout is built from.
+export void csr_count_rows(
     uniform int start_cell, uniform int end_cell,
     const uniform Cells *uniform queries_in,
     const uniform CellRanges *uniform ranges_in,
     const uniform Points *uniform qpts_in,
     const uniform Points *uniform tpts_in, uniform bool same_set,
-    uniform float r2, uniform int counts[], uniform const int row_ptr[],
-    uniform int col_idx[]) {
+    uniform float r2, uniform int counts[]) {
   const uniform Cells queries = *queries_in;
   const uniform CellRanges ranges = *ranges_in;
   const uniform Points qpts = *qpts_in;
   const uniform Points tpts = *tpts_in;
-  const uniform bool write = row_ptr != NULL;
   for (uniform int cell = start_cell; cell < end_cell; ++cell) {
     const uniform int first = ranges.offset[cell];
     const uniform int num_runs = ranges.count[cell];
     foreach (i = queries.starts[cell]... queries.ends[cell]) {
       const float<3> q = point_at(qpts, i);
       int count = 0;
-      // Keep the row-local offset small and form the row base in 64-bit:
-      // a CSR offset past 2^29 entries would otherwise sign-extend a 32-bit
-      // byte offset and address before the buffer.
-      int slot = 0;
-      int * row = write ? col_idx + (int64)row_ptr[i] : NULL;
       for (uniform int run = 0; run < num_runs; ++run) {
-        const uniform int end = ranges.ends[first + run];
-#pragma unroll 4
-        for (uniform int j = ranges.starts[first + run]; j < end; ++j) {
-          // Compute the predicate once: the count and write passes must agree
-          // exactly, or the write can run past the counted row.
+        const uniform int run_end = ranges.ends[first + run];
+        for (uniform int j = ranges.starts[first + run]; j < run_end; ++j) {
           const bool hit =
               length_sq(point_at(tpts, j) - q) <= r2 && (!same_set || i != j);
           if (hit) {
-            if (write) {
-              row[slot++] = tpts.index[j];
-            } else {
-              ++count;
-            }
+            ++count;
           }
         }
       }
-      if (!write) {
-        counts[i] = count;
+      counts[i] = count;
+    }
+  }
+}
+
+// CSR write pass: writes each query's neighbors from col_idx[row_ptr[q]] on.
+// Queries are visited one at a time and targets are vectorized, so the active
+// targets can be compacted with packmask/shuffle instead of a per-lane
+// scatter. Each row is staged in scratch (capacity + 8 ints) and copied out
+// with vector stores; the row base is formed in 64-bit because a CSR offset
+// past 2^29 entries would otherwise sign-extend a 32-bit byte offset.
+export void csr_rows(
+    uniform int start_cell, uniform int end_cell,
+    const uniform Cells *uniform queries_in,
+    const uniform CellRanges *uniform ranges_in,
+    const uniform Points *uniform qpts_in,
+    const uniform Points *uniform tpts_in, uniform bool same_set,
+    uniform float r2, uniform const int row_ptr[], uniform int col_idx[],
+    uniform int scratch[], uniform const int perm[]) {
+  const uniform Cells queries = *queries_in;
+  const uniform CellRanges ranges = *ranges_in;
+  const uniform Points qpts = *qpts_in;
+  const uniform Points tpts = *tpts_in;
+  for (uniform int cell = start_cell; cell < end_cell; ++cell) {
+    const uniform int first = ranges.offset[cell];
+    const uniform int num_runs = ranges.count[cell];
+    for (uniform int query = queries.starts[cell];
+         query < queries.ends[cell]; ++query) {
+      const uniform float<3> q = point_at(qpts, query);
+      uniform int count = 0;
+      uniform int *uniform out = scratch;
+      for (uniform int run = 0; run < num_runs; ++run) {
+        const uniform int run_end = ranges.ends[first + run];
+        foreach (j = ranges.starts[first + run]... run_end) {
+          // Compute the predicate once: the count and write passes must agree
+          // exactly, or the write can run past the counted row.
+          const bool hit =
+              length_sq(point_at(tpts, j) - q) <= r2 && (!same_set || j != query);
+          const uniform int mask = packmask(hit);
+          out[programIndex] =
+              shuffle(tpts.index[j], perm[mask * 8 + programIndex]);
+          const uniform int added = popcnt(mask);
+          out += added;
+          count += added;
+        }
+      }
+      const uniform int row_start = row_ptr[query];
+      const uniform int row_len = row_ptr[query + 1] - row_start;
+      const uniform int n = min(count, row_len);
+      uniform int *uniform row = col_idx + (int64)row_start;
+      // col_idx is 32-byte aligned, so align the row start with a short scalar
+      // prefix and stream the rest without write-allocate traffic.
+      const uniform int prefix =
+          (programCount - (row_start & (programCount - 1))) &
+          (programCount - 1);
+      const uniform int prefix_end = min(prefix, n);
+      for (uniform int k = 0; k < prefix_end; ++k) {
+        row[k] = scratch[k];
+      }
+      uniform int k = prefix_end;
+      for (; k + programCount <= n; k += programCount) {
+        streaming_store(row + k, scratch[k + programIndex]);
+      }
+      for (; k < n; ++k) {
+        row[k] = scratch[k];
       }
     }
   }
+  memory_barrier();
 }
 
 // Coordinate sync: interleaved caller xyz -> SoA x/y/z for points

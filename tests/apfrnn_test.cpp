@@ -95,13 +95,13 @@ TEST_CASE("CSR writer forms the row base in 64-bit") {
   int tindex[1] = {42};
   ispc::Points tpts{tx, ty, tz, tindex};
 
-  int counts[1] = {0};
-  const int row_ptr[1] = {1 << 29};
+  const int row_ptr[2] = {1 << 29, (1 << 29) + 1};
   int *col_idx =
       reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(target) - kDelta);
 
-  ispc::csr_rows(0, 1, &queries, &ranges, &qpts, &tpts, false, 1.0f, counts,
-                 row_ptr, col_idx);
+  int scratch[9] = {0};
+  ispc::csr_rows(0, 1, &queries, &ranges, &qpts, &tpts, false, 1.0f, row_ptr,
+                 col_idx, scratch, apfrnn::neighbor_permutation_table());
 
   // The 64-bit row base must land on the target page. The old 32-bit byte
   // arithmetic wraps to target - 4 GiB, i.e. the wrong page.

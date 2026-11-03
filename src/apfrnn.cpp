@@ -17,6 +17,27 @@
 
 namespace apfrnn {
 
+const int *neighbor_permutation_table() {
+  struct NeighborPermutationTable {
+    alignas(32) int values[256 * 8];
+    NeighborPermutationTable() {
+      for (int mask = 0; mask < 256; ++mask) {
+        int count = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+          if ((mask & (1 << bit)) != 0) {
+            values[mask * 8 + count++] = bit;
+          }
+        }
+        while (count < 8) {
+          values[mask * 8 + count++] = 0;
+        }
+      }
+    }
+  };
+  static const NeighborPermutationTable table;
+  return table.values;
+}
+
 namespace {
 
 constexpr int kGrain = 64;
@@ -26,26 +47,12 @@ inline int cell_grain(int count) {
   return std::max(1, std::min(kGrain, count / 32));
 }
 
-struct NeighborPermutationTable {
-  alignas(32) int values[256 * 8];
-  NeighborPermutationTable() {
-    for (int mask = 0; mask < 256; ++mask) {
-      int count = 0;
-      for (int bit = 0; bit < 8; ++bit) {
-        if ((mask & (1 << bit)) != 0) {
-          values[mask * 8 + count++] = bit;
-        }
-      }
-      while (count < 8) {
-        values[mask * 8 + count++] = 0;
-      }
-    }
+inline int max_row_count(const IntBuffer &counts) {
+  int max_count = 0;
+  for (int count : counts) {
+    max_count = std::max(max_count, count);
   }
-};
-
-const int *neighbor_permutation_table() {
-  static const NeighborPermutationTable table;
-  return table.values;
+  return max_count;
 }
 
 // Sizes the fixed-row buffers. The writers rewrite every row, so the old
@@ -550,6 +557,32 @@ void write_rows_parallel(int num_items, int grain, int capacity,
       });
 }
 
+// CSR rows have exact capacity, so every row is staged in a per-thread
+// scratch row and copied out with streaming stores. The kernel compacts the
+// active target lanes instead of scattering them one lane at a time.
+template <typename Write>
+void write_csr_rows_parallel(int num_items, int grain, int capacity,
+                             Write write) {
+  const int stride = capacity + 8;
+  int max_threads = tbb::this_task_arena::max_concurrency();
+  if (max_threads < 1) {
+    max_threads = 1;
+  }
+  IntBuffer scratch;
+  scratch.resize(static_cast<std::size_t>(max_threads) * stride);
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_items, grain),
+      [&](const tbb::blocked_range<int> &range) {
+        int tid = tbb::this_task_arena::current_thread_index();
+        if (tid < 0 || tid >= max_threads) {
+          tid = 0;
+        }
+        int *scratch_row =
+            scratch.data() + static_cast<std::size_t>(tid) * stride;
+        write(range.begin(), range.end(), scratch_row);
+      });
+}
+
 // Blocked writers run over source blocks; small block counts use a finer
 // grain so all threads get work.
 int block_grain(int block_count) { return block_count < 256 ? 8 : 64; }
@@ -729,9 +762,9 @@ inline void build_cross_neighbor_lists_from_sorted(
         const ispc::CellRanges ranges = ranges_of(data);
         const ispc::Points qpts = query_points_of(data);
         const ispc::Points tpts = points_of(target_data);
-        ispc::csr_rows(range.begin(), range.end(), &queries, &ranges, &qpts,
-            &tpts, false, data.radius * data.radius, data.counts.data(),
-            nullptr, nullptr);
+        ispc::csr_count_rows(range.begin(), range.end(), &queries, &ranges,
+            &qpts, &tpts, false, data.radius * data.radius,
+            data.counts.data());
       });
 
   data.row_ptr.resize(data.num_points + 1);
@@ -1254,9 +1287,8 @@ static void count_same_set_neighbors_parallel(NeighborSearchData &data,
         const ispc::Cells cells = cells_of(data);
         const ispc::CellRanges ranges = ranges_of(data);
         const ispc::Points pts = points_of(data);
-        ispc::csr_rows(range.begin(), range.end(), &cells, &ranges, &pts,
-            &pts, true, data.radius * data.radius, counts.data(), nullptr,
-            nullptr);
+        ispc::csr_count_rows(range.begin(), range.end(), &cells, &ranges,
+            &pts, &pts, true, data.radius * data.radius, counts.data());
       });
 }
 
@@ -1511,9 +1543,12 @@ void write_neighbors_range(NeighborSearchData &data, int start_cell,
   const ispc::Cells cells = cells_of(data);
   const ispc::CellRanges ranges = ranges_of(data);
   const ispc::Points pts = points_of(data);
-  ispc::csr_rows(start_cell, end_cell, &cells, &ranges, &pts, &pts,
-      true, data.radius * data.radius, nullptr, data.row_ptr.data(),
-      data.col_idx.data());
+  IntBuffer scratch;
+  scratch.resize(static_cast<std::size_t>(max_row_count(data.counts) + 8));
+  ispc::csr_rows(start_cell, end_cell, &cells, &ranges, &pts, &pts, true,
+                 data.radius * data.radius, data.row_ptr.data(),
+                 data.col_idx.data(), scratch.data(),
+                 neighbor_permutation_table());
 }
 
 void write_neighbors_parallel(NeighborSearchData &data) {
@@ -1521,10 +1556,17 @@ void write_neighbors_parallel(NeighborSearchData &data) {
     return;
   }
 
-  tbb::parallel_for(tbb::blocked_range<int>(0, data.num_cells, cell_grain(data.num_cells)),
-                    [&](const tbb::blocked_range<int> &range) {
-                      write_neighbors_range(data, range.begin(), range.end());
-                    });
+  const ispc::Cells cells = cells_of(data);
+  const ispc::CellRanges ranges = ranges_of(data);
+  const ispc::Points pts = points_of(data);
+  const float r2 = data.radius * data.radius;
+  write_csr_rows_parallel(
+      data.num_cells, cell_grain(data.num_cells), max_row_count(data.counts),
+      [&](int begin, int end, int *scratch) {
+        ispc::csr_rows(begin, end, &cells, &ranges, &pts, &pts, true, r2,
+                       data.row_ptr.data(), data.col_idx.data(), scratch,
+                       neighbor_permutation_table());
+      });
 }
 
 void write_cross_neighbors_range(CrossNeighborSearchData &query_data,
@@ -1534,9 +1576,13 @@ void write_cross_neighbors_range(CrossNeighborSearchData &query_data,
   const ispc::CellRanges ranges = ranges_of(query_data);
   const ispc::Points qpts = query_points_of(query_data);
   const ispc::Points tpts = points_of(target_data);
-  ispc::csr_rows(start_cell, end_cell, &queries, &ranges, &qpts, &tpts,
-      false, query_data.radius * query_data.radius, nullptr,
-      query_data.row_ptr.data(), query_data.col_idx.data());
+  IntBuffer scratch;
+  scratch.resize(
+      static_cast<std::size_t>(max_row_count(query_data.counts) + 8));
+  ispc::csr_rows(start_cell, end_cell, &queries, &ranges, &qpts, &tpts, false,
+                 query_data.radius * query_data.radius,
+                 query_data.row_ptr.data(), query_data.col_idx.data(),
+                 scratch.data(), neighbor_permutation_table());
 }
 
 void write_cross_neighbors_parallel(CrossNeighborSearchData &query_data,
@@ -1545,11 +1591,19 @@ void write_cross_neighbors_parallel(CrossNeighborSearchData &query_data,
     return;
   }
 
-  tbb::parallel_for(tbb::blocked_range<int>(0, query_data.num_cells, cell_grain(query_data.num_cells)),
-                    [&](const tbb::blocked_range<int> &range) {
-                      write_cross_neighbors_range(query_data, target_data,
-                                                  range.begin(), range.end());
-                    });
+  const ispc::Cells queries = query_cells_of(query_data);
+  const ispc::CellRanges ranges = ranges_of(query_data);
+  const ispc::Points qpts = query_points_of(query_data);
+  const ispc::Points tpts = points_of(target_data);
+  const float r2 = query_data.radius * query_data.radius;
+  write_csr_rows_parallel(
+      query_data.num_cells, cell_grain(query_data.num_cells),
+      max_row_count(query_data.counts),
+      [&](int begin, int end, int *scratch) {
+        ispc::csr_rows(begin, end, &queries, &ranges, &qpts, &tpts, false, r2,
+                       query_data.row_ptr.data(), query_data.col_idx.data(),
+                       scratch, neighbor_permutation_table());
+      });
 }
 
 void write_cross_neighbors_fixed_query_active2_parallel(

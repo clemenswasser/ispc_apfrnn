@@ -59,6 +59,10 @@ struct DefaultInitAllocator {
 
 using IntBuffer = std::vector<int, DefaultInitAllocator<int>>;
 
+// Compaction lookup table shared by the row writers. Internal, but exposed so
+// the CSR regression can call the same ISPC writer as the library.
+const int *neighbor_permutation_table();
+
 // Axis-aligned bounding box of a point set. Empty when min > max.
 struct Bounds {
   float min_x = std::numeric_limits<float>::infinity();
