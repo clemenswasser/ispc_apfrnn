@@ -1364,6 +1364,12 @@ bool NSearch::build_same_block_rows(int set) {
     if (bytes > block_budget) {
       return false;
     }
+    if (point_set.fixed_neighbors.capacity() <
+            static_cast<std::size_t>(total) ||
+        point_set.fixed_neighbors.capacity() >
+            static_cast<std::size_t>(total) * 2) {
+      IntBuffer().swap(point_set.fixed_neighbors);
+    }
     point_set.fixed_neighbors.resize(static_cast<std::size_t>(total));
     write_same_set_block_rows_parallel(
         data, max_capacity, point_set.fixed_counts, point_set.fixed_neighbors,

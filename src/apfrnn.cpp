@@ -1297,7 +1297,9 @@ void build_point_grid_inplace(NeighborSearchData &data,
             data.cell_starts[static_cast<std::size_t>(cell)]);
   }
   data.max_cell_points = max_cell_points;
-  if (max_cell_points > 512) {
+  // Blocks reorder points inside dense cells, so build them before the range
+  // cache and neighbor rows are derived from the sorted order.
+  if (max_cell_points > 32) {
     build_point_blocks_inplace(data);
   }
   build_dense_range_cache(data);
@@ -1820,6 +1822,25 @@ void write_same_set_block_rows_parallel(
   const ispc::CellRanges ranges = ranges_of(data);
   const ispc::Points pts = points_of(data);
   const float r2 = data.radius * data.radius;
+  if (data.max_cell_points > 32) {
+    ensure_point_blocks(data);
+    build_same_set_candidate_cells_inplace(data);
+    if (data.blocks_valid) {
+      const ispc::Blocks blocks = blocks_of(data);
+      const ispc::NeighborCells ncells =
+          neighbor_cells_of(data, data.max_neighbor_cells);
+      const int block_count = static_cast<int>(data.block_begin.size());
+      write_block_rows_parallel(
+          block_count, block_grain(block_count), capacity, counts, neighbors,
+          row_offset, row_capacity,
+          [&](int begin, int end, const ispc::FixedRows &rows) {
+            ispc::write_fixed_rows_blocked(begin, end, &blocks, &ncells,
+                                           &blocks, &pts, &pts, true, r2,
+                                           &rows);
+          });
+      return;
+    }
+  }
   write_block_rows_parallel(
       data.num_cells, cell_grain(data.num_cells), capacity, counts, neighbors,
       row_offset, row_capacity,
