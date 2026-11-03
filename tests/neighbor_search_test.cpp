@@ -1668,3 +1668,30 @@ TEST_CASE("cross rows with a skin stay exact after a same-set CSR fallback") {
     }
   }
 }
+
+TEST_CASE("sparse bounding boxes crossing zero keep z runs contiguous") {
+  // One far point makes the bounding box too large for the counting sort, so
+  // cells are ordered by the comparison sort. The cloud crosses z = 0, where
+  // a raw packed-key order would put the z = -1 cells after the positive
+  // ones and break the dense stencils' contiguous z runs (stack overflow of
+  // the 9 runs, duplicate neighbors).
+  for (const float far_x : {50.0f, 300.0f}) {
+    CAPTURE(far_x);
+    auto cloud = apfrnn::support::make_point_cloud(600, 6.0f, 21);
+    for (float &z : cloud.z) {
+      z -= 1.0f;
+    }
+    cloud.x.push_back(far_x);
+    cloud.y.push_back(1.0f);
+    cloud.z.push_back(1.0f);
+    auto xyz = interleave(cloud);
+
+    apfrnn::NSearch search(1.7f);
+    const int id =
+        search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+    search.set_all_searches(true);
+    search.run();
+    CHECK(search.last_stats().dense_sets == 1);
+    check_same_set(search, id, cloud, 1.7f);
+  }
+}

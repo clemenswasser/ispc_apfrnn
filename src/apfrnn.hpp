@@ -111,9 +111,17 @@ struct SortPointKey {
   uint64_t key;
   int index;
 
+  // Cell keys pack each coordinate as a 21-bit two's-complement field, so
+  // raw key order puts negative coordinates after positive ones. Flipping
+  // each field's sign bit compares in signed (x, y, z) order, the order of
+  // the counting sort: adjacent z cells stay contiguous across z = 0, which
+  // the dense stencil kernels rely on.
+  static constexpr uint64_t kSignBits =
+      (uint64_t{1} << 62) | (uint64_t{1} << 41) | (uint64_t{1} << 20);
+
   bool operator<(const SortPointKey &other) const {
     if (key != other.key) {
-      return key < other.key;
+      return (key ^ kSignBits) < (other.key ^ kSignBits);
     }
     return index < other.index;
   }
