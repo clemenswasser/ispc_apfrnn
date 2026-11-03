@@ -74,6 +74,46 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
       .count();
 }
 
+// Keeps the CSR neighbors within `radius` at the current positions. With a
+// skin, rows are searched at radius + skin over the sorted coordinates of the
+// last grid build, which a skin-reused set lags by up to skin / 2 (see
+// sync_dynamic_sets); unlike fixed rows, CSR rows have no filtered copy.
+// Rows are indexed by sorted source position and hold target original
+// indices.
+void filter_csr_rows(IntBuffer &row_ptr, IntBuffer &col_idx, IntBuffer &counts,
+                     const IntBuffer &source_original,
+                     const std::vector<float> &qx, const std::vector<float> &qy,
+                     const std::vector<float> &qz, const std::vector<float> &tx,
+                     const std::vector<float> &ty, const std::vector<float> &tz,
+                     float radius) {
+  const float r2 = radius * radius;
+  const int rows = static_cast<int>(row_ptr.size()) - 1;
+  int out = 0;
+  for (int row = 0; row < rows; ++row) {
+    const std::size_t q =
+        static_cast<std::size_t>(source_original[static_cast<std::size_t>(row)]);
+    const int begin = row_ptr[static_cast<std::size_t>(row)];
+    const int end = row_ptr[static_cast<std::size_t>(row) + 1];
+    row_ptr[static_cast<std::size_t>(row)] = out;
+    for (int k = begin; k < end; ++k) {
+      const int neighbor = col_idx[static_cast<std::size_t>(k)];
+      const std::size_t t = static_cast<std::size_t>(neighbor);
+      const float dx = qx[q] - tx[t];
+      const float dy = qy[q] - ty[t];
+      const float dz = qz[q] - tz[t];
+      if (dx * dx + dy * dy + dz * dz <= r2) {
+        col_idx[static_cast<std::size_t>(out++)] = neighbor;
+      }
+    }
+    if (static_cast<std::size_t>(row) < counts.size()) {
+      counts[static_cast<std::size_t>(row)] =
+          out - row_ptr[static_cast<std::size_t>(row)];
+    }
+  }
+  row_ptr[static_cast<std::size_t>(rows)] = out;
+  col_idx.resize(static_cast<std::size_t>(out));
+}
+
 } // namespace
 
 struct NSearch::PointSet {
@@ -772,6 +812,12 @@ void NSearch::build_same_pair(Pair &pair, int set) {
   }
   if (!point_set.fixed_valid) {
     write_neighbors_parallel(point_set.data);
+    if (skin_ > 0.0f) {
+      filter_csr_rows(point_set.data.row_ptr, point_set.data.col_idx,
+                      point_set.data.counts, point_set.data.original_index,
+                      point_set.x, point_set.y, point_set.z, point_set.x,
+                      point_set.y, point_set.z, radius_);
+    }
   }
   pair.same_set = true;
   pair.valid = true;
@@ -891,9 +937,15 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   note_path(kPathCrossCsr);
   pair.skin_lists = false;
   pair.active_valid = false;
-  build_cross_neighbor_search_data_from_sorted_inplace(pair.cross, source.data,
-                                                       target.data, radius_);
+  // Searched at radius + skin like the fixed rows, then filtered.
+  build_cross_neighbor_search_data_from_sorted_inplace(
+      pair.cross, source.data, target.data, build_radius());
   write_cross_neighbors_parallel(pair.cross, target.data);
+  if (skin_ > 0.0f) {
+    filter_csr_rows(pair.cross.row_ptr, pair.cross.col_idx, pair.cross.counts,
+                    source.data.original_index, source.x, source.y, source.z,
+                    target.x, target.y, target.z, radius_);
+  }
 }
 
 void NSearch::filter_skin_lists() {
@@ -1391,7 +1443,8 @@ void NSearch::build_grid_same_lists(int set) {
   note_path(kPathSameCsr);
   point_set.skin_lists = false;
   point_set.active_valid = false;
-  build_same_set_neighbor_lists_inplace(data, radius_);
+  // Searched at radius + skin and filtered in build_same_pair.
+  build_same_set_neighbor_lists_inplace(data, build_radius());
   point_set.same_lists_valid = true;
 }
 

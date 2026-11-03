@@ -1735,3 +1735,49 @@ TEST_CASE("block rows with cached capacities rebuild the grid's ranges") {
   }
   CHECK(block_frames > 0);
 }
+
+TEST_CASE("CSR fallback rows stay exact on a skin-reused target") {
+  // `fluid` (only a target) moves less than skin / 2, so it keeps its grid
+  // (skin reuse) and that grid's sorted coordinates lag behind the caller's. `probes` changes
+  // size, so pair (probes, fluid) is rebuilt; the tiny budget sends it to
+  // the CSR fallback, which must search at radius + skin and filter at the
+  // current positions like the fixed rows do.
+  constexpr float radius = 1.5f;
+  constexpr float skin = 0.4f;
+  const float side = std::cbrt(3000.0f / 6.0f);
+  auto fluid = apfrnn::support::make_point_cloud(3000, side, 31);
+  auto probes = apfrnn::support::make_point_cloud(400, side, 32);
+  auto fluid_xyz = interleave(fluid);
+  auto probe_xyz = interleave(probes);
+
+  apfrnn::NSearch search(radius);
+  search.set_skin(skin);
+  search.set_memory_budget(1 << 16);
+  const int f =
+      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int p = search.add_point_set(probe_xyz.data(),
+                                     static_cast<int>(probes.x.size()));
+  search.set_all_searches(false);
+  search.set_active_search(p, f, true);
+  search.run();
+
+  std::mt19937 generator(3);
+  std::uniform_real_distribution<float> jitter(-0.11f, 0.11f);  // < skin / 2
+  for (std::size_t i = 0; i < fluid.x.size(); ++i) {
+    fluid.x[i] += jitter(generator);
+    fluid.y[i] += jitter(generator);
+    fluid.z[i] += jitter(generator);
+  }
+  const auto moved = interleave(fluid);
+  std::copy(moved.begin(), moved.end(), fluid_xyz.begin());
+  probes = apfrnn::support::make_point_cloud(500, side, 33);
+  probe_xyz = interleave(probes);
+  search.resize_point_set(p, probe_xyz.data(),
+                          static_cast<int>(probes.x.size()));
+  search.run();
+  const uint64_t paths = search.last_stats().paths;
+  CHECK((paths & apfrnn::NSearch::kPathSkinReuse) != 0);
+  CHECK((paths & apfrnn::NSearch::kPathCrossCsr) != 0);
+
+  check_cross_set(search, p, f, probes, fluid, radius);
+}
