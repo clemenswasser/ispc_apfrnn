@@ -2,13 +2,15 @@
 // stress scenes, plus the NSearch-API scenarios (Api/...).
 //
 // Benchmarks are named Frame/<backend>/<scene>, Stress/<backend>/<scene>,
-// Threads/<backend>/<scene>/<threads> and Api/<scenario>/<scene>, so
-// --benchmark_filter selects by family, backend or scene. Each Frame run
-// times frames after one warm-up frame. That first frame is also validated
-// (see validate()): the label carries a checksum of the neighbor pairs
-// clearly within the radius, which must be equal for all backends on a
-// scene, and FalsePositives must be 0. Stress holds the regimes outside the
-// headline matrix (large high-degree sets, many active pairs).
+// Threads/<backend>/<scene>/<threads>, Cold/<backend>/<scene> and
+// Api/<scenario>/<scene>, so --benchmark_filter selects by family, backend or
+// scene. Each Frame run times frames after two warm-up frames. The second one
+// is validated (see validate()), so plans that change after the first frame
+// are covered: the label carries a checksum of the neighbor pairs clearly
+// within the radius, which must be equal for all backends on a scene, and
+// FalsePositives must be 0. Stress holds the regimes outside the headline
+// matrix (large high-degree sets, many active pairs, sparse hash-grid
+// droplets). Cold times setup plus the first frame on a fresh backend.
 //
 //   --learnsph_res=DIR       learnsph/res with the saved frames (default
 //                            ../learnsph/res); scenes whose files are missing
@@ -164,7 +166,11 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   const ThreadLimit limit(threads);
   std::unique_ptr<Backend> backend = backend_spec.make();
   backend->setup(scene);
-  backend->run();  // the warm-up frame, which is the one validated
+  // Two warm-up frames. Row capacities and some plans adapt after the first
+  // frame, so the second one is the one validated.
+  backend->run();
+  scene.advance(1);
+  backend->run();
 
   // Benchmark functions run several times per benchmark; validate once.
   static std::map<std::string, Validation> validated;
@@ -174,7 +180,7 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   }
   const Validation &validation = found->second;
 
-  int step = 1;
+  int step = 2;
   for (auto _ : state) {
     scene.advance(step++);
     backend->run();
@@ -193,6 +199,22 @@ void frames(benchmark::State &state, const SceneSpec &spec,
                 static_cast<unsigned long long>(validation.checksum));
   state.SetLabel(label);
   backend->add_counters(state);
+  attach_rss(state);
+}
+
+// Setup plus the first run() on a fresh backend: row capacities start from
+// their defaults and buffers are freshly allocated. Destruction is not timed.
+void cold_frame(benchmark::State &state, const SceneSpec &spec,
+                const BackendSpec &backend_spec) {
+  const SceneData &scene = cached_scene(spec);
+  for (auto _ : state) {
+    std::unique_ptr<Backend> backend = backend_spec.make();
+    backend->setup(scene);
+    backend->run();
+    state.PauseTiming();
+    backend.reset();
+    state.ResumeTiming();
+  }
   attach_rss(state);
 }
 
@@ -240,17 +262,35 @@ int main(int argc, char **argv) {
   };
   register_family("Frame", scenes);
   register_family("Stress", apfrnn::bench::stress_scenes());
+  for (const SceneSpec &scene : apfrnn::bench::cold_scenes()) {
+    for (const BackendSpec &backend : backends) {
+      benchmark::RegisterBenchmark("Cold/" + backend.name + "/" + scene.name,
+                                   cold_frame, scene, backend)
+          ->Unit(benchmark::kMillisecond)
+          ->UseRealTime();
+    }
+  }
   // Thread scaling on the CPU backends: the 200k scene across the core counts,
-  // and 1M where the memory system starts to matter. Scenes are registered in
-  // groups so cached_scene() keeps the scene alive between backends.
-  const std::vector<std::pair<SceneSpec, std::vector<int>>> scaling = {
+  // 1M where the memory system starts to matter, a high-degree scene and a
+  // small learnsph frame (when present), where per-frame fixed costs show up
+  // at low thread counts. Scenes are registered in groups so cached_scene()
+  // keeps the scene alive between backends.
+  std::vector<std::pair<SceneSpec, std::vector<int>>> scaling = {
       {apfrnn::bench::synthetic_scene(apfrnn::bench::Distribution::Uniform,
                                       200000),
        {1, 2, 4, 8, 16}},
       {apfrnn::bench::synthetic_scene(apfrnn::bench::Distribution::Uniform,
                                       1000000),
        {8, 16}},
+      {apfrnn::bench::synthetic_scene(apfrnn::bench::Distribution::Clustered,
+                                      200000),
+       {1, 4, 16}},
   };
+  for (SceneSpec &scene : apfrnn::bench::learnsph_scenes(learnsph_res)) {
+    if (scene.name == "learnsph_ramp_split_lv") {
+      scaling.push_back({std::move(scene), {1, 4, 16}});
+    }
+  }
   for (const auto &[scaling_scene, thread_counts] : scaling) {
     for (const BackendSpec &backend : backends) {
       if (!backend.uses_cpu_threads) {

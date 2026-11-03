@@ -212,11 +212,12 @@ taskset -c 0-15 ./build/bench/ispc_apfrnn_bench \
   --benchmark_report_aggregates_only=true
 ```
 
-Every benchmark runs one warm-up frame before the timed frames, so they are
-steady state even for short `--benchmark_min_time` values. That warm-up frame
-is also validated: the label carries a checksum of the neighbor pairs clearly
-within the radius, which must be equal for all backends of a scene, and
-`FalsePositives` must be 0. The learnsph tables use the same command with
+Every benchmark runs two warm-up frames before the timed frames, so they are
+steady state even for short `--benchmark_min_time` values. The second warm-up
+frame is validated, so plans that only change after the first frame (fitted
+row capacities, small cells) are checked too: the label carries a checksum of
+the neighbor pairs clearly within the radius, which must be equal for all
+backends of a scene, and `FalsePositives` must be 0. The learnsph tables use the same command with
 `--learnsph_res=../learnsph/res` (the default); the saved frames join the
 scene list when their files exist.
 
@@ -241,14 +242,19 @@ scene list when their files exist.
 ./build/bench/ispc_apfrnn_bench --benchmark_filter='^Api/'
 ```
 
-`ispc_apfrnn_bench` has four benchmark families:
+`ispc_apfrnn_bench` has five benchmark families:
 
 - `Frame/<backend>/<scene>` runs every backend on the headline scenes.
-- `Stress/<backend>/<scene>` extends the matrix to 500k-2M high-degree sets
-  and 8-16 point sets with every pair active; these are the regimes outside
-  the headline scenes.
-- `Threads/<backend>/<scene>/<threads>` is CPU thread scaling (200k across 1,
-  2, 4, 8 and 16 threads, 1M across 8 and 16).
+- `Stress/<backend>/<scene>` extends the matrix to 500k-2M high-degree sets,
+  8-16 point sets with every pair active, and dense droplets scattered
+  through a huge domain (hash grid with ~26 neighbors per point); these are
+  the regimes outside the headline scenes.
+- `Threads/<backend>/<scene>/<threads>` is CPU thread scaling (uniform 200k
+  across 1, 2, 4, 8 and 16 threads, 1M across 8 and 16, and clustered 200k
+  and learnsph ramp_split_lv across 1, 4 and 16).
+- `Cold/<backend>/<scene>` times setup plus the first frame on a fresh
+  backend (uniform, slab and clustered at 200k, thin pipe at 50k), where row
+  capacities are not yet fitted.
 - `Api/<scenario>/<scene>` covers the NSearch-API scenarios: static, small and
   large motion frames with stage counters (`Api/Frame/...`), skin reuse
   (`Api/Skin`, `Api/SkinConsume`), consuming neighbors (`Api/Consume`),
@@ -260,8 +266,10 @@ with a GPU), plus `tree` and `compact` in a baseline build. The Frame scenes
 are the synthetic distributions uniform, jittered lattice, lattice, clustered,
 slab, thin slab, huge domain, surface, thin pipe and two-scale at 50k and
 200k, uniform at 1k/10k/1M, clustered at 10k, pathological at 10k, the moving
-variants, and any learnsph frames found under `--learnsph_res` (default
-`../learnsph/res`). `scripts/bench.sh` accepts `APFRNN_FILTER` and
+variants (`_moving`: small rigid motion, `_fast`: large rigid motion,
+`_jitter`: non-rigid per-point motion), slab with the boundary also querying
+(`_boundary_queries`), a 1k probe set queried into 200k/1M points, and any
+learnsph frames found under `--learnsph_res` (default `../learnsph/res`). `scripts/bench.sh` accepts `APFRNN_FILTER` and
 `APFRNN_CPUS`.
 
 `--memory_budget_mb=N` overrides the library's fixed-row cap. The default is
