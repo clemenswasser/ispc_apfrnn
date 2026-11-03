@@ -81,6 +81,10 @@ struct FixedRows {
   uniform int *uniform scratch;
   uniform int *uniform counts;
   uniform int *uniform neighbors;
+  // Optional per-query block layout. When set, row q starts at
+  // neighbors[row_offset[q]] and has row_capacity[q] slots.
+  const uniform int *uniform row_offset;
+  const uniform int *uniform row_capacity;
 };
 
 inline varying uint64 make_key(varying int cx, varying int cy,
@@ -318,6 +322,60 @@ export void merge_dense_neighbor_ranges(
   }
 }
 
+// Fixed 9-run dense stencil: each query cell gets one merged z-run per
+// (dx,dy) pair. One pass, 27 dense lookups, no count/scan; the writer sees
+// nine runs instead of 27 individual cells or the branchy merged lists.
+export void dense_stencil9_ranges(
+    uniform int start_cell, uniform int end_cell,
+    const uniform Cells *uniform queries_in,
+    const uniform DenseGrid *uniform grid_in,
+    const uniform Cells *uniform targets_in, uniform int out_starts[],
+    uniform int out_ends[]) {
+  const uniform Cells queries = *queries_in;
+  const uniform DenseGrid grid = *grid_in;
+  const uniform Cells targets = *targets_in;
+  foreach (cell = start_cell... end_cell) {
+    const varying uint64 key = queries.keys[cell];
+    const varying int cx = unpack_coord(key, 42);
+    const varying int cy = unpack_coord(key, 21);
+    const varying int cz = unpack_coord(key, 0);
+    const varying int base = cell * 9;
+    varying int slot = 0;
+    for (uniform int dx = -1; dx <= 1; ++dx) {
+      for (uniform int dy = -1; dy <= 1; ++dy) {
+        varying int run_start = -1;
+        varying int run_end = -1;
+        for (uniform int dz = -1; dz <= 1; ++dz) {
+          const varying int lx = cx + dx - grid.min_x;
+          const varying int ly = cy + dy - grid.min_y;
+          const varying int lz = cz + dz - grid.min_z;
+          const varying bool inside =
+              lx >= 0 && lx < grid.nx && ly >= 0 && ly < grid.ny &&
+              lz >= 0 && lz < grid.nz;
+          const varying int safe_lx = inside ? lx : 0;
+          const varying int safe_ly = inside ? ly : 0;
+          const varying int safe_lz = inside ? lz : 0;
+          const varying int neighbor =
+              inside
+                  ? grid.cells[(safe_lz * grid.ny + safe_ly) * grid.nx +
+                               safe_lx]
+                  : -1;
+          const varying bool valid = neighbor >= 0;
+          const varying int safe_neighbor = valid ? neighbor : 0;
+          const varying int start =
+              valid ? targets.starts[safe_neighbor] : run_start;
+          const varying int end = valid ? targets.ends[safe_neighbor] : run_end;
+          run_start = run_start < 0 ? start : min(run_start, start);
+          run_end = run_end < 0 ? end : max(run_end, end);
+        }
+        out_starts[base + slot] = run_start < 0 ? 0 : run_start;
+        out_ends[base + slot] = run_start < 0 ? 0 : run_end;
+        ++slot;
+      }
+    }
+  }
+}
+
 // Neighbor-row writers. Every writer handles both same-set and cross-set
 // searches: with `same_set`, queries and targets are the same point set and
 // a query never lists itself.
@@ -354,6 +412,9 @@ static inline varying float length_sq(varying float<3> d) {
 
 static inline uniform int *uniform row_of(const uniform FixedRows &rows,
                                           uniform int query) {
+  if (rows.row_offset != NULL) {
+    return rows.neighbors + (uniform int64)rows.row_offset[query];
+  }
   return rows.neighbors + (uniform int64)query * (rows.capacity + 8);
 }
 
@@ -363,8 +424,9 @@ static inline uniform int *uniform row_of(const uniform FixedRows &rows,
 static inline uniform int append_active(uniform int *uniform out,
                                         uniform int &count, varying bool active,
                                         varying int value,
-                                        const uniform FixedRows &rows) {
-  if (count > rows.capacity) {
+                                        const uniform FixedRows &rows,
+                                        uniform int capacity) {
+  if (count > capacity) {
     count += reduce_add(select(active, 1, 0));
     return 0;
   }
@@ -384,7 +446,9 @@ static inline uniform int *uniform row_output(const uniform FixedRows &rows,
 static inline void finish_row(const uniform FixedRows &rows,
                               uniform int query, uniform int count) {
   if (rows.scratch != NULL) {
-    const uniform int n = min(count, rows.capacity);
+    const uniform int capacity =
+        rows.row_capacity != NULL ? rows.row_capacity[query] : rows.capacity;
+    const uniform int n = min(count, capacity);
     const uniform int vector_end = n & ~(programCount - 1);
     uniform int *uniform dst = row_of(rows, query);
     for (uniform int i = 0; i < vector_end; i += programCount) {
@@ -415,12 +479,14 @@ static inline void rows_single(uniform int q_start, uniform int q_end,
   for (uniform int query = q_start; query < q_end; ++query) {
     const uniform float<3> q = point_at(qpts, query);
     uniform int *uniform out = row_output(rows, query);
+    const uniform int capacity =
+        rows.row_capacity != NULL ? rows.row_capacity[query] : rows.capacity;
     uniform int count = 0;
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
         out += append_active(
             out, count, is_neighbor(tpts, j, q, r2, same_set, query),
-            tpts.index[j], rows);
+            tpts.index[j], rows, capacity);
       }
     }
     finish_row(rows, query, count);
@@ -446,6 +512,10 @@ static inline void rows_pair(uniform int q_start, uniform int q_end,
     const uniform float<3> p0 = point_at(qpts, q0), p1 = point_at(qpts, q1);
     uniform int *uniform o0 = row_of(rows, q0);
     uniform int *uniform o1 = row_of(rows, q1);
+    const uniform int cap0 =
+        rows.row_capacity != NULL ? rows.row_capacity[q0] : rows.capacity;
+    const uniform int cap1 =
+        rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
     uniform int c0 = 0, c1 = 0;
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
@@ -455,9 +525,9 @@ static inline void rows_pair(uniform int q_start, uniform int q_end,
                         (!same_set || j != q0);
         const bool a1 = within_radius(pj, p1, r2) &&
                         (!same_set || j != q1);
-        o0 += append_active(o0, c0, a0, value, rows);
+        o0 += append_active(o0, c0, a0, value, rows, cap0);
         if (v1) {
-          o1 += append_active(o1, c1, a1, value, rows);
+          o1 += append_active(o1, c1, a1, value, rows, cap1);
         }
       }
     }
@@ -488,6 +558,14 @@ static inline void rows_quad(uniform int q_start, uniform int q_end,
     uniform int *uniform o1 = row_of(rows, q1);
     uniform int *uniform o2 = row_of(rows, q2);
     uniform int *uniform o3 = row_of(rows, q3);
+    const uniform int cap0 =
+        rows.row_capacity != NULL ? rows.row_capacity[q0] : rows.capacity;
+    const uniform int cap1 =
+        rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
+    const uniform int cap2 =
+        rows.row_capacity != NULL ? rows.row_capacity[q2] : rows.capacity;
+    const uniform int cap3 =
+        rows.row_capacity != NULL ? rows.row_capacity[q3] : rows.capacity;
     uniform int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
@@ -501,15 +579,15 @@ static inline void rows_quad(uniform int q_start, uniform int q_end,
                         (!same_set || j != q2);
         const bool a3 = within_radius(pj, p3, r2) &&
                         (!same_set || j != q3);
-        o0 += append_active(o0, c0, a0, value, rows);
+        o0 += append_active(o0, c0, a0, value, rows, cap0);
         if (v1) {
-          o1 += append_active(o1, c1, a1, value, rows);
+          o1 += append_active(o1, c1, a1, value, rows, cap1);
         }
         if (v2) {
-          o2 += append_active(o2, c2, a2, value, rows);
+          o2 += append_active(o2, c2, a2, value, rows, cap2);
         }
         if (v3) {
-          o3 += append_active(o3, c3, a3, value, rows);
+          o3 += append_active(o3, c3, a3, value, rows, cap3);
         }
       }
     }
@@ -707,6 +785,8 @@ static inline void rows_blocked(uniform int source_block,
        query < src.end[source_block]; ++query) {
     const uniform float<3> q = point_at(qpts, query);
     uniform int *uniform out = row_output(rows, query);
+    const uniform int capacity =
+        rows.row_capacity != NULL ? rows.row_capacity[query] : rows.capacity;
     uniform int count = 0;
     for (uniform int n = 0; n < num_neighbors; ++n) {
       const uniform int c = ncells.cells[cell * ncells.stride + n];
@@ -724,7 +804,7 @@ static inline void rows_blocked(uniform int source_block,
           out += append_active(
               out, count,
               is_neighbor(tpts, j, q, r2, same_set, query),
-              tpts.index[j], rows);
+              tpts.index[j], rows, capacity);
         }
       }
     }

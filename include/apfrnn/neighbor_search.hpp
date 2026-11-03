@@ -52,6 +52,7 @@ public:
     std::size_t neighbor_bytes = 0;
     std::size_t grid_bytes = 0;
     int same_fixed_pairs = 0;
+    int same_block_pairs = 0;
     int same_csr_pairs = 0;
     int cross_fixed_pairs = 0;
     int cross_csr_pairs = 0;
@@ -148,6 +149,7 @@ private:
   void build_same_lists(int set);
   bool build_sweep_same_lists(int set);
   void build_grid_same_lists(int set);
+  bool build_same_block_rows(int set);
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
   void filter_same_active(int set);
   void filter_cross_active(Pair &pair, int source_set, int target_set);

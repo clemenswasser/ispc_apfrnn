@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <random>
@@ -1243,6 +1242,37 @@ TEST_CASE("memory budget forces CSR fallback") {
   check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
   CHECK(search.last_stats().same_csr_pairs == 1);
   CHECK(search.last_stats().cross_csr_pairs == 1);
+}
+
+TEST_CASE("block-fixed rows match brute force") {
+  constexpr int num_points = 2048;
+  constexpr float radius = 2.0f;
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 20.0f, 9001);
+  // One dense cluster makes the global fixed-row capacity (and its memory)
+  // much larger than the per-row block layout.
+  for (int i = 0; i < 200; ++i) {
+    cloud.x[static_cast<std::size_t>(i)] = 10.0f + 1e-4f * i;
+    cloud.y[static_cast<std::size_t>(i)] = 10.0f;
+    cloud.z[static_cast<std::size_t>(i)] = 10.0f;
+  }
+  auto xyz = interleave(cloud);
+
+  apfrnn::NSearch search(radius);
+  search.set_memory_budget(1 << 20);
+  const int set =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(false);
+  search.set_active_search(set, set, true);
+  search.run();
+  search.run();  // cached per-row capacities and the no-count path
+
+  CHECK(search.last_stats().same_block_pairs == 1);
+  check_same_set(search, set, cloud, radius);
+
+  // A skin invalidates the block path; the exact fallback must still work.
+  search.set_skin(0.1f);
+  search.run();
+  check_same_set(search, set, cloud, radius);
 }
 
 TEST_CASE("sparse backends fall back to grid under memory pressure") {

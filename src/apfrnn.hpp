@@ -111,7 +111,12 @@ struct SortPointKey {
   uint64_t key;
   int index;
 
-  bool operator<(const SortPointKey &other) const { return key < other.key; }
+  bool operator<(const SortPointKey &other) const {
+    if (key != other.key) {
+      return key < other.key;
+    }
+    return index < other.index;
+  }
 };
 
 struct NeighborSearchData {
@@ -216,6 +221,16 @@ void build_same_set_cell_ranges_inplace(NeighborSearchData &data);
 
 // Dense-grid variant that fuses cell collection and range merging.
 void build_same_set_cell_ranges_dense_fused_inplace(NeighborSearchData &data);
+
+// Builds only the same-set cell ranges and per-query counts.
+void count_same_set_neighbors_inplace(NeighborSearchData &data);
+
+// Writes same-set rows using per-query block offsets/capacities.
+void write_same_set_block_rows_parallel(NeighborSearchData &data, int capacity,
+                                        IntBuffer &counts,
+                                        IntBuffer &neighbors,
+                                        const IntBuffer &row_offset,
+                                        const IntBuffer &row_capacity);
 
 // Builds the same-set cell ranges, counts, row_ptr, and col_idx using the grid
 // produced by build_point_grid_inplace().

@@ -111,6 +111,14 @@ struct NSearch::PointSet {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Block-fixed rows: per-block capacities and per-query row offsets.
+  bool block_rows = false;
+  bool block_caps_valid = false;
+  int block_size = 0;
+  IntBuffer block_offsets;
+  IntBuffer block_caps;
+  IntBuffer row_offset;
+  IntBuffer row_capacity;
 };
 
 struct NSearch::Pair {
@@ -785,6 +793,9 @@ void NSearch::collect_memory_stats() {
       if (set_i == set_j) {
         if (source.fixed_valid) {
           ++last_stats_.same_fixed_pairs;
+          if (source.block_rows) {
+            ++last_stats_.same_block_pairs;
+          }
           last_stats_.neighbor_bytes +=
               source.fixed_neighbors.capacity() * sizeof(int) +
               source.fixed_counts.capacity() * sizeof(int) +
@@ -870,6 +881,17 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
   // identity for sweep sets), so it is valid for same-set and cross rows.
   const int sorted_index =
       source.original_to_sorted[static_cast<std::size_t>(point)];
+
+  if (pair.same_set && source.fixed_valid && source.block_rows) {
+    const int count =
+        source.fixed_counts[static_cast<std::size_t>(sorted_index)];
+    const int *neighbors =
+        source.fixed_neighbors.data() +
+        static_cast<std::size_t>(
+            source.row_offset[static_cast<std::size_t>(sorted_index)]);
+    return {reinterpret_cast<const uint32_t *>(neighbors),
+            static_cast<std::size_t>(count)};
+  }
 
   if (pair.same_set && source.fixed_valid) {
     if (skin_ > 0.0f && source.skin_lists) {
@@ -1102,6 +1124,12 @@ void NSearch::build_grid_same_lists(int set) {
   }
   NeighborSearchData &data = point_set.data;
   point_set.fixed_valid = false;
+  if (point_set.block_rows) {
+    if (build_same_block_rows(set)) {
+      return;
+    }
+    point_set.block_rows = false;
+  }
   const plan::SamePlan same_plan =
       plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
@@ -1131,6 +1159,7 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.fixed_capacity = capacity + 8;
     point_set.last_fixed_capacity =
         plan::same_fitted_capacity(max_count, capacity);
+    point_set.block_rows = false;
     point_set.fixed_valid = true;
     point_set.skin_lists = skin_ > 0.0f;
     point_set.active_valid = false;
@@ -1180,10 +1209,157 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.fixed_counts.clear();
   }
 
+  if (build_same_block_rows(set)) {
+    return;
+  }
+  point_set.block_rows = false;
+
   point_set.skin_lists = false;
   point_set.active_valid = false;
   build_same_set_neighbor_lists_inplace(data, radius_);
   point_set.same_lists_valid = true;
+}
+
+bool NSearch::build_same_block_rows(int set) {
+  PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+  NeighborSearchData &data = point_set.data;
+  const int num_points = data.num_points;
+  if (num_points == 0 || skin_ > 0.0f) {
+    return false;
+  }
+  data.radius = radius_;
+
+  const bool cached =
+      point_set.block_caps_valid && point_set.block_size > 0 &&
+      static_cast<int>(point_set.block_caps.size()) ==
+          (num_points + point_set.block_size - 1) / point_set.block_size;
+  int64_t block_budget = memory_budget_;
+  if (!cached) {
+    count_same_set_neighbors_inplace(data);
+    point_set.fixed_counts = data.counts;
+    int64_t exact_neighbors = 0;
+    for (int count : data.counts) {
+      exact_neighbors += count;
+    }
+    const int64_t exact_bytes = exact_neighbors * 4;
+    const int64_t output_budget =
+        exact_bytes + static_cast<int64_t>(num_points) * 32 + static_cast<int64_t>(64) << 20;
+    if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
+      block_budget = std::max(memory_budget_, output_budget);
+    }
+    point_set.block_size = 0;
+    for (int candidate : {1, 2, 4, 8, 16, 32, 64, 128, 256}) {
+      const int blocks = (num_points + candidate - 1) / candidate;
+      int64_t bytes = static_cast<int64_t>(num_points) * 2 * 4 +
+                      static_cast<int64_t>(blocks) * 2 * 4;
+      std::vector<int> caps(static_cast<std::size_t>(blocks));
+      for (int block = 0; block < blocks; ++block) {
+        const int begin = block * candidate;
+        const int end = std::min(begin + candidate, num_points);
+        int max_count = 0;
+        for (int i = begin; i < end; ++i) {
+          max_count = std::max(max_count, data.counts[i]);
+        }
+        const int cap = (max_count + 15) & ~7;
+        caps[static_cast<std::size_t>(block)] = cap;
+        bytes += static_cast<int64_t>(end - begin) * (cap + 8) * 4;
+      }
+      if (bytes <= block_budget) {
+        point_set.block_size = candidate;
+        point_set.block_caps.assign(caps.begin(), caps.end());
+        break;
+      }
+    }
+    if (point_set.block_size == 0) {
+      return false;
+    }
+    point_set.block_caps_valid = true;
+  } else {
+    if (static_cast<int>(point_set.fixed_counts.size()) != num_points) {
+      point_set.fixed_counts.resize(static_cast<std::size_t>(num_points));
+    }
+    int64_t exact_neighbors = 0;
+    for (int count : point_set.fixed_counts) {
+      exact_neighbors += count;
+    }
+    if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
+      block_budget = std::max(
+          memory_budget_,
+          exact_neighbors * 4 + static_cast<int64_t>(num_points) * 32 +
+              static_cast<int64_t>(64) << 20);
+    }
+  }
+
+  const int block_size = point_set.block_size;
+  const int block_count = (num_points + block_size - 1) / block_size;
+  point_set.block_offsets.resize(static_cast<std::size_t>(block_count));
+  point_set.row_offset.resize(static_cast<std::size_t>(num_points));
+  point_set.row_capacity.resize(static_cast<std::size_t>(num_points));
+
+  bool stable = false;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    int total = 0;
+    int max_capacity = 0;
+    for (int block = 0; block < block_count; ++block) {
+      const int begin = block * block_size;
+      const int end = std::min(begin + block_size, num_points);
+      const int capacity =
+          point_set.block_caps[static_cast<std::size_t>(block)];
+      const int stride = capacity + 8;
+      point_set.block_offsets[static_cast<std::size_t>(block)] = total;
+      for (int i = begin; i < end; ++i) {
+        point_set.row_offset[static_cast<std::size_t>(i)] =
+            total + (i - begin) * stride;
+        point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
+      }
+      total += (end - begin) * stride;
+      max_capacity = std::max(max_capacity, capacity);
+    }
+    const int64_t bytes =
+        static_cast<int64_t>(total) * 4 +
+        static_cast<int64_t>(num_points) * 2 * 4 +
+        static_cast<int64_t>(block_count) * 2 * 4;
+    if (bytes > block_budget) {
+      return false;
+    }
+    point_set.fixed_neighbors.resize(static_cast<std::size_t>(total));
+    write_same_set_block_rows_parallel(
+        data, max_capacity, point_set.fixed_counts, point_set.fixed_neighbors,
+        point_set.row_offset, point_set.row_capacity);
+
+    bool grew = false;
+    for (int block = 0; block < block_count; ++block) {
+      const int begin = block * block_size;
+      const int end = std::min(begin + block_size, num_points);
+      int max_count = 0;
+      for (int i = begin; i < end; ++i) {
+        max_count = std::max(max_count, point_set.fixed_counts[i]);
+      }
+      const int current =
+          point_set.block_caps[static_cast<std::size_t>(block)];
+      if (max_count > current) {
+        point_set.block_caps[static_cast<std::size_t>(block)] =
+            (max_count + 15) & ~7;
+        grew = true;
+      }
+    }
+    if (!grew) {
+      stable = true;
+      break;
+    }
+  }
+  if (!stable) {
+    return false;
+  }
+
+  point_set.block_rows = true;
+  point_set.fixed_valid = true;
+  point_set.fixed_capacity = 0;
+  point_set.last_fixed_capacity = 0;
+  point_set.skin_lists = false;
+  point_set.active_valid = false;
+  point_set.same_lists_valid = true;
+  return true;
 }
 
 bool NSearch::build_sweep_same_lists(int set) {
