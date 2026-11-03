@@ -17,6 +17,8 @@
 
 namespace apfrnn {
 
+inline int dense_cache_position(const NeighborSearchData &data, uint64_t key);
+
 const int *neighbor_permutation_table() {
   struct NeighborPermutationTable {
     alignas(32) int values[256 * 8];
@@ -559,8 +561,14 @@ ispc::HashGrid hash_of(const NeighborSearchData &data) {
 }
 
 template <typename Data> ispc::CellRanges ranges_of(const Data &data) {
+  const int *starts = data.shared_starts != nullptr
+                          ? data.shared_starts->data()
+                          : data.cell_neighbor_starts.data();
+  const int *ends = data.shared_ends != nullptr
+                        ? data.shared_ends->data()
+                        : data.cell_neighbor_ends.data();
   return {data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
-          data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data()};
+          starts, ends};
 }
 
 template <typename Data>
@@ -813,6 +821,28 @@ inline void build_cross_cell_ranges_from_sorted_impl(
   if (target_data.dense_valid &&
       (data.source == nullptr ||
        (!data.source->blocks_valid && data.source->cell_stencil == 1))) {
+    if (target_data.dense_cache_valid) {
+      data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
+      data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
+      data.shared_starts = &target_data.dense_cache_starts;
+      data.shared_ends = &target_data.dense_cache_ends;
+      for (int cell = 0; cell < num_cells; ++cell) {
+        const int target_cell = dense_cache_position(
+            target_data, source_unique_keys[static_cast<std::size_t>(cell)]);
+        if (target_cell >= 0) {
+          data.cell_neighbor_offset[static_cast<std::size_t>(cell)] =
+              target_data
+                  .dense_cache_offsets[static_cast<std::size_t>(target_cell)];
+          data.cell_num_neighbors[static_cast<std::size_t>(cell)] =
+              target_data
+                  .dense_cache_counts[static_cast<std::size_t>(target_cell)];
+        } else {
+          data.cell_neighbor_offset[static_cast<std::size_t>(cell)] = 0;
+          data.cell_num_neighbors[static_cast<std::size_t>(cell)] = 0;
+        }
+      }
+      return;
+    }
     build_dense_stencil9_ranges_impl(data, source_unique_keys, target_data);
     return;
   }
@@ -1160,6 +1190,8 @@ static void build_point_blocks_inplace(NeighborSearchData &data) {
 }
 
 
+inline void build_dense_range_cache(NeighborSearchData &data);
+
 void build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &x,
                               const std::vector<float> &y,
@@ -1268,6 +1300,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
   if (max_cell_points > 512) {
     build_point_blocks_inplace(data);
   }
+  build_dense_range_cache(data);
 }
 
 void ensure_point_blocks(NeighborSearchData &data) {
@@ -1292,6 +1325,74 @@ static void build_same_set_candidate_cells_inplace(NeighborSearchData &data) {
       num_cells, data.scratch_unique_keys, data,
       data.scratch_cached_neighbor_cells, data.scratch_cached_neighbor_counts,
       data.cell_stencil, data.max_neighbor_cells);
+}
+
+inline int dense_cache_position(const NeighborSearchData &data,
+                                uint64_t key) {
+  if (!data.dense_cache_valid) {
+    return -1;
+  }
+  const int cx0 = data.dense_min_x - 1;
+  const int cy0 = data.dense_min_y - 1;
+  const int cz0 = data.dense_min_z - 1;
+  const int nx = data.dense_nx + 2;
+  const int ny = data.dense_ny + 2;
+  const int nz = data.dense_nz + 2;
+  const int lx = unpack_coord(key, 42) - cx0;
+  const int ly = unpack_coord(key, 21) - cy0;
+  const int lz = unpack_coord(key, 0) - cz0;
+  if (lx < 0 || lx >= nx || ly < 0 || ly >= ny || lz < 0 || lz >= nz) {
+    return -1;
+  }
+  return (lz * ny + ly) * nx + lx;
+}
+
+inline void build_dense_range_cache(NeighborSearchData &data) {
+  data.dense_cache_valid = false;
+  data.dense_cache_offsets.clear();
+  data.dense_cache_counts.clear();
+  data.dense_cache_starts.clear();
+  data.dense_cache_ends.clear();
+  if (!data.dense_valid || data.dense_nx <= 0 || data.dense_ny <= 0 ||
+      data.dense_nz <= 0) {
+    return;
+  }
+  // One extra ring lets a source cell just outside the target AABB see its
+  // target neighbors.
+  const int nx = data.dense_nx + 2;
+  const int ny = data.dense_ny + 2;
+  const int nz = data.dense_nz + 2;
+  const int cx0 = data.dense_min_x - 1;
+  const int cy0 = data.dense_min_y - 1;
+  const int cz0 = data.dense_min_z - 1;
+  const int total = nx * ny * nz;
+  std::vector<uint64_t> keys(static_cast<std::size_t>(total));
+  for (int z = 0; z < nz; ++z) {
+    for (int y = 0; y < ny; ++y) {
+      for (int x = 0; x < nx; ++x) {
+        keys[static_cast<std::size_t>((z * ny + y) * nx + x)] =
+            make_key(cx0 + x, cy0 + y, cz0 + z);
+      }
+    }
+  }
+  data.dense_cache_offsets.resize(static_cast<std::size_t>(total));
+  data.dense_cache_counts.assign(static_cast<std::size_t>(total), 9);
+  data.dense_cache_starts.resize(static_cast<std::size_t>(total) * 9);
+  data.dense_cache_ends.resize(static_cast<std::size_t>(total) * 9);
+  for (int cell = 0; cell < total; ++cell) {
+    data.dense_cache_offsets[static_cast<std::size_t>(cell)] = cell * 9;
+  }
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, total, cell_grain(total)),
+      [&](const tbb::blocked_range<int> &range) {
+        const ispc::Cells queries = key_cells(keys);
+        const ispc::DenseGrid grid = dense_of(data);
+        const ispc::Cells targets = cells_of(data);
+        ispc::dense_stencil9_ranges(
+            range.begin(), range.end(), &queries, &grid, &targets,
+            data.dense_cache_starts.data(), data.dense_cache_ends.data());
+      });
+  data.dense_cache_valid = true;
 }
 
 inline int find_cell_index_cpp(const NeighborSearchData &data,
@@ -1391,7 +1492,31 @@ void build_same_set_cell_ranges_dense_fused_inplace(
     build_same_set_cell_ranges_inplace(data);
     return;
   }
-  build_dense_stencil9_ranges_impl(data, data.scratch_unique_keys, data);
+  if (!data.dense_cache_valid) {
+    build_dense_range_cache(data);
+  }
+  if (!data.dense_cache_valid) {
+    build_dense_stencil9_ranges_impl(data, data.scratch_unique_keys, data);
+    return;
+  }
+  const int num_cells = data.num_cells;
+  data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
+  data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
+  data.shared_starts = &data.dense_cache_starts;
+  data.shared_ends = &data.dense_cache_ends;
+  for (int cell = 0; cell < num_cells; ++cell) {
+    const int target_cell = dense_cache_position(
+        data, data.scratch_unique_keys[static_cast<std::size_t>(cell)]);
+    if (target_cell >= 0) {
+      data.cell_neighbor_offset[static_cast<std::size_t>(cell)] =
+          data.dense_cache_offsets[static_cast<std::size_t>(target_cell)];
+      data.cell_num_neighbors[static_cast<std::size_t>(cell)] =
+          data.dense_cache_counts[static_cast<std::size_t>(target_cell)];
+    } else {
+      data.cell_neighbor_offset[static_cast<std::size_t>(cell)] = 0;
+      data.cell_num_neighbors[static_cast<std::size_t>(cell)] = 0;
+    }
+  }
 }
 
 static void count_same_set_neighbors_parallel(NeighborSearchData &data,

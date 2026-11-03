@@ -274,6 +274,41 @@ TEST_CASE("empty same-set and cross-set inputs produce valid empty CSR") {
   CHECK(apfrnn::support::has_valid_row_ptr(empty_cross));
 }
 
+TEST_CASE("empty inputs are no-ops for every fixed-row writer") {
+  apfrnn::NeighborSearchData empty;
+  apfrnn::NeighborSearchData target;
+  apfrnn::CrossNeighborSearchData empty_cross;
+  apfrnn::IntBuffer neighbors;
+  apfrnn::IntBuffer counts;
+
+  apfrnn::write_neighbors_fixed_query_active2_parallel(empty, 64, neighbors,
+                                                       counts);
+  apfrnn::write_neighbors_fixed_query_pair_parallel(empty, 64, neighbors,
+                                                    counts);
+  apfrnn::write_neighbors_fixed_query_blocked_parallel(empty, 64, neighbors,
+                                                       counts);
+  apfrnn::write_neighbors_fixed_query_pair_dense_parallel(empty, 64, neighbors,
+                                                          counts);
+
+  apfrnn::write_cross_neighbors_target_major_parallel(empty_cross, empty,
+                                                      target, 64, neighbors,
+                                                      counts);
+  apfrnn::write_cross_neighbors_fixed_query_active2_parallel(
+      empty_cross, target, 64, neighbors, counts);
+  apfrnn::write_cross_neighbors_fixed_query_pair_parallel(
+      empty_cross, target, 64, neighbors, counts);
+  apfrnn::write_cross_neighbors_fixed_query_pair_dense_parallel(
+      empty_cross, empty, target, 64, neighbors, counts);
+  apfrnn::write_cross_neighbors_fixed_query_blocked_parallel(
+      empty_cross, target, empty, 64, neighbors, counts);
+
+  apfrnn::build_cross_neighbor_search_data_from_sorted_inplace(
+      empty_cross, empty, target, 1.0f);
+  CHECK(empty_cross.num_points == 0);
+  CHECK(empty_cross.row_ptr.size() == 1);
+  CHECK(empty_cross.row_ptr[0] == 0);
+}
+
 TEST_CASE("duplicate points preserve expected zero-distance neighbors") {
   constexpr float radius = 0.0f;
 

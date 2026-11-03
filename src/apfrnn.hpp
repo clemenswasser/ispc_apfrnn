@@ -136,6 +136,9 @@ struct NeighborSearchData {
   IntBuffer cell_num_neighbors;
   IntBuffer cell_neighbor_starts;
   IntBuffer cell_neighbor_ends;
+  // Optional shared ranges (the per-target dense cache).
+  const IntBuffer *shared_starts = nullptr;
+  const IntBuffer *shared_ends = nullptr;
   IntBuffer counts;
   IntBuffer row_ptr;
   IntBuffer col_idx;
@@ -177,6 +180,14 @@ struct NeighborSearchData {
   int dense_min_y = 0;
   int dense_min_z = 0;
   bool dense_valid = false;
+
+  // Nine z-merged target ranges for every dense grid cell. Shared by every
+  // source set that uses this set as a target.
+  bool dense_cache_valid = false;
+  IntBuffer dense_cache_offsets;
+  IntBuffer dense_cache_counts;
+  IntBuffer dense_cache_starts;
+  IntBuffer dense_cache_ends;
 };
 
 struct CrossNeighborSearchData {
@@ -194,6 +205,8 @@ struct CrossNeighborSearchData {
   IntBuffer cell_num_neighbors;
   IntBuffer cell_neighbor_starts;
   IntBuffer cell_neighbor_ends;
+  const IntBuffer *shared_starts = nullptr;
+  const IntBuffer *shared_ends = nullptr;
   IntBuffer counts;
   IntBuffer row_ptr;
   IntBuffer col_idx;
