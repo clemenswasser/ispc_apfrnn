@@ -137,19 +137,19 @@ unchanged grid/sort and rewrite rows; moving scenes rebuild.
 <!-- bench:headline-timing:start -->
 | Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|
-| uniform | 32 | 4.22 ms | 19.18 ms | 28.97 ms | 4.5x | 6.9x |
-| uniform, 1M | 33 | 24.87 ms | 132.62 ms | 305.52 ms | 5.3x | 12.3x |
-| uniform, moving | 32 | 6.78 ms | 19.98 ms | 33.78 ms | 2.9x | 5.0x |
-| jittered lattice | 29 | 3.73 ms | 9.04 ms | 22.64 ms | 2.4x | 6.1x |
-| SPH-like slab | 58 | 5.88 ms | 19.73 ms | 42.16 ms | 3.4x | 7.2x |
-| slab, moving | 58 | 8.44 ms | 20.43 ms | 46.05 ms | 2.4x | 5.5x |
-| huge sparse domain | 0 | 1.44 ms | 4.85 ms | 36.09 ms | 3.4x | 25.0x |
-| thin slab | 243 | 14.66 ms | 25.30 ms | 451.19 ms | 1.7x | 30.8x |
-| surface | 270 | 15.24 ms | 23.51 ms | 84.27 ms | 1.5x | 5.5x |
-| two-scale clusters | 575 | 20.82 ms | 36.68 ms | 685.90 ms | 1.8x | 33.0x |
-| clustered | 632 | 27.03 ms | 42.30 ms | 1106.85 ms | 1.6x | 40.9x |
-| thin pipe | 3402 | 100.42 ms | 165.35 ms | 1275.94 ms | 1.6x | 12.7x |
-| pathological (10k, one cell) | 9999 | 28.81 ms | 60.40 ms | 346.84 ms | 2.1x | 12.0x |
+| uniform | 32 | 4.36 ms | 18.80 ms | 28.47 ms | 4.3x | 6.5x |
+| uniform, 1M | 33 | 25.29 ms | 122.39 ms | 271.67 ms | 4.8x | 10.7x |
+| uniform, moving | 32 | 5.84 ms | 19.12 ms | 31.19 ms | 3.3x | 5.3x |
+| jittered lattice | 29 | 3.90 ms | 8.80 ms | 22.33 ms | 2.3x | 5.7x |
+| SPH-like slab | 58 | 5.90 ms | 19.35 ms | 40.77 ms | 3.3x | 6.9x |
+| slab, moving | 58 | 7.30 ms | 19.76 ms | 43.36 ms | 2.7x | 5.9x |
+| huge sparse domain | 0 | 1.29 ms | 4.54 ms | 31.81 ms | 3.5x | 24.6x |
+| thin slab | 243 | 14.42 ms | 24.06 ms | 210.58 ms | 1.7x | 14.6x |
+| surface | 270 | 13.47 ms | 21.30 ms | 81.54 ms | 1.6x | 6.1x |
+| two-scale clusters | 575 | 20.16 ms | 36.09 ms | 649.13 ms | 1.8x | 32.2x |
+| clustered | 632 | 26.82 ms | 42.49 ms | 1051.50 ms | 1.6x | 39.2x |
+| thin pipe | 3402 | 91.13 ms | 154.85 ms | 1254.53 ms | 1.7x | 13.8x |
+| pathological (10k, one cell) | 9999 | 26.92 ms | 66.84 ms | 324.76 ms | 2.5x | 12.1x |
 <!-- bench:headline-timing:end -->
 
 Fixed-row capacity and resident memory:
@@ -157,19 +157,19 @@ Fixed-row capacity and resident memory:
 <!-- bench:headline-memory:start -->
 | Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
 |---|---:|---:|---:|---:|
-| uniform | 151 | 196 | 138 | 168 |
-| uniform, 1M | 757 | 952 | 606 | 813 |
-| uniform, moving | 167 | 197 | 135 | 169 |
-| jittered lattice | 84 | 207 | 97 | 168 |
-| SPH-like slab | 151 | 195 | 160 | 234 |
-| slab, moving | 167 | 196 | 160 | 236 |
-| huge sparse domain | 5 | 25 | 41 | 201 |
-| thin slab | 329 | 393 | 330 | 474 |
-| surface | 369 | 417 | 456 | 552 |
-| two-scale clusters | 2181 | 1303 | 745 | 874 |
-| clustered | 1350 | 1244 | 725 | 962 |
-| thin pipe | 3683 | 3728 | 3806 | 5544 |
-| pathological (10k, one cell) | 492 | 501 | 1474 | 597 |
+| uniform | 103 | 150 | 132 | 168 |
+| uniform, 1M | 513 | 723 | 583 | 812 |
+| uniform, moving | 118 | 152 | 132 | 169 |
+| jittered lattice | 84 | 132 | 89 | 168 |
+| SPH-like slab | 127 | 174 | 144 | 235 |
+| slab, moving | 143 | 174 | 148 | 236 |
+| huge sparse domain | 5 | 26 | 40 | 200 |
+| thin slab | 311 | 376 | 322 | 474 |
+| surface | 350 | 407 | 424 | 552 |
+| two-scale clusters | 480 | 552 | 731 | 874 |
+| clustered | 523 | 604 | 680 | 963 |
+| thin pipe | 3664 | 3711 | 3782 | 5526 |
+| pathological (10k, one cell) | 490 | 499 | 2519 | 597 |
 <!-- bench:headline-memory:end -->
 
 ### Stress scenes
@@ -177,29 +177,29 @@ Fixed-row capacity and resident memory:
 <!-- bench:stress-timing:start -->
 | Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|
-| clustered 500k | 646 | 73.95 ms | 127.56 ms | 2918.08 ms | 1.7x | 39.5x |
-| clustered 1M | 652 | 147.00 ms | 300.50 ms | 6173.50 ms | 2.0x | 42.0x |
-| two-scale 1M | 810 | 133.54 ms | 295.28 ms | 6750.99 ms | 2.2x | 50.6x |
-| uniform 2M | 33 | 65.19 ms | 340.17 ms | 682.66 ms | 5.2x | 10.5x |
-| 8 sets x 2.5k | 4 | 0.79 ms | 1.69 ms | 2.01 ms | 2.1x | 2.5x |
-| 8 sets x 12.5k | 4 | 4.76 ms | 9.62 ms | 18.25 ms | 2.0x | 3.8x |
-| 16 sets x 1.25k | 2 | 1.74 ms | 1.99 ms | 2.68 ms | 1.1x | 1.5x |
-| droplets 200k | 26 | 1.73 ms | 5.00 ms | 11.46 ms | 2.9x | 6.6x |
-| droplets 200k, jitter | 25 | 6.28 ms | 5.84 ms | 20.78 ms | 0.9x | 3.3x |
+| clustered 500k | 646 | 67.64 ms | 118.03 ms | 2710.01 ms | 1.7x | 40.1x |
+| clustered 1M | 652 | 134.44 ms | 285.26 ms | 5772.57 ms | 2.1x | 42.9x |
+| two-scale 1M | 810 | 122.24 ms | 278.75 ms | 6422.62 ms | 2.3x | 52.5x |
+| uniform 2M | 33 | 54.02 ms | 318.41 ms | 640.01 ms | 5.9x | 11.8x |
+| 8 sets x 2.5k | 4 | 0.76 ms | 1.66 ms | 1.97 ms | 2.2x | 2.6x |
+| 8 sets x 12.5k | 4 | 4.71 ms | 9.45 ms | 18.20 ms | 2.0x | 3.9x |
+| 16 sets x 1.25k | 2 | 1.82 ms | 1.98 ms | 2.61 ms | 1.1x | 1.4x |
+| droplets 200k | 26 | 1.71 ms | 4.77 ms | 11.41 ms | 2.8x | 6.7x |
+| droplets 200k, jitter | 25 | 5.52 ms | 5.80 ms | 20.17 ms | 1.0x | 3.7x |
 <!-- bench:stress-timing:end -->
 
 <!-- bench:stress-memory:start -->
 | Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
 |---|---:|---:|---:|---:|
-| clustered 500k | 1334 | 1473 | 1625 | 2433 |
-| clustered 1M | 2691 | 2953 | 3323 | 4850 |
-| two-scale 1M | 3295 | 3586 | 4041 | 5636 |
-| uniform 2M | 492 | 806 | 1200 | 1618 |
-| 8 sets x 2.5k | 25 | 52 | 20 | 44 |
-| 8 sets x 12.5k | 61 | 212 | 55 | 195 |
-| 16 sets x 1.25k | 50 | 77 | 24 | 80 |
-| droplets 200k | 105 | 138 | 58 | 76 |
-| droplets 200k, jitter | 105 | 146 | 61 | 78 |
+| clustered 500k | 1334 | 1473 | 1599 | 2435 |
+| clustered 1M | 2691 | 2955 | 3108 | 4859 |
+| two-scale 1M | 3295 | 3589 | 3882 | 5635 |
+| uniform 2M | 492 | 807 | 1184 | 1618 |
+| 8 sets x 2.5k | 25 | 44 | 19 | 45 |
+| 8 sets x 12.5k | 61 | 179 | 52 | 195 |
+| 16 sets x 1.25k | 50 | 70 | 23 | 80 |
+| droplets 200k | 56 | 91 | 44 | 76 |
+| droplets 200k, jitter | 56 | 103 | 49 | 78 |
 <!-- bench:stress-memory:end -->
 
 ### Motion
@@ -207,11 +207,11 @@ Fixed-row capacity and resident memory:
 <!-- bench:motion:start -->
 | Scene | static | jitter | jitter vs static | maximum row, static -> jitter |
 |---|---:|---:|---:|---:|
-| uniform 200k | 4.22 ms | 7.83 ms | +86% | 62 -> 60 |
-| slab 200k | 5.88 ms | 9.36 ms | +59% | 92 -> 95 |
-| clustered 200k | 27.03 ms | 34.18 ms | +26% | 1717 -> 1694 |
-| thin pipe 50k | 19.51 ms | 27.94 ms | +43% | 2475 -> 3388 |
-| droplets 200k | 1.73 ms | 6.93 ms | +301% | 61 -> 57 |
+| uniform 200k | 4.35 ms | 6.70 ms | +54% | 62 -> 60 |
+| slab 200k | 5.92 ms | 7.98 ms | +35% | 92 -> 95 |
+| clustered 200k | 26.64 ms | 34.50 ms | +30% | 1717 -> 1689 |
+| thin pipe 50k | 16.01 ms | 28.81 ms | +80% | 2475 -> 3432 |
+| droplets 200k | 1.71 ms | 5.51 ms | +223% | 61 -> 58 |
 <!-- bench:motion:end -->
 
 ### Saved learnsph frames
@@ -219,13 +219,13 @@ Fixed-row capacity and resident memory:
 <!-- bench:learnsph:start -->
 | Frame | Fluid / boundary | ispc_apfrnn | TreeNSearch | CompactNSearch | Peak RSS (ours / Tree / Compact) |
 |---|---:|---:|---:|---:|---:|
-| ramp_split_lv | 20k / 78k | 0.25 ms | 1.39 ms | 2.73 ms | 32 / 17 / 31 MB |
-| ramp_split_hv | 29k / 78k | 0.36 ms | 1.74 ms | 4.72 ms | 32 / 28 / 40 MB |
-| wall_01 | 74k / 208k | 0.87 ms | 4.34 ms | 9.62 ms | 70 / 76 / 100 MB |
-| funnel | 21k / 535k | 0.28 ms | 5.04 ms | 17.84 ms | 77 / 76 / 105 MB |
-| sink | 57k / 13k | 1.35 ms | 2.78 ms | 10.11 ms | 85 / 63 / 80 MB |
-| bowl | 111k / 82k | 1.12 ms | 6.12 ms | 14.74 ms | 100 / 42 / 83 MB |
-| wall | 107k / 208k | 1.19 ms | 5.22 ms | 19.11 ms | 109 / 59 / 102 MB |
+| ramp_split_lv | 20k / 78k | 0.26 ms | 1.33 ms | 2.82 ms | 27 / 16 / 31 MB |
+| ramp_split_hv | 29k / 78k | 0.38 ms | 1.74 ms | 4.84 ms | 27 / 27 / 40 MB |
+| wall_01 | 74k / 208k | 0.80 ms | 4.07 ms | 9.33 ms | 50 / 70 / 100 MB |
+| funnel | 21k / 535k | 0.28 ms | 4.85 ms | 17.32 ms | 72 / 75 / 105 MB |
+| sink | 57k / 13k | 1.31 ms | 2.65 ms | 10.23 ms | 57 / 49 / 79 MB |
+| bowl | 111k / 82k | 0.96 ms | 5.99 ms | 14.79 ms | 58 / 40 / 83 MB |
+| wall | 107k / 208k | 0.99 ms | 4.87 ms | 18.07 ms | 68 / 56 / 101 MB |
 <!-- bench:learnsph:end -->
 
 ## Benchmarks
