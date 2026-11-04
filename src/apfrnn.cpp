@@ -100,9 +100,10 @@ inline void prepare_block_rows(IntBuffer &values, IntBuffer &counts,
   }
 #ifndef NDEBUG
   // finish_row() uses aligned non-temporal stores of a whole gang: every row
-  // start and capacity must be a multiple of row_align() ints.
+  // must start on a gang boundary. Capacities are rounded to row_align()
+  // (at least 8), and the stride adds row_slack() (one gang).
   for (std::size_t i = 0; i < num_points; ++i) {
-    assert(row_offset[i] % row_align() == 0);
+    assert(row_offset[i] % gang_width() == 0);
     assert(row_capacity[i] % row_align() == 0);
   }
 #endif

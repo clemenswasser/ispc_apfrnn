@@ -121,3 +121,40 @@ TEST_CASE("block row budget adds the 64 MiB slack after the per-point term") {
   // The slack must not multiply the exact-neighbor term.
   CHECK(apfrnn::plan::block_output_budget(1, 1) < kSlack + 1024);
 }
+
+TEST_CASE("exact capacities fit the maximum without a degree margin") {
+  using apfrnn::plan::same_exact_capacity;
+  CHECK(same_exact_capacity(5, 1000, kBudget) == 32);
+  CHECK(same_exact_capacity(70, 1000, kBudget) ==
+        apfrnn::round_up_to_row_align(70));
+  CHECK(same_exact_capacity(40000, 1000, kBudget) == 0);   // over the limit
+  CHECK(same_exact_capacity(1000, 1000000, 1 << 20) == 0); // over budget
+}
+
+TEST_CASE("block rows are preferred only for large padding savings") {
+  using apfrnn::plan::prefer_block_rows;
+  using apfrnn::plan::same_block_slots;
+  using apfrnn::plan::same_fixed_slots;
+  // One long row pads every row of the fixed layout.
+  apfrnn::IntBuffer outlier(80000, 10);
+  outlier[123] = 600;
+  CHECK(same_fixed_slots(outlier) ==
+        80000LL * (apfrnn::round_up_to_row_align(600) + apfrnn::row_slack()));
+  CHECK(prefer_block_rows(same_fixed_slots(outlier),
+                          same_block_slots(outlier, 8)));
+  // Equal rows: block rows only add headroom and per-row offsets.
+  const apfrnn::IntBuffer flat(80000, 30);
+  CHECK_FALSE(
+      prefer_block_rows(same_fixed_slots(flat), same_block_slots(flat, 8)));
+  // A large relative saving that is too small in bytes to matter.
+  apfrnn::IntBuffer tiny(50, 10);
+  tiny[3] = 600;
+  CHECK_FALSE(
+      prefer_block_rows(same_fixed_slots(tiny), same_block_slots(tiny, 8)));
+}
+
+TEST_CASE("high-degree sets size every block row on its own") {
+  CHECK(apfrnn::plan::same_min_block(apfrnn::IntBuffer(1000, 100)) == 1);
+  CHECK(apfrnn::plan::same_min_block(apfrnn::IntBuffer(1000, 10)) == 8);
+  CHECK(apfrnn::plan::same_min_block(apfrnn::IntBuffer()) == 8);
+}

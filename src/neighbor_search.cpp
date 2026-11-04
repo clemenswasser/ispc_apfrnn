@@ -212,6 +212,12 @@ struct NSearch::PointSet {
   // Block-fixed rows: per-block capacities and per-query row offsets.
   bool block_rows = false;
   bool block_caps_valid = false;
+  // row_offset/row_capacity and the buffer size match block_caps. On an
+  // unchanged grid nothing overflows, so later frames skip the layout pass.
+  bool block_layout_valid = false;
+  int block_total = 0;
+  int block_max_capacity = 0;
+  int64_t block_layout_budget = 0; // memory_budget_ the layout was checked at
   int block_size = 0;
   IntBuffer block_offsets;
   IntBuffer block_caps;
@@ -220,6 +226,15 @@ struct NSearch::PointSet {
   // Bumped whenever the sorted grid (and therefore the cell keys and sorted
   // index order) is rebuilt. Cross-pair caches compare it to detect reuse.
   uint64_t grid_generation = 0;
+  // grid_generation at the last same-set list build. Block rows are cached
+  // per sorted index, which a grid rebuild reorders, so they are only used
+  // while the grid is unchanged.
+  static constexpr uint64_t kNoGeneration = ~uint64_t{0};
+  uint64_t lists_grid_generation = kNoGeneration;
+  // grid_generation at which the fixed layout was last chosen over block
+  // rows. The counts of an unchanged grid cannot change that decision, so it
+  // is not re-evaluated (three passes over the counts) every frame.
+  uint64_t fixed_layout_generation = kNoGeneration;
 };
 
 struct NSearch::Pair {
@@ -1514,37 +1529,53 @@ void NSearch::build_grid_same_lists(int set) {
   // (radius + skin) that fixed and skin rows are written with.
   data.radius = build_radius();
   point_set.fixed_valid = false;
+  // A moving set is re-sorted on every grid rebuild, so cached per-row block
+  // capacities no longer match their rows and nearly every frame overflows
+  // and rewrites all rows; it uses fixed rows instead. The first build is
+  // optimistic.
+  const bool first_lists =
+      point_set.lists_grid_generation == PointSet::kNoGeneration;
+  const bool grid_rebuilt =
+      point_set.lists_grid_generation != point_set.grid_generation;
+  point_set.lists_grid_generation = point_set.grid_generation;
+  const bool block_rows_ok = skin_ <= 0.0f && (first_lists || !grid_rebuilt);
   if (point_set.block_rows) {
-    if (build_same_block_rows(set)) {
+    if (block_rows_ok && build_same_block_rows(set)) {
       note_path(kPathSameBlockRows);
       return;
     }
     point_set.block_rows = false;
+    point_set.block_caps_valid = false;
+    point_set.block_layout_valid = false;
   }
   const plan::SamePlan same_plan =
       plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
-  // For a stationary dense set whose maximum row is a large outlier over
-  // the average, per-block rows avoid padding every row to the maximum.
-  // The fixed path is used on the first frame; once counts are known, switch
-  // to block rows with a block size large enough to amortize task overhead.
-  if (same_plan.fixed_rows && data.dense_valid &&
-      data.num_points >= 100000 && data.num_points <= 200000 &&
-      point_set.fixed_counts.size() ==
-          static_cast<std::size_t>(data.num_points)) {
-    long long total_count = 0;
-    int max_count = 0;
-    for (int count : point_set.fixed_counts) {
-      total_count += count;
-      max_count = std::max(max_count, count);
+  // Per-block rows avoid padding every row to the set's maximum. They need
+  // exact counts and do not support skin lists. On later frames the last
+  // frame's counts decide; on the first build the counts are taken below.
+  auto wants_block_rows = [&](int &min_block) {
+    if (!block_rows_ok ||
+        point_set.fixed_layout_generation == point_set.grid_generation) {
+      return false;
     }
-    const double average_count =
-        static_cast<double>(total_count) / data.num_points;
-    if (max_count > 32 && max_count > 5.0 * average_count) {
-      if (build_same_block_rows(set, 8)) {
-        note_path(kPathSameBlockRows);
-        return;
-      }
+    min_block = plan::same_min_block(point_set.fixed_counts);
+    if (plan::prefer_block_rows(
+            plan::same_fixed_slots(point_set.fixed_counts),
+            plan::same_block_slots(point_set.fixed_counts, min_block))) {
+      return true;
+    }
+    point_set.fixed_layout_generation = point_set.grid_generation;
+    return false;
+  };
+  int min_block = 0;
+  if (same_plan.fixed_rows && point_set.last_fixed_capacity > 0 &&
+      point_set.fixed_counts.size() ==
+          static_cast<std::size_t>(data.num_points) &&
+      wants_block_rows(min_block)) {
+    if (build_same_block_rows(set, min_block)) {
+      note_path(kPathSameBlockRows);
+      return;
     }
   }
 
@@ -1616,7 +1647,23 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.same_lists_valid = true;
       return;
     }
-    if (try_fixed(same_plan.first_capacity)) {
+    int first_capacity = same_plan.first_capacity;
+    if (point_set.last_fixed_capacity == 0) {
+      // First build of this set: count exactly instead of writing rows at a
+      // guessed capacity, which leaves an oversized buffer resident or, on
+      // overflow, rewrites every row padded to the maximum.
+      count_same_set_neighbors_inplace(data);
+      point_set.fixed_counts = data.counts;
+      if (wants_block_rows(min_block) &&
+          build_same_block_rows(set, min_block, /*counts_ready=*/true)) {
+        note_path(kPathSameBlockRows);
+        return;
+      }
+      first_capacity =
+          plan::same_exact_capacity(max_row_count(point_set.fixed_counts),
+                                    data.num_points, memory_budget_);
+    }
+    if (first_capacity > 0 && try_fixed(first_capacity)) {
       return;
     }
     const int grown = plan::same_grown_capacity(
@@ -1651,7 +1698,7 @@ void NSearch::build_grid_same_lists(int set) {
   point_set.same_lists_valid = true;
 }
 
-bool NSearch::build_same_block_rows(int set, int min_block) {
+bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
   NeighborSearchData &data = point_set.data;
   const int num_points = data.num_points;
@@ -1666,10 +1713,13 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
           (num_points + point_set.block_size - 1) / point_set.block_size;
   int64_t block_budget = memory_budget_;
   if (!cached) {
-    count_same_set_neighbors_inplace(data);
-    point_set.fixed_counts = data.counts;
+    if (!counts_ready) {
+      count_same_set_neighbors_inplace(data);
+      point_set.fixed_counts = data.counts;
+    }
+    const IntBuffer &counts = point_set.fixed_counts;
     int64_t exact_neighbors = 0;
-    for (int count : data.counts) {
+    for (int count : counts) {
       exact_neighbors += count;
     }
     const int64_t output_budget =
@@ -1691,7 +1741,7 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
         const int end = std::min(begin + candidate, num_points);
         int max_count = 0;
         for (int i = begin; i < end; ++i) {
-          max_count = std::max(max_count, data.counts[i]);
+          max_count = std::max(max_count, counts[i]);
         }
         const int cap = round_up_to_row_align(max_count + 8);
         caps[static_cast<std::size_t>(block)] = cap;
@@ -1707,7 +1757,12 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
       return false;
     }
     point_set.block_caps_valid = true;
-  } else {
+    point_set.block_layout_valid = false;
+  } else if (!point_set.block_layout_valid ||
+             point_set.block_layout_budget != memory_budget_ ||
+             point_set.fixed_neighbors.size() !=
+                 static_cast<std::size_t>(point_set.block_total)) {
+    point_set.block_layout_valid = false;
     if (static_cast<int>(point_set.fixed_counts.size()) != num_points) {
       point_set.fixed_counts.resize(static_cast<std::size_t>(num_points));
     }
@@ -1730,61 +1785,84 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
 
   bool stable = false;
   for (int attempt = 0; attempt < 4; ++attempt) {
-    int total = 0;
-    int max_capacity = 0;
-    for (int block = 0; block < block_count; ++block) {
-      const int begin = block * block_size;
-      const int end = std::min(begin + block_size, num_points);
-      const int capacity =
-          point_set.block_caps[static_cast<std::size_t>(block)];
-      const int stride = capacity + row_slack();
-      point_set.block_offsets[static_cast<std::size_t>(block)] = total;
-      for (int i = begin; i < end; ++i) {
-        point_set.row_offset[static_cast<std::size_t>(i)] =
-            total + (i - begin) * stride;
-        point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
+    if (!point_set.block_layout_valid) {
+      int total = 0;
+      int max_capacity = 0;
+      for (int block = 0; block < block_count; ++block) {
+        const int begin = block * block_size;
+        const int end = std::min(begin + block_size, num_points);
+        const int capacity =
+            point_set.block_caps[static_cast<std::size_t>(block)];
+        const int stride = capacity + row_slack();
+        point_set.block_offsets[static_cast<std::size_t>(block)] = total;
+        for (int i = begin; i < end; ++i) {
+          point_set.row_offset[static_cast<std::size_t>(i)] =
+              total + (i - begin) * stride;
+          point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
+        }
+        total += (end - begin) * stride;
+        max_capacity = std::max(max_capacity, capacity);
       }
-      total += (end - begin) * stride;
-      max_capacity = std::max(max_capacity, capacity);
+      const int64_t bytes = static_cast<int64_t>(total) * 4 +
+                            static_cast<int64_t>(num_points) * 2 * 4 +
+                            static_cast<int64_t>(block_count) * 2 * 4;
+      if (bytes > block_budget) {
+        return false;
+      }
+      if (point_set.fixed_neighbors.capacity() <
+              static_cast<std::size_t>(total) ||
+          point_set.fixed_neighbors.capacity() >
+              static_cast<std::size_t>(total) * 2) {
+        IntBuffer().swap(point_set.fixed_neighbors);
+        // After a regrow (a moving set) leave headroom, so the next small
+        // growth reuses the buffer instead of faulting in a fresh one.
+        if (attempt > 0) {
+          point_set.fixed_neighbors.reserve(static_cast<std::size_t>(total) +
+                                            static_cast<std::size_t>(total) /
+                                                8);
+        }
+      }
+      point_set.fixed_neighbors.resize(static_cast<std::size_t>(total));
+      point_set.block_total = total;
+      point_set.block_max_capacity = max_capacity;
+      point_set.block_layout_budget = memory_budget_;
+      point_set.block_layout_valid = true;
     }
-    const int64_t bytes =
-        static_cast<int64_t>(total) * 4 +
-        static_cast<int64_t>(num_points) * 2 * 4 +
-        static_cast<int64_t>(block_count) * 2 * 4;
-    if (bytes > block_budget) {
-      return false;
-    }
-    if (point_set.fixed_neighbors.capacity() <
-            static_cast<std::size_t>(total) ||
-        point_set.fixed_neighbors.capacity() >
-            static_cast<std::size_t>(total) * 2) {
-      IntBuffer().swap(point_set.fixed_neighbors);
-    }
-    point_set.fixed_neighbors.resize(static_cast<std::size_t>(total));
     write_same_set_block_rows_parallel(
-        data, max_capacity, point_set.fixed_counts, point_set.fixed_neighbors,
-        point_set.row_offset, point_set.row_capacity);
+        data, point_set.block_max_capacity, point_set.fixed_counts,
+        point_set.fixed_neighbors, point_set.row_offset,
+        point_set.row_capacity);
 
-    bool grew = false;
-    for (int block = 0; block < block_count; ++block) {
-      const int begin = block * block_size;
-      const int end = std::min(begin + block_size, num_points);
-      int max_count = 0;
-      for (int i = begin; i < end; ++i) {
-        max_count = std::max(max_count, point_set.fixed_counts[i]);
-      }
-      const int current =
-          point_set.block_caps[static_cast<std::size_t>(block)];
-      if (max_count > current) {
-        point_set.block_caps[static_cast<std::size_t>(block)] =
-            round_up_to_row_align(max_count + 8);
-        grew = true;
-      }
-    }
+    // Each block's capacity is independent, so the overflow check runs in
+    // parallel; a serial pass over every row is a fixed per-frame cost.
+    const bool grew = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, block_count, 4096), false,
+        [&](const tbb::blocked_range<int> &range, bool acc) {
+          for (int block = range.begin(); block < range.end(); ++block) {
+            const int begin = block * block_size;
+            const int end = std::min(begin + block_size, num_points);
+            int max_count = 0;
+            for (int i = begin; i < end; ++i) {
+              max_count = std::max(max_count, point_set.fixed_counts[i]);
+            }
+            int &current =
+                point_set.block_caps[static_cast<std::size_t>(block)];
+            if (max_count > current) {
+              // Only a moving set overflows; a margin keeps its degree
+              // fluctuations from rewriting every row on most frames.
+              current =
+                  round_up_to_row_align(max_count + std::max(8, max_count / 8));
+              acc = true;
+            }
+          }
+          return acc;
+        },
+        [](bool a, bool b) { return a || b; });
     if (!grew) {
       stable = true;
       break;
     }
+    point_set.block_layout_valid = false;
   }
   if (!stable) {
     return false;

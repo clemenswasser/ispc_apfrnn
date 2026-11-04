@@ -1,5 +1,8 @@
 #include "plan.hpp"
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_reduce.h>
+
 #include <algorithm>
 #include <cstddef>
 
@@ -12,6 +15,15 @@ constexpr int kSameMaxCapacity = 32768;
 constexpr int kCrossInitialCapacity = 32;
 constexpr int kCrossMaxCapacity = 4096;
 constexpr int kFixedMaxPoints = 1000000;
+// prefer_block_rows: block rows must save this fraction of the fixed slots
+// and this many bytes.
+constexpr int64_t kBlockRowMinSavingNum = 1;
+constexpr int64_t kBlockRowMinSavingDen = 3;
+constexpr int64_t kBlockRowMinSavedBytes = int64_t(256) << 10;
+// same_min_block: sets averaging this many neighbors size every row on its
+// own; lower-degree sets share a capacity per kLowDegreeBlock rows.
+constexpr int64_t kPerRowBlockDegree = 64;
+constexpr int kLowDegreeBlock = 8;
 
 int64_t row_bytes(int num_points, int capacity) {
   return static_cast<int64_t>(num_points) *
@@ -163,6 +175,94 @@ int same_fitted_capacity(int max_count, int capacity) {
       max_count <= 64 ? 0 : std::max(8, max_count / 16);
   return std::min(capacity,
                   std::max(32, round_up_to_row_align(max_count + margin)));
+}
+
+int same_exact_capacity(int max_count, int num_points, int64_t memory_budget) {
+  if (max_count > kSameMaxCapacity) {
+    return 0;
+  }
+  // No degree margin: a static set never needs one, and a moving set that
+  // overflows regrows once with the fitted margin.
+  const int capacity = std::max(32, round_up_to_row_align(max_count));
+  return row_bytes(num_points, capacity) > memory_budget ? 0 : capacity;
+}
+
+namespace {
+
+// Block-wise maximum of counts, combined by `combine(block_max, rows)`. The
+// counts have one entry per point, so this runs in parallel like the writers.
+template <typename Combine>
+int64_t reduce_blocks(const IntBuffer &counts, int block, Combine combine) {
+  const int n = static_cast<int>(counts.size());
+  const int blocks = (n + block - 1) / block;
+  return tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, blocks, 1024), int64_t{0},
+      [&](const tbb::blocked_range<int> &range, int64_t acc) {
+        for (int b = range.begin(); b < range.end(); ++b) {
+          const int begin = b * block;
+          const int end = std::min(begin + block, n);
+          int block_max = 0;
+          for (int i = begin; i < end; ++i) {
+            block_max =
+                std::max(block_max, counts[static_cast<std::size_t>(i)]);
+          }
+          acc = combine(acc, block_max, end - begin);
+        }
+        return acc;
+      },
+      [](int64_t a, int64_t b) { return a + b; });
+}
+
+} // namespace
+
+int64_t same_fixed_slots(const IntBuffer &counts) {
+  const int64_t max_count = tbb::parallel_reduce(
+      tbb::blocked_range<std::size_t>(0, counts.size(), 1 << 16), int64_t{0},
+      [&](const tbb::blocked_range<std::size_t> &range, int64_t acc) {
+        for (std::size_t i = range.begin(); i < range.end(); ++i) {
+          acc = std::max<int64_t>(acc, counts[i]);
+        }
+        return acc;
+      },
+      [](int64_t a, int64_t b) { return std::max(a, b); });
+  // The capacity same_exact_capacity() gives these counts.
+  const int capacity =
+      std::max(32, round_up_to_row_align(static_cast<int>(max_count)));
+  return static_cast<int64_t>(counts.size()) * (capacity + row_slack());
+}
+
+int64_t same_block_slots(const IntBuffer &counts, int block) {
+  // Plus the per-row offset and capacity that block rows also store.
+  return 2 * static_cast<int64_t>(counts.size()) +
+         reduce_blocks(counts, block, [](int64_t acc, int block_max, int rows) {
+           return acc +
+                  static_cast<int64_t>(rows) *
+                      (round_up_to_row_align(block_max + 8) + row_slack());
+         });
+}
+
+int same_min_block(const IntBuffer &counts) {
+  if (counts.empty()) {
+    return kLowDegreeBlock;
+  }
+  const int64_t total = tbb::parallel_reduce(
+      tbb::blocked_range<std::size_t>(0, counts.size(), 1 << 16), int64_t{0},
+      [&](const tbb::blocked_range<std::size_t> &range, int64_t acc) {
+        for (std::size_t i = range.begin(); i < range.end(); ++i) {
+          acc += counts[i];
+        }
+        return acc;
+      },
+      [](int64_t a, int64_t b) { return a + b; });
+  return total >= kPerRowBlockDegree * static_cast<int64_t>(counts.size())
+             ? 1
+             : kLowDegreeBlock;
+}
+
+bool prefer_block_rows(int64_t fixed_slots, int64_t block_slots) {
+  const int64_t saved = fixed_slots - block_slots;
+  return saved * kBlockRowMinSavingDen >= fixed_slots * kBlockRowMinSavingNum &&
+         saved * static_cast<int64_t>(sizeof(int)) >= kBlockRowMinSavedBytes;
 }
 
 int cross_fitted_capacity(int max_count, int capacity) {

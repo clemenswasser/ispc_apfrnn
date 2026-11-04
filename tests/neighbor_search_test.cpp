@@ -1800,6 +1800,44 @@ TEST_CASE("block rows with cached capacities rebuild the grid's ranges") {
   CHECK(block_frames > 0);
 }
 
+TEST_CASE(
+    "block rows are used while the grid is unchanged and left on motion") {
+  // Clustered rows have very different lengths. Frame 1 counts exactly and
+  // writes block rows directly (no padded fixed rows that overflow and
+  // regrow); moving the points rebuilds the grid and re-sorts the rows, so
+  // frame 2 uses fixed rows; frame 3 is stationary again.
+  auto cloud = apfrnn::bench::make_clustered(20000, 30.0f, 23);
+  auto xyz = interleave(cloud);
+  apfrnn::NSearch search(1.7f);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+  search.run();
+  uint64_t paths = search.last_stats().paths;
+  CHECK((paths & apfrnn::NSearch::kPathSameBlockRows) != 0);
+  CHECK((paths & apfrnn::NSearch::kPathSameGrown) == 0);
+  check_same_set(search, id, cloud, 1.7f);
+
+  std::mt19937 generator(9);
+  std::uniform_real_distribution<float> jitter(-0.3f, 0.3f);
+  for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+    cloud.x[i] += jitter(generator);
+    cloud.y[i] += jitter(generator);
+    cloud.z[i] += jitter(generator);
+  }
+  const auto moved = interleave(cloud);
+  std::copy(moved.begin(), moved.end(), xyz.begin());
+  search.run();
+  paths = search.last_stats().paths;
+  CHECK((paths & apfrnn::NSearch::kPathSameBlockRows) == 0);
+  check_same_set(search, id, cloud, 1.7f);
+
+  search.run();
+  paths = search.last_stats().paths;
+  CHECK((paths & apfrnn::NSearch::kPathSameBlockRows) != 0);
+  check_same_set(search, id, cloud, 1.7f);
+}
+
 TEST_CASE("CSR fallback rows stay exact on a skin-reused target") {
   // `fluid` (only a target) moves less than skin / 2, so it keeps its grid
   // (skin reuse) and that grid's sorted coordinates lag behind the caller's. `probes` changes

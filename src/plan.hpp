@@ -73,6 +73,27 @@ int cross_grown_capacity(int max_count, int num_points, int64_t memory_budget);
 
 // Capacity to start from next frame, given the observed maximum degree.
 int same_fitted_capacity(int max_count, int capacity);
+
+// Fixed-row capacity for exact counts with maximum `max_count`: the fitted
+// capacity, or 0 when the rows would exceed the limit or the memory budget.
+int same_exact_capacity(int max_count, int num_points, int64_t memory_budget);
+
+// Row slots of the two same-set layouts for exact `counts`: fixed rows fitted
+// to the maximum, and per-block rows (build_same_block_rows) with `block`
+// points per block, each row sized to its block's maximum plus 8 headroom,
+// including the per-row offset and capacity block rows also store.
+int64_t same_fixed_slots(const IntBuffer &counts);
+int64_t same_block_slots(const IntBuffer &counts, int block);
+
+// Block rows when they save enough to pay for their per-row offset and
+// capacity loads: at least kBlockRowMinSaving of the fixed slots and
+// kBlockRowMinSavedBytes in absolute terms.
+bool prefer_block_rows(int64_t fixed_slots, int64_t block_slots);
+
+// Smallest block size for per-block rows: 1 (every row sized to its own
+// count) for high-degree sets, where the per-row capacity arrays are small
+// next to the rows, else a shared capacity per 8 rows.
+int same_min_block(const IntBuffer &counts);
 int cross_fitted_capacity(int max_count, int capacity);
 
 // True when every point is alone in its cell with no occupied neighbor cell,
