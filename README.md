@@ -121,7 +121,9 @@ scene); that keeps a long-running kernel from resetting the device.
 Median frame time on the machine below with an Intel Arc A770 (oneAPI 2026.2,
 Level Zero 1.17.39758+11), 5 x 1 s repetitions with the CPU threads pinned to
 0-15. These are raw neighbor-list frames; they do not include an SPH consumer.
-`Auto` applies the policy above.
+`Auto` applies the policy above. This table is from the earlier SYCL build; its
+CPU column is that build's CPU backend and has not been re-run for the current
+CPU table above.
 
 | Scene | CPU | GPU | Auto | GPU / CPU |
 |---|---:|---:|---:|---:|
@@ -143,32 +145,87 @@ Level Zero 1.17.39758+11), 5 x 1 s repetitions with the CPU threads pinned to
 Steady-state frame times, wall clock, i7-12700K pinned to its 8 P-cores (16
 threads). The baselines use OpenMP, so the comparison is wall time, not CPU
 time. Each benchmark ran for 2 s after two warm-up frames (see
-[Methodology](#methodology)).
+[Methodology](#methodology)). All numbers below were measured on the current
+tree at `7445981`.
 
 ### Synthetic scenes
 
 Fluid set plus a static boundary and an emitter, frame replay
-(`ispc_apfrnn_bench`, the `Frame/...` benchmarks). The speedup shrinks
-as the neighbor count per point grows, because writing the rows dominates
-there.
+(`ispc_apfrnn_bench`, the `Frame/...` benchmarks). The speedup shrinks as the
+neighbor count per point grows, because writing the rows dominates there.
 
 | Scene (200k unless noted) | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|
-| uniform | 32 | 5.99 ms | 19.2 ms | 29.3 ms | 3.2x | 4.9x |
-| uniform, 1M | 33 | 32.1 ms | 123 ms | 282 ms | 3.8x | 8.8x |
-| uniform, moving | 32 | 6.23 ms | 19.5 ms | 32.0 ms | 3.1x | 5.1x |
-| jittered lattice | 29 | 4.64 ms | 8.91 ms | 21.9 ms | 1.9x | 4.7x |
-| SPH-like slab | 58 | 7.20 ms | 19.7 ms | 41.7 ms | 2.7x | 5.8x |
-| slab, moving | 58 | 7.70 ms | 20.3 ms | 44.4 ms | 2.6x | 5.8x |
-| huge sparse domain | 0 | 1.48 ms | 4.58 ms | 32.0 ms | 3.1x | 22x |
-| thin slab | 243 | 14.9 ms | 23.9 ms | 225 ms | 1.6x | 15x |
-| surface | 270 | 15.3 ms | 21.8 ms | 81.4 ms | 1.4x | 5.3x |
-| two-scale clusters | 575 | 26.0 ms | 36.5 ms | 684 ms | 1.4x | 26x |
-| clustered | 632 | 31.4 ms | 41.7 ms | 1107 ms | 1.3x | 35x |
-| thin pipe | 3400 | 112 ms | 156 ms | 1262 ms | 1.4x | 11x |
-| pathological (10k, one cell) | 10000 | 37.6 ms | 54.7 ms | 345 ms | 1.5x | 9.2x |
+| uniform | 32 | 5.94 ms | 19.10 ms | 28.97 ms | 3.2x | 4.9x |
+| uniform, 1M | 33 | 32.77 ms | 125.78 ms | 278.92 ms | 3.8x | 8.5x |
+| uniform, moving | 32 | 6.22 ms | 19.50 ms | 32.27 ms | 3.1x | 5.2x |
+| jittered lattice | 29 | 4.72 ms | 9.02 ms | 22.50 ms | 1.9x | 4.8x |
+| SPH-like slab | 58 | 7.64 ms | 19.76 ms | 41.42 ms | 2.6x | 5.4x |
+| slab, moving | 58 | 7.92 ms | 20.04 ms | 43.96 ms | 2.5x | 5.5x |
+| huge sparse domain | 0 | 1.44 ms | 4.61 ms | 32.20 ms | 3.2x | 22.3x |
+| thin slab | 243 | 17.07 ms | 26.27 ms | 220.08 ms | 1.5x | 12.9x |
+| surface | 270 | 16.20 ms | 21.67 ms | 81.96 ms | 1.3x | 5.1x |
+| two-scale clusters | 575 | 26.78 ms | 38.64 ms | 693.24 ms | 1.4x | 25.9x |
+| clustered | 632 | 30.79 ms | 42.78 ms | 1111.61 ms | 1.4x | 36.1x |
+| thin pipe | 3402 | 105.89 ms | 155.05 ms | 1267.22 ms | 1.5x | 12.0x |
+| pathological (10k, one cell) | 9999 | 37.80 ms | 57.77 ms | 347.72 ms | 1.5x | 9.2x |
 
-At 50k points the ratios are similar (1.45x to 5.5x against TreeNSearch).
+Fixed-row capacity and resident memory:
+
+| Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
+|---|---:|---:|---:|---:|
+| uniform | 167 | 193 | 131 | 168 |
+| uniform, 1M | 835 | 938 | 575 | 812 |
+| uniform, moving | 167 | 194 | 131 | 169 |
+| jittered lattice | 100 | 223 | 94 | 168 |
+| SPH-like slab | 167 | 192 | 145 | 235 |
+| slab, moving | 167 | 193 | 156 | 236 |
+| huge sparse domain | 5 | 26 | 43 | 201 |
+| thin slab | 362 | 390 | 304 | 474 |
+| surface | 387 | 415 | 397 | 552 |
+| two-scale clusters | 2242 | 1332 | 706 | 875 |
+| clustered | 1412 | 1275 | 684 | 963 |
+| thin pipe | 3683 | 3728 | 3861 | 5576 |
+| pathological (10k, one cell) | 492 | 501 | 1542 | 596 |
+
+`Rows MB` is the fixed-row/CSR capacity reported by `last_stats()`. `Peak RSS`
+is the process high-water mark from a separate one-scene run; rows can exceed
+RSS when capacity pages are not all touched. Tree and Compact have no row
+counter. At 50k points the tree speedups range from 1.2x to 6.0x and the
+Compact speedups from 4.2x to 28x.
+
+### Stress scenes
+
+These are deliberately outside the headline matrix: 500k-2M high-degree sets,
+many all-pairs sets, and dense droplets in a huge domain.
+
+| Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |
+|---|---:|---:|---:|---:|---:|---:|
+| clustered 500k | 646 | 79.4 ms | 119.0 ms | 2861 ms | 1.5x | 36x |
+| clustered 1M | 652 | 159 ms | 288 ms | 6057 ms | 1.8x | 38x |
+| two-scale 1M | 810 | 158 ms | 281 ms | 6785 ms | 1.8x | 43x |
+| uniform 2M | 33 | 83.0 ms | 323 ms | 655 ms | 3.9x | 7.9x |
+| 8 sets x 2.5k | 4 | 0.98 ms | 1.69 ms | 2.05 ms | 1.7x | 2.1x |
+| 8 sets x 12.5k | 4 | 6.87 ms | 9.60 ms | 18.7 ms | 1.4x | 2.7x |
+| 16 sets x 1.25k | 2 | 2.02 ms | 2.03 ms | 2.72 ms | 1.0x | 1.3x |
+| droplets 200k | 26 | 3.70 ms | 5.01 ms | 11.4 ms | 1.4x | 3.1x |
+| droplets 200k, jitter | 25 | 6.23 ms | 5.79 ms | 19.9 ms | 0.9x | 3.2x |
+
+| Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
+|---|---:|---:|---:|---:|
+| clustered 500k | 1490 | 1497 | 1611 | 2434 |
+| clustered 1M | 3002 | 2997 | 3102 | 4858 |
+| two-scale 1M | 3847 | 3797 | 4041 | 5635 |
+| uniform 2M | 492 | 803 | 1184 | 1618 |
+| 8 sets x 2.5k | 25 | 53 | 18 | 44 |
+| 8 sets x 12.5k | 125 | 214 | 54 | 194 |
+| 16 sets x 1.25k | 50 | 76 | 23 | 80 |
+| droplets 200k | 105 | 138 | 56 | 76 |
+| droplets 200k, jitter | 105 | 146 | 53 | 79 |
+
+Jittered droplets is the one stress scene where TreeNSearch is faster (by
+about 8%): the static cache hits disappear when every point moves, so the
+hash-grid stencil and range merge run every frame.
 
 ### Motion
 
@@ -179,52 +236,58 @@ which leaves relative geometry unchanged and is the easy case. `_jitter`
 moves every point independently by up to a quarter radius per axis, changing
 cell occupancy and the maximum degree, and is closer to real flow.
 
-| Scene | jitter vs static | maximum row, static -> jitter |
-|---|---:|---:|
-| uniform 200k | +20% | 62 -> 61 |
-| slab 200k | +13% | 92 -> 95 |
-| clustered 200k | +7% | 1717 -> 1694 |
-| thin pipe 50k | +40% | 2475 -> 3429 |
+| Scene | static | jitter | jitter vs static | maximum row, static -> jitter |
+|---|---:|---:|---:|---:|
+| uniform 200k | 5.95 ms | 7.05 ms | +19% | 62 -> 62 |
+| slab 200k | 7.68 ms | 8.61 ms | +12% | 92 -> 94 |
+| clustered 200k | 30.81 ms | 32.96 ms | +7% | 1717 -> 1694 |
+| thin pipe 50k | 20.00 ms | 26.86 ms | +34% | 2475 -> 3413 |
+| droplets 200k | 3.66 ms | 6.26 ms | +71% | 61 -> 63 |
 
-The largest increase is on the high-degree thin pipe, where the neighbour
-count itself rises. Rigid translation does not cover this case. The `Frame`
-numbers exclude the O(n) `scene.advance()`; `Api/Frame` times it inside the
-loop and the small-move case is 6.38 ms against 5.96 ms static at 200k.
+Jitter costs 7% to 71% more than a static frame. Thin pipe rises because the
+neighbour count itself increases. Droplets rises most because the static
+frame reuses the unchanged cell and range tables while the jittered frame
+rebuilds them; that is the honest cost of motion on the hash-grid path. The
+`Frame` numbers exclude the O(n) `scene.advance()`; `Api/Frame` times it inside
+the loop and the small-move case is 6.38 ms against 5.96 ms static at 200k.
 
 The warm-up is not hiding motion: it only removes one-time allocation and
-capacity fitting. `Cold/` times setup plus the first frame, 11.6 ms for
-uniform 200k and 12.2 ms for slab 200k, against 5.8 ms and 7.6 ms in steady
-state.
+capacity fitting. `Cold/` times setup plus the first frame: 11.7 ms uniform
+200k, 12.4 ms slab 200k, 98.3 ms clustered 200k and 49.6 ms thin pipe 50k,
+against 5.9/7.6/30.8/20.0 ms in steady state.
 
 ### Saved learnsph frames
 
 One fluid/boundary pair from real simulations (`ispc_apfrnn_bench` with
-`--learnsph_res`, median of 7 runs after a warm-up). Peak RSS is that of the
-whole benchmark process.
+`--learnsph_res`, median of 7 runs after a warm-up). Peak RSS is from a
+separate one-scene process, as in the synthetic tables.
 
-| Frame | Fluid / boundary | ispc_apfrnn | TreeNSearch | CompactNSearch | Peak RSS (ours / Tree) |
+| Frame | Fluid / boundary | ispc_apfrnn | TreeNSearch | CompactNSearch | Peak RSS (ours / Tree / Compact) |
 |---|---:|---:|---:|---:|---:|
-| ramp_split_lv | 20k / 78k | 0.88 ms | 1.40 ms | 2.69 ms | 32 / 12 MB |
-| ramp_split_hv | 29k / 78k | 0.62 ms | 1.80 ms | 4.69 ms | 33 / 19 MB |
-| wall_01 | 74k / 208k | 1.28 ms | 4.18 ms | 11.0 ms | 64 / 51 MB |
-| funnel | 21k / 535k | 0.57 ms | 4.99 ms | 18.1 ms | 77 / 50 MB |
-| sink | 57k / 13k | 1.71 ms | 2.62 ms | 9.86 ms | 70 / 42 MB |
-| bowl | 111k / 82k | 3.35 ms | 6.20 ms | 14.7 ms | 114 / 32 MB |
-| wall | 107k / 208k | 3.33 ms | 5.03 ms | 17.4 ms | 130 / 40 MB |
+| ramp_split_lv | 20k / 78k | 0.69 ms | 1.35 ms | 2.69 ms | 38 / 17 / 31 MB |
+| ramp_split_hv | 29k / 78k | 0.55 ms | 1.75 ms | 4.77 ms | 32 / 28 / 40 MB |
+| wall_01 | 74k / 208k | 1.16 ms | 4.21 ms | 9.40 ms | 69 / 73 / 100 MB |
+| funnel | 21k / 535k | 0.51 ms | 4.99 ms | 17.8 ms | 78 / 76 / 104 MB |
+| sink | 57k / 13k | 1.88 ms | 2.72 ms | 10.4 ms | 85 / 59 / 80 MB |
+| bowl | 111k / 82k | 2.92 ms | 6.12 ms | 14.8 ms | 134 / 42 / 83 MB |
+| wall | 107k / 208k | 3.15 ms | 5.02 ms | 17.6 ms | 161 / 58 / 102 MB |
+
 
 ### Costs and caveats
 
 - **Memory.** Rows are fixed-capacity (the observed maximum degree plus a small
-  margin), so they use more memory than exact CSR. Peak RSS is 1.3x to 3.6x
-  that of TreeNSearch on the learnsph frames. Thin pipe at 200k needs about
-  3.7 GB of rows. `set_memory_budget` caps this; larger rows fall back to CSR.
+  margin), so they use more memory than exact CSR. Peak RSS is 0.9x to 3.2x
+  that of TreeNSearch on the learnsph frames. Thin pipe at 200k needs 3.68 GB
+  of rows and 3.73 GB peak RSS. `set_memory_budget` caps this; larger rows fall
+  back to CSR.
 - **First frame.** The first frame starts from a default row capacity: it
   can overflow, retry with a larger one, and touch freshly allocated memory.
   Thin pipe's first frame takes about 250 ms against 103 ms in steady state;
   from the second frame on, rows reuse the fitted capacity and buffer. All
   tables above are steady state.
-- **CPU time.** Wall time is lower everywhere, but total CPU time is not
-  always: on ramp_split_lv we use 12.2 ms of CPU against TreeNSearch's 9.9 ms.
+- **CPU time.** Tables report wall time because the baselines use OpenMP. On
+  ramp_split_lv the current CPU time is 0.69 ms against TreeNSearch's 1.27 ms;
+  the earlier CPU-time caveat no longer applies.
 - **One machine.** All numbers come from one AVX2 desktop CPU.
 
 ### Methodology
@@ -246,6 +309,10 @@ the neighbor pairs clearly within the radius, which must be equal for all
 backends of a scene, and `FalsePositives` must be 0. The learnsph tables use the same command with
 `--learnsph_res=../learnsph/res` (the default); the saved frames join the
 scene list when their files exist.
+
+Memory is measured separately, one scene and backend per process, with the
+same warm-up and a 0.5 s timed region. `Peak RSS` is the process high-water
+mark; `Rows MB` is the fixed-row/CSR capacity from `last_stats()`.
 
 ### How it works
 
