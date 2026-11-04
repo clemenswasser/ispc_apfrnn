@@ -169,6 +169,11 @@ struct NeighborSearchData {
   int cached_range_total = -1;
   uint64_t cached_range_generation = 0;
   bool cached_range_valid = false;
+  std::vector<uint64_t> dense_stencil_keys;
+  IntBuffer dense_stencil_cell_starts;
+  IntBuffer dense_stencil_cell_ends;
+  int dense_stencil_total = -1;
+  bool dense_stencil_cache_valid = false;
   IntBuffer block_begin;
   IntBuffer block_end;
   IntBuffer block_cell;

@@ -1391,6 +1391,11 @@ void build_point_grid_inplace(NeighborSearchData &data,
     data.cell_neighbor_starts.clear();
     data.cell_neighbor_ends.clear();
     data.cached_range_valid = false;
+    data.dense_stencil_keys.clear();
+    data.dense_stencil_cell_starts.clear();
+    data.dense_stencil_cell_ends.clear();
+    data.dense_stencil_total = -1;
+    data.dense_stencil_cache_valid = false;
     return;
   }
 
@@ -1414,12 +1419,28 @@ void build_point_grid_inplace(NeighborSearchData &data,
           static_cast<std::size_t>(data.cached_range_total) &&
       data.cell_neighbor_ends.size() ==
           static_cast<std::size_t>(data.cached_range_total);
-  if (!keep_ranges) {
+  const bool keep_dense_stencil =
+      data.dense_stencil_cache_valid &&
+      data.dense_stencil_keys == unique_keys &&
+      data.dense_stencil_cell_starts == data.cell_starts &&
+      data.dense_stencil_cell_ends == data.cell_ends &&
+      data.cell_neighbor_offset.size() == num_cells_size &&
+      data.cell_num_neighbors.size() == num_cells_size &&
+      data.cell_neighbor_starts.size() ==
+          static_cast<std::size_t>(data.dense_stencil_total) &&
+      data.cell_neighbor_ends.size() ==
+          static_cast<std::size_t>(data.dense_stencil_total);
+  if (!keep_ranges && !keep_dense_stencil) {
     data.cell_neighbor_offset.clear();
     data.cell_num_neighbors.clear();
     data.cell_neighbor_starts.clear();
     data.cell_neighbor_ends.clear();
+  }
+  if (!keep_ranges) {
     data.cached_range_valid = false;
+  }
+  if (!keep_dense_stencil) {
+    data.dense_stencil_cache_valid = false;
   }
 
   int num_cells = static_cast<int>(data.cell_starts.size());
@@ -1600,6 +1621,7 @@ inline int find_cell_index_cpp(const NeighborSearchData &data,
 
 void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
   use_own_ranges(data);
+  data.dense_stencil_cache_valid = false;
   if (data.num_points == 0) {
     data.cell_neighbor_offset.clear();
     data.cell_num_neighbors.clear();
@@ -1688,17 +1710,39 @@ void build_same_set_cell_ranges_dense_fused_inplace(
     data.cell_num_neighbors.clear();
     data.cell_neighbor_starts.clear();
     data.cell_neighbor_ends.clear();
+    data.dense_stencil_cache_valid = false;
     return;
   }
   if (!data.dense_valid || data.cell_stencil > 1) {
     build_same_set_cell_ranges_inplace(data);
     return;
   }
-  if (!data.dense_cache_valid) {
-    build_dense_stencil9_ranges_impl(data, data.scratch_unique_keys, data);
+  const int num_cells = data.num_cells;
+  if (!data.dense_cache_valid && data.dense_stencil_cache_valid &&
+      data.dense_stencil_keys == data.scratch_unique_keys &&
+      data.dense_stencil_cell_starts == data.cell_starts &&
+      data.dense_stencil_cell_ends == data.cell_ends &&
+      data.cell_neighbor_offset.size() ==
+          static_cast<std::size_t>(num_cells) &&
+      data.cell_num_neighbors.size() ==
+          static_cast<std::size_t>(num_cells) &&
+      data.cell_neighbor_starts.size() ==
+          static_cast<std::size_t>(data.dense_stencil_total) &&
+      data.cell_neighbor_ends.size() ==
+          static_cast<std::size_t>(data.dense_stencil_total)) {
     return;
   }
-  const int num_cells = data.num_cells;
+  if (!data.dense_cache_valid) {
+    build_dense_stencil9_ranges_impl(data, data.scratch_unique_keys, data);
+    data.dense_stencil_keys = data.scratch_unique_keys;
+    data.dense_stencil_cell_starts = data.cell_starts;
+    data.dense_stencil_cell_ends = data.cell_ends;
+    data.dense_stencil_total =
+        static_cast<int>(data.cell_neighbor_starts.size());
+    data.dense_stencil_cache_valid = true;
+    return;
+  }
+  data.dense_stencil_cache_valid = false;
   data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
   data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
   data.shared_starts = &data.dense_cache_starts;
