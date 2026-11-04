@@ -146,7 +146,7 @@ Steady-state frame times, wall clock, i7-12700K pinned to its 8 P-cores (16
 threads). The baselines use OpenMP, so the comparison is wall time, not CPU
 time. Each benchmark ran for 2 s after two warm-up frames (see
 [Methodology](#methodology)). All numbers below were measured on the current
-tree at `7445981`.
+tree.
 
 ### Synthetic scenes
 
@@ -269,8 +269,8 @@ separate one-scene process, as in the synthetic tables.
 | wall_01 | 74k / 208k | 1.16 ms | 4.21 ms | 9.40 ms | 69 / 73 / 100 MB |
 | funnel | 21k / 535k | 0.51 ms | 4.99 ms | 17.8 ms | 78 / 76 / 104 MB |
 | sink | 57k / 13k | 1.88 ms | 2.72 ms | 10.4 ms | 85 / 59 / 80 MB |
-| bowl | 111k / 82k | 2.92 ms | 6.12 ms | 14.8 ms | 134 / 42 / 83 MB |
-| wall | 107k / 208k | 3.15 ms | 5.02 ms | 17.6 ms | 161 / 58 / 102 MB |
+| bowl | 111k / 82k | 2.90 ms | 6.12 ms | 14.8 ms | 134 / 42 / 83 MB |
+| wall | 107k / 208k | 2.93 ms | 5.02 ms | 17.6 ms | 163 / 58 / 102 MB |
 
 
 ### Costs and caveats
