@@ -175,7 +175,32 @@ void radix_sort_point_keys(std::vector<SortPointKey> &keys,
                            kRadixBuckets);
   SortPointKey *src = keys.data();
   SortPointKey *dst = scratch.data();
+  // A pass whose digit is the same in every key leaves the order unchanged:
+  // skip it. The digits that vary are those where the OR and AND of all keys
+  // differ, which one reduction finds.
+  struct Bits {
+    uint64_t any = 0;
+    uint64_t all = ~uint64_t{0};
+  };
+  const Bits bits = tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, num_points, 1 << 14), Bits{},
+      [&](const tbb::blocked_range<int> &range, Bits acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          acc.any |= src[i].key;
+          acc.all &= src[i].key;
+        }
+        return acc;
+      },
+      [](Bits a, const Bits &b) {
+        a.any |= b.any;
+        a.all &= b.all;
+        return a;
+      });
+  const uint64_t varying_bits = bits.any ^ bits.all;
   for (int pass = 0; pass < 8; ++pass) {
+    if (((varying_bits >> (pass * kRadixBits)) & (kRadixBuckets - 1)) == 0) {
+      continue;
+    }
     std::fill(histogram.begin(), histogram.end(), 0);
     tbb::parallel_for(0, kRadixChunks, [&](int chunk) {
       const int begin = static_cast<int>(
@@ -1655,6 +1680,43 @@ inline int find_cell_index_cpp(const NeighborSearchData &data,
   }
 }
 
+// Hash grid with the 27-cell stencil: one pass of hash_stencil_ranges writes
+// every cell's merged runs into fixed slots, instead of collecting the 27
+// neighbor cells and merging them in a count pass, a scan and a write pass.
+static void build_hash_stencil_ranges(NeighborSearchData &data) {
+  const int num_cells = data.num_cells;
+  const bool reuse =
+      data.cached_range_valid && data.cached_range_stencil == -1 &&
+      data.hash_range_keys == data.scratch_unique_keys &&
+      data.cached_range_cell_starts == data.cell_starts &&
+      data.cached_range_cell_ends == data.cell_ends &&
+      data.cell_num_neighbors.size() == static_cast<std::size_t>(num_cells);
+  if (reuse) {
+    return;
+  }
+  const int slots = ispc::hash_stencil_runs_per_cell();
+  const std::size_t total = static_cast<std::size_t>(num_cells) * slots;
+  data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
+  data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
+  data.cell_neighbor_starts.resize(total);
+  data.cell_neighbor_ends.resize(total);
+  parallel_cells(0, num_cells, cell_grain(num_cells), [&](int begin, int end) {
+    const ispc::Cells cells = cells_of(data);
+    const ispc::HashGrid hash = hash_of(data);
+    ispc::hash_stencil_ranges(
+        begin, end, &cells, &hash, &cells, num_cells,
+        data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
+        data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data());
+  });
+  data.hash_range_keys = data.scratch_unique_keys;
+  data.cached_range_cell_starts = data.cell_starts;
+  data.cached_range_cell_ends = data.cell_ends;
+  // -1 marks these ranges; the merged path below never reuses them.
+  data.cached_range_stencil = -1;
+  data.cached_range_total = static_cast<int>(total);
+  data.cached_range_valid = true;
+}
+
 void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
   use_own_ranges(data);
   data.dense_stencil_cache_valid = false;
@@ -1664,6 +1726,10 @@ void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
     data.cell_neighbor_starts.clear();
     data.cell_neighbor_ends.clear();
     data.cached_range_valid = false;
+    return;
+  }
+  if (!data.dense_valid && data.cell_stencil == 1) {
+    build_hash_stencil_ranges(data);
     return;
   }
 
@@ -1943,6 +2009,9 @@ void write_neighbors_fixed_query_blocked_parallel(
   if (data.num_points == 0) {
     return;
   }
+  // The hash-grid range builder does not collect candidate cells, so build
+  // (or reuse) the ones this writer reads.
+  build_same_set_candidate_cells_inplace(data);
   const ispc::Blocks blocks = blocks_of(data);
   const ispc::NeighborCells ncells =
       neighbor_cells_of(data, data.max_neighbor_cells);

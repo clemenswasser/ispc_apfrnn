@@ -189,6 +189,9 @@ struct NeighborSearchData {
   int cached_range_total = -1;
   uint64_t cached_range_generation = 0;
   bool cached_range_valid = false;
+  // Cell keys the hash-grid stencil ranges were built from (see
+  // build_hash_stencil_ranges); cached_range_* holds the rest of the check.
+  std::vector<uint64_t> hash_range_keys;
   std::vector<uint64_t> dense_stencil_keys;
   IntBuffer dense_stencil_cell_starts;
   IntBuffer dense_stencil_cell_ends;

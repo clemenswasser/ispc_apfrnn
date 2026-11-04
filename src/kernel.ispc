@@ -371,6 +371,104 @@ export void merge_dense_neighbor_ranges(
   }
 }
 
+// Stencil runs on the hash grid, in one pass. Cells are sorted by key (x,
+// then y, then z), so the occupied cells of one (x, y) column with z in
+// [cz - 1, cz + 1] are adjacent in the cell arrays and their points form one
+// run. The first such cell takes a hash probe; each next z is the array
+// successor if its key matches (no probe). Only the step from z = -1 to
+// z = 0 needs a probe: keys hold z as an unsigned 21-bit field, so -1 sorts
+// after every z >= 0 of its column. That case can split a column into two
+// runs, so each cell has kHashStencilRuns slots at cell * kHashStencilRuns;
+// out_counts gets the runs used. Touching runs (end == start) are merged,
+// also across columns. 9 probes per cell in the common case instead of the
+// 27 of collect_neighbor_cells, and no count/scan/merge passes.
+// Appends point run [start, end) to a cell's runs, extending the open run
+// when they touch; the open run is flushed to out_* when they do not.
+static inline void append_run(varying int start, varying int end,
+                              varying int base, varying int &runs,
+                              varying int &run_start, varying int &run_end,
+                              uniform int out_starts[], uniform int out_ends[]) {
+  if (start == run_end) {
+    run_end = end;
+    return;
+  }
+  if (run_start >= 0) {
+    out_starts[base + runs] = run_start;
+    out_ends[base + runs] = run_end;
+    ++runs;
+  }
+  run_start = start;
+  run_end = end;
+}
+
+#define HASH_STENCIL_RUNS 18
+export uniform int hash_stencil_runs_per_cell() { return HASH_STENCIL_RUNS; }
+
+export void hash_stencil_ranges(
+    uniform int start_cell, uniform int end_cell,
+    const uniform Cells *uniform queries_in,
+    const uniform HashGrid *uniform hash_in,
+    const uniform Cells *uniform targets_in, uniform int num_target_cells,
+    uniform int out_offsets[], uniform int out_counts[],
+    uniform int out_starts[], uniform int out_ends[]) {
+  const uniform Cells queries = *queries_in;
+  const uniform HashGrid hash = *hash_in;
+  const uniform Cells targets = *targets_in;
+  foreach (cell = start_cell... end_cell) {
+    const varying uint64 key = queries.keys[cell];
+    const varying int cx = unpack_coord(key, 42);
+    const varying int cy = unpack_coord(key, 21);
+    const varying int cz = unpack_coord(key, 0);
+    const varying int base = cell * HASH_STENCIL_RUNS;
+    varying int runs = 0;
+    varying int run_start = -1;
+    varying int run_end = -1;
+    for (uniform int dx = -1; dx <= 1; ++dx) {
+      for (uniform int dy = -1; dy <= 1; ++dy) {
+        // Consecutive cells [first, last] of this column; their points are
+        // [starts[first], ends[last]), so only the run's ends are gathered.
+        varying int first = -1;
+        varying int last = -1;
+        for (uniform int dz = -1; dz <= 1; ++dz) {
+          const varying int z = cz + dz;
+          const varying uint64 want = make_key(cx + dx, cy + dy, z);
+          varying int found = -1;
+          if (last >= 0 && z != 0) {
+            const varying int next = last + 1;
+            if (next < num_target_cells && targets.keys[next] == want) {
+              found = next;
+            }
+          } else {
+            found = find_cell_index(hash, want);
+          }
+          if (found >= 0) {
+            if (first >= 0 && found != last + 1) {
+              // Only across z = -1 -> 0 in raw key order: not adjacent.
+              append_run(targets.starts[first], targets.ends[last], base,
+                         runs, run_start, run_end, out_starts, out_ends);
+              first = found;
+            } else if (first < 0) {
+              first = found;
+            }
+            last = found;
+          }
+        }
+        if (first >= 0) {
+          append_run(targets.starts[first], targets.ends[last], base, runs,
+                     run_start, run_end, out_starts, out_ends);
+        }
+      }
+    }
+    if (run_start >= 0) {
+      out_starts[base + runs] = run_start;
+      out_ends[base + runs] = run_end;
+      ++runs;
+    }
+    out_offsets[cell] = base;
+    out_counts[cell] = runs;
+  }
+}
+
 // Fixed 9-run dense stencil: each query cell gets one merged z-run per
 // (dx,dy) pair. One pass, 27 dense lookups, no count/scan; the writer sees
 // nine runs instead of 27 individual cells or the branchy merged lists.

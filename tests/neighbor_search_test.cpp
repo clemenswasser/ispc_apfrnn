@@ -1838,6 +1838,38 @@ TEST_CASE(
   check_same_set(search, id, cloud, 1.7f);
 }
 
+TEST_CASE("hash-grid stencil ranges are exact across the zero cell layer") {
+  // Cell keys store z as an unsigned 21-bit field. The radix sort (16384+
+  // points) orders raw keys, so a column's z = -1 cell sorts after its
+  // z >= 0 cells, and the stencil runs must not chain them through the
+  // sorted order. Dense clusters straddle x = y = z = 0 in a domain far too
+  // large for the dense lookup.
+  apfrnn::support::PointCloud cloud;
+  std::mt19937 generator(41);
+  std::uniform_real_distribution<float> local(-3.0f, 3.0f);
+  const float centers[][3] = {{0.0f, 0.0f, 0.0f},
+                              {5000.0f, -4000.0f, 0.2f},
+                              {-6000.0f, 3000.0f, -0.4f},
+                              {0.5f, 7000.0f, 0.9f}};
+  for (const auto &c : centers) {
+    for (int i = 0; i < 5000; ++i) {
+      cloud.x.push_back(c[0] + local(generator));
+      cloud.y.push_back(c[1] + local(generator));
+      cloud.z.push_back(c[2] + local(generator));
+    }
+  }
+  const auto xyz = interleave(cloud);
+  apfrnn::NSearch search(1.0f);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+  search.run();
+  const uint64_t paths = search.last_stats().paths;
+  CHECK((paths & apfrnn::NSearch::kPathGridHash) != 0);
+  CHECK((paths & apfrnn::NSearch::kPathSameRangesMerged) != 0);
+  check_same_set(search, id, cloud, 1.0f);
+}
+
 TEST_CASE("CSR fallback rows stay exact on a skin-reused target") {
   // `fluid` (only a target) moves less than skin / 2, so it keeps its grid
   // (skin reuse) and that grid's sorted coordinates lag behind the caller's. `probes` changes
