@@ -213,13 +213,13 @@ Fixed-row capacity and resident memory:
 <!-- bench:learnsph:start -->
 | Frame | Fluid / boundary | ispc_apfrnn | TreeNSearch | CompactNSearch | Peak RSS (ours / Tree / Compact) |
 |---|---:|---:|---:|---:|---:|
-| ramp_split_lv | 20k / 78k | 0.24 ms | 1.40 ms | 2.86 ms | 38 / 17 / 31 MB |
-| ramp_split_hv | 29k / 78k | 0.37 ms | 1.76 ms | 4.81 ms | 32 / 28 / 40 MB |
-| wall_01 | 74k / 208k | 0.88 ms | 4.33 ms | 9.30 ms | 69 / 73 / 100 MB |
-| funnel | 21k / 535k | 0.28 ms | 5.17 ms | 18.07 ms | 78 / 76 / 104 MB |
-| sink | 57k / 13k | 1.38 ms | 2.75 ms | 10.12 ms | 85 / 59 / 80 MB |
-| bowl | 111k / 82k | 1.31 ms | 6.15 ms | 14.72 ms | 134 / 42 / 83 MB |
-| wall | 107k / 208k | 1.44 ms | 5.09 ms | 17.95 ms | 163 / 58 / 102 MB |
+| ramp_split_lv | 20k / 78k | 0.24 ms | 1.35 ms | 2.73 ms | 38 / 17 / 31 MB |
+| ramp_split_hv | 29k / 78k | 0.37 ms | 1.76 ms | 4.78 ms | 32 / 28 / 40 MB |
+| wall_01 | 74k / 208k | 0.87 ms | 4.45 ms | 9.57 ms | 69 / 73 / 100 MB |
+| funnel | 21k / 535k | 0.28 ms | 5.18 ms | 18.67 ms | 78 / 76 / 104 MB |
+| sink | 57k / 13k | 1.49 ms | 2.72 ms | 10.07 ms | 85 / 59 / 80 MB |
+| bowl | 111k / 82k | 1.40 ms | 6.14 ms | 14.62 ms | 126 / 42 / 83 MB |
+| wall | 107k / 208k | 1.46 ms | 5.10 ms | 17.85 ms | 139 / 58 / 102 MB |
 <!-- bench:learnsph:end -->
 
 ## Benchmarks

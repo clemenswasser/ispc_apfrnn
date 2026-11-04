@@ -1445,6 +1445,29 @@ void NSearch::build_grid_same_lists(int set) {
   const plan::SamePlan same_plan =
       plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
+  // For a stationary dense set whose maximum row is a large outlier over
+  // the average, per-block rows avoid padding every row to the maximum.
+  // The fixed path is used on the first frame; once counts are known, switch
+  // to block rows with a block size large enough to amortize task overhead.
+  if (same_plan.fixed_rows && data.dense_valid &&
+      data.num_points >= 100000 && data.num_points <= 200000 &&
+      !point_set.fixed_counts.empty()) {
+    long long total_count = 0;
+    int max_count = 0;
+    for (int count : point_set.fixed_counts) {
+      total_count += count;
+      max_count = std::max(max_count, count);
+    }
+    const double average_count =
+        static_cast<double>(total_count) / data.num_points;
+    if (max_count > 32 && max_count > 5.0 * average_count) {
+      if (build_same_block_rows(set, 8)) {
+        note_path(kPathSameBlockRows);
+        return;
+      }
+    }
+  }
+
   auto try_fixed = [&](int capacity) {
     switch (same_plan.writer) {
     case plan::SameWriter::PairDense:
@@ -1548,7 +1571,7 @@ void NSearch::build_grid_same_lists(int set) {
   point_set.same_lists_valid = true;
 }
 
-bool NSearch::build_same_block_rows(int set) {
+bool NSearch::build_same_block_rows(int set, int min_block) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
   NeighborSearchData &data = point_set.data;
   const int num_points = data.num_points;
@@ -1576,6 +1599,9 @@ bool NSearch::build_same_block_rows(int set) {
     }
     point_set.block_size = 0;
     for (int candidate : {1, 2, 4, 8, 16, 32, 64, 128, 256}) {
+      if (candidate < min_block) {
+        continue;
+      }
       const int blocks = (num_points + candidate - 1) / candidate;
       int64_t bytes = static_cast<int64_t>(num_points) * 2 * 4 +
                       static_cast<int64_t>(blocks) * 2 * 4;
