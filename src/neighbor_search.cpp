@@ -160,6 +160,8 @@ struct NSearch::PointSet {
   int last_fixed_capacity = 0;
   Bounds bounds;  // of x/y/z, maintained by sync_source
   bool use_sweep = false;
+  bool sweep_decision_valid = false;
+  bool sweep_decision = false;
   sweep::Index sweep;
   SourceType source_type = SourceType::None;
   const void *source = nullptr;
@@ -263,6 +265,7 @@ float NSearch::sync_source(int set_index) {
     set.z.clear();
     set.bounds = Bounds{};
     set.sweep.valid = false;
+    set.sweep_decision_valid = false;
     return max_distance_sq;
   }
 
@@ -283,8 +286,9 @@ float NSearch::sync_source(int set_index) {
                                     : std::numeric_limits<float>::infinity();
   if (max_distance_sq > 0.0f) {
     // Both the sweep x order and the packed GPU copy are stale once any
-    // point moved.
+    // point moved. The sweep/grid choice may change as well.
     set.sweep.valid = false;
+    set.sweep_decision_valid = false;
     set.gpu_xyz_valid = false;
   }
   return max_distance_sq;
@@ -343,6 +347,7 @@ void NSearch::resize_source(int set, const void *xyz, bool is_double, int n) {
   point_set.source_count = n;
   point_set.dirty = true;
   point_set.valid = false;
+  point_set.sweep_decision_valid = false;
   point_set.probe_valid = false;
   point_set.probe_age = 0;
   point_set.gpu_xyz_valid = false;
@@ -1226,6 +1231,7 @@ void NSearch::set_radius(float radius) {
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     sets_[static_cast<std::size_t>(set)].dirty = true;
     sets_[static_cast<std::size_t>(set)].valid = false;
+    sets_[static_cast<std::size_t>(set)].sweep_decision_valid = false;
     invalidate_pairs_for_set(set);
   }
 }
@@ -1283,6 +1289,7 @@ void NSearch::set_skin(float skin) {
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     sets_[static_cast<std::size_t>(set)].dirty = true;
     sets_[static_cast<std::size_t>(set)].valid = false;
+    sets_[static_cast<std::size_t>(set)].sweep_decision_valid = false;
     invalidate_pairs_for_set(set);
   }
 }
@@ -1327,8 +1334,13 @@ void NSearch::build_point_grid(int set) {
   point_set.active_valid = false;
   point_set.dirty = false;
 
-  if (sweep::should_use(point_set.bounds, point_set.x.size(),
-                        build_radius())) {
+  if (!point_set.sweep_decision_valid) {
+    point_set.sweep_decision = sweep::should_use(
+        point_set.x, point_set.y, point_set.z, point_set.bounds,
+        build_radius());
+    point_set.sweep_decision_valid = true;
+  }
+  if (point_set.sweep_decision) {
     // Sweep sets keep the caller's order: the sorted mapping is the identity
     // and the grid arrays stay empty.
     NeighborSearchData &data = point_set.data;

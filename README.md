@@ -250,8 +250,9 @@ scene list when their files exist.
 ### How it works
 
 - The grid is a flat cell grid with a dense cell lookup when the bounding box
-  fits the memory budget, and a hash otherwise. Very sparse sets use a sweep
-  fallback instead.
+  fits the memory budget, and a hash otherwise. Uniformly sparse sets use a
+  sweep fallback; sparse sets with dense clusters keep the hash grid, because
+  an x-window sweep would scan each cluster repeatedly.
 - Points are counting-sorted by cell. Results are mapped back to the caller's
   order.
 - Rows are written in one pass into fixed-capacity rows, with CSR as the

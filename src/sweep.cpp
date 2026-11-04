@@ -1,6 +1,7 @@
 #include "sweep.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <tbb/blocked_range.h>
@@ -13,6 +14,34 @@ namespace {
 
 constexpr double kMinCellsPerPoint = 10000.0;
 constexpr int kMaxRowCapacity = 65536;
+
+// A huge bounding box only makes the sweep attractive when its points are
+// spread through it. Dense clusters still fill every x-window, so sample
+// coarse cells and look for repeated occupancy. Small sets skip the sample:
+// their search cost is negligible either way.
+constexpr int kClusterMinPoints = 4096;
+constexpr int kClusterMinSamples = 2048;
+constexpr int kClusterMaxSamples = 32768;
+constexpr float kClusterCellScale = 8.0f;
+constexpr int kClusterRunThreshold = 4;
+constexpr double kClusterUniqueRatio = 0.4;
+
+uint64_t cluster_cell_key(float x, float y, float z, float cell) {
+  const double inverse = 1.0 / static_cast<double>(cell);
+  const int64_t ix =
+      static_cast<int64_t>(std::floor(static_cast<double>(x) * inverse));
+  const int64_t iy =
+      static_cast<int64_t>(std::floor(static_cast<double>(y) * inverse));
+  const int64_t iz =
+      static_cast<int64_t>(std::floor(static_cast<double>(z) * inverse));
+  uint64_t hash = static_cast<uint64_t>(ix) * 0x9e3779b97f4a7c15ull;
+  hash ^= static_cast<uint64_t>(iy) * 0xc2b2ae3d27d4eb4full;
+  hash ^= static_cast<uint64_t>(iz) * 0x165667b19e3779f9ull;
+  hash ^= hash >> 33;
+  hash *= 0xff51afd7ed558ccdull;
+  hash ^= hash >> 33;
+  return hash;
+}
 
 // Visits the query points [begin, end) of the query's visiting order. For each
 // query, calls visit(other) for every target point within radius and then
@@ -97,9 +126,59 @@ double estimated_cells_per_point(const Bounds &bounds, std::size_t num_points,
   return cells / static_cast<double>(num_points);
 }
 
-bool should_use(const Bounds &bounds, std::size_t num_points, float radius) {
-  return estimated_cells_per_point(bounds, num_points, radius) >
-         kMinCellsPerPoint;
+bool should_use(const std::vector<float> &x, const std::vector<float> &y,
+                const std::vector<float> &z, const Bounds &bounds,
+                float radius) {
+  const std::size_t num_points = x.size();
+  if (estimated_cells_per_point(bounds, num_points, radius) <=
+      kMinCellsPerPoint) {
+    return false;
+  }
+  if (num_points < static_cast<std::size_t>(kClusterMinPoints) ||
+      y.size() != num_points || z.size() != num_points || !(radius > 0.0f)) {
+    // Preserve the old choice for small or malformed sets.
+    return true;
+  }
+
+  const std::size_t wanted =
+      std::max(static_cast<std::size_t>(kClusterMinSamples), num_points / 64);
+  const std::size_t samples =
+      std::min(num_points,
+               std::min(wanted, static_cast<std::size_t>(kClusterMaxSamples)));
+  std::size_t capacity = 1;
+  while (capacity < samples * 2) {
+    capacity <<= 1;
+  }
+  std::vector<uint64_t> keys(capacity, 0);
+  std::vector<int> counts(capacity, 0);
+  const std::size_t mask = capacity - 1;
+  const float cell = kClusterCellScale * radius;
+  int max_run = 0;
+  int unique = 0;
+  for (std::size_t sample = 0; sample < samples; ++sample) {
+    const std::size_t index = static_cast<std::size_t>(
+        static_cast<unsigned long long>(sample) * num_points / samples);
+    uint64_t key = cluster_cell_key(x[index], y[index], z[index], cell);
+    if (key == 0) {
+      key = 1; // zero marks an empty slot
+    }
+    std::size_t slot = static_cast<std::size_t>(key) & mask;
+    while (keys[slot] != 0 && keys[slot] != key) {
+      slot = (slot + 1) & mask;
+    }
+    if (keys[slot] == 0) {
+      keys[slot] = key;
+      ++unique;
+    }
+    ++counts[slot];
+    max_run = std::max(max_run, counts[slot]);
+  }
+
+  // A few points per coarse cell (pairs, triplets) still leave the sweep
+  // cheap. Dense clusters put many samples into the same cell.
+  const double unique_ratio =
+      static_cast<double>(unique) / static_cast<double>(samples);
+  return max_run < kClusterRunThreshold && unique_ratio >= kClusterUniqueRatio;
 }
 
 void ensure_index(Index &index, const std::vector<float> &x) {

@@ -36,7 +36,13 @@ struct Cloud {
 double estimated_cells_per_point(const Bounds &bounds, std::size_t num_points,
                                  float radius);
 
-bool should_use(const Bounds &bounds, std::size_t num_points, float radius);
+// Decides between the sweep and a grid. A huge, mostly empty bounding box
+// alone does not make the sweep cheap: dense clusters inside it still put
+// many points into every x-window. Sample the coordinates and keep the sweep
+// only when those clusters are absent.
+bool should_use(const std::vector<float> &x, const std::vector<float> &y,
+                const std::vector<float> &z, const Bounds &bounds,
+                float radius);
 
 void ensure_index(Index &index, const std::vector<float> &x);
 
