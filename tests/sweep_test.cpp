@@ -125,6 +125,45 @@ TEST_CASE("sweep decision preserves the old choice for small sparse sets") {
   CHECK(apfrnn::sweep::should_use(cloud.x, cloud.y, cloud.z, bounds, radius));
 }
 
+TEST_CASE("sparse grid keeps every neighbor after the radix sort") {
+  constexpr float radius = 1.0f;
+  constexpr int kClusters = 256;
+  constexpr int kPerCluster = 64;
+  constexpr int kPoints = kClusters * kPerCluster;
+  std::vector<float> xyz;
+  xyz.reserve(static_cast<std::size_t>(kPoints) * 3);
+  std::mt19937 generator(17);
+  std::uniform_real_distribution<float> offset(-0.3f, 0.3f);
+  for (int cluster = 0; cluster < kClusters; ++cluster) {
+    const float cx = static_cast<float>((cluster % 8) * 100);
+    const float cy = static_cast<float>(((cluster / 8) % 8) * 100);
+    const float cz = static_cast<float>((cluster / 64) * 100);
+    for (int point = 0; point < kPerCluster; ++point) {
+      float dx, dy, dz;
+      do {
+        dx = offset(generator);
+        dy = offset(generator);
+        dz = offset(generator);
+      } while (dx * dx + dy * dy + dz * dz > 0.09f);
+      xyz.push_back(cx + dx);
+      xyz.push_back(cy + dy);
+      xyz.push_back(cz + dz);
+    }
+  }
+
+  apfrnn::NSearch search(radius);
+  const int set = search.add_point_set(xyz.data(), kPoints);
+  search.set_all_searches(false);
+  search.set_active_search(set, set, true);
+  search.run();
+  CHECK(search.last_stats().grid_sets == 1);
+  CHECK(search.last_stats().sweep_sets == 0);
+  for (int point = 0; point < kPoints; ++point) {
+    CHECK(search.get_neighbors(set, set, point).size() ==
+          static_cast<std::size_t>(kPerCluster - 1));
+  }
+}
+
 TEST_CASE("sweep decision is re-evaluated when a set moves") {
   constexpr float radius = 2.0f;
   const Cloud clustered = droplet_cloud(64, 128, 20000.0f, 15);

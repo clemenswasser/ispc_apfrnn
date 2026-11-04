@@ -115,12 +115,90 @@ inline int unpack_coord(uint64_t key, int shift) {
   return coord;
 }
 
+constexpr int kRadixBits = 8;
+constexpr int kRadixBuckets = 1 << kRadixBits;
+constexpr int kRadixChunks = 16;
+constexpr int kRadixMinPoints = 16384;
+
+// Stable LSD radix sort by the 64-bit cell key. The input is in original
+// index order, so equal keys keep that order and the comparator's index
+// tie-break is preserved. For the sparse droplets domain the comparison sort
+// spends ~42% of the branch misses; this sort moves that work into a
+// branch-free histogram/scatter.
+void radix_sort_point_keys(std::vector<SortPointKey> &keys,
+                           std::vector<SortPointKey> &scratch) {
+  const int num_points = static_cast<int>(keys.size());
+  if (num_points < kRadixMinPoints) {
+    tbb::parallel_sort(keys.begin(), keys.end());
+    return;
+  }
+
+  scratch.resize(keys.size());
+  std::vector<int> histogram(static_cast<std::size_t>(kRadixChunks) *
+                             kRadixBuckets);
+  std::vector<int> offsets(static_cast<std::size_t>(kRadixChunks) *
+                           kRadixBuckets);
+  SortPointKey *src = keys.data();
+  SortPointKey *dst = scratch.data();
+  for (int pass = 0; pass < 8; ++pass) {
+    std::fill(histogram.begin(), histogram.end(), 0);
+    tbb::parallel_for(0, kRadixChunks, [&](int chunk) {
+      const int begin = static_cast<int>(
+          static_cast<long long>(chunk) * num_points / kRadixChunks);
+      const int end = static_cast<int>(
+          static_cast<long long>(chunk + 1) * num_points / kRadixChunks);
+      int *row = histogram.data() +
+                 static_cast<std::size_t>(chunk) * kRadixBuckets;
+      for (int i = begin; i < end; ++i) {
+        const int digit =
+            static_cast<int>((src[i].key >> (pass * kRadixBits)) &
+                             (kRadixBuckets - 1));
+        ++row[digit];
+      }
+    });
+
+    int total = 0;
+    for (int bucket = 0; bucket < kRadixBuckets; ++bucket) {
+      int running = total;
+      for (int chunk = 0; chunk < kRadixChunks; ++chunk) {
+        const std::size_t slot =
+            static_cast<std::size_t>(chunk) * kRadixBuckets + bucket;
+        offsets[slot] = running;
+        running += histogram[slot];
+      }
+      total = running;
+    }
+
+    tbb::parallel_for(0, kRadixChunks, [&](int chunk) {
+      const int begin = static_cast<int>(
+          static_cast<long long>(chunk) * num_points / kRadixChunks);
+      const int end = static_cast<int>(
+          static_cast<long long>(chunk + 1) * num_points / kRadixChunks);
+      int *row = offsets.data() +
+                 static_cast<std::size_t>(chunk) * kRadixBuckets;
+      for (int i = begin; i < end; ++i) {
+        const SortPointKey value = src[i];
+        const int digit =
+            static_cast<int>((value.key >> (pass * kRadixBits)) &
+                             (kRadixBuckets - 1));
+        dst[row[digit]++] = value;
+      }
+    });
+    std::swap(src, dst);
+  }
+  if (src != keys.data()) {
+    std::copy(src, src + num_points, keys.data());
+  }
+}
+
 inline void sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
     const std::vector<float> &z, float inv_radius, std::vector<float> &sorted_x,
     std::vector<float> &sorted_y, std::vector<float> &sorted_z,
     IntBuffer &original_index, IntBuffer &cell_starts, IntBuffer &cell_ends,
-    std::vector<SortPointKey> &point_keys, std::vector<uint64_t> &unique_keys) {
+    std::vector<SortPointKey> &point_keys,
+    std::vector<SortPointKey> &point_keys_alt,
+    std::vector<uint64_t> &unique_keys) {
   int const num_points = static_cast<int>(x.size());
   point_keys.resize(num_points);
 
@@ -378,7 +456,7 @@ inline void sort_point_set(
     return;
   }
 
-  tbb::parallel_sort(point_keys.begin(), point_keys.end());
+  radix_sort_point_keys(point_keys, point_keys_alt);
 
   sorted_x.resize(num_points);
   sorted_y.resize(num_points);
@@ -1317,7 +1395,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
   sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
                  data.sorted_z, data.original_index, data.cell_starts,
                  data.cell_ends, data.scratch_point_keys,
-                 data.scratch_unique_keys);
+                 data.scratch_point_keys_alt, data.scratch_unique_keys);
   auto const &unique_keys = data.scratch_unique_keys;
 
   int num_cells = static_cast<int>(data.cell_starts.size());
@@ -1755,7 +1833,7 @@ static void build_cross_neighbor_search_data_inplace(
   sort_point_set(query_x, query_y, query_z, inv_radius, data.sorted_x,
                  data.sorted_y, data.sorted_z, data.original_index,
                  data.cell_starts, data.cell_ends, data.scratch_point_keys,
-                 data.scratch_unique_keys);
+                 data.scratch_point_keys_alt, data.scratch_unique_keys);
   auto const &unique_keys = data.scratch_unique_keys;
 
   data.num_cells = static_cast<int>(data.cell_starts.size());
