@@ -20,7 +20,7 @@ enum class SameRanges {
 enum class SameWriter {
   PairDense,  // write_neighbors_fixed_query_pair_dense_parallel
   Blocked,    // write_neighbors_fixed_query_blocked_parallel
-  QueryQuad,  // write_neighbors_fixed_query_quad_parallel
+  QueryOct,   // write_neighbors_fixed_query_oct_parallel
   Active2,    // write_neighbors_fixed_query_active2_parallel
 };
 

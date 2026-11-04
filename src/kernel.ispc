@@ -604,6 +604,83 @@ static inline void rows_quad(uniform int q_start, uniform int q_end,
   }
 }
 
+// As rows_quad, with eight queries per target load.
+static inline void rows_oct(uniform int q_start, uniform int q_end,
+                            const uniform int *uniform run_start,
+                            const uniform int *uniform run_end,
+                            uniform int num_runs, const uniform Points &qpts,
+                            const uniform Points &tpts, uniform bool same_set,
+                            uniform float r2, const uniform FixedRows &rows) {
+  for (uniform int q0 = q_start; q0 < q_end; q0 += 8) {
+    const uniform bool v1 = q0 + 1 < q_end;
+    const uniform bool v2 = q0 + 2 < q_end;
+    const uniform bool v3 = q0 + 3 < q_end;
+    const uniform bool v4 = q0 + 4 < q_end;
+    const uniform bool v5 = q0 + 5 < q_end;
+    const uniform bool v6 = q0 + 6 < q_end;
+    const uniform bool v7 = q0 + 7 < q_end;
+    const uniform int q1 = v1 ? q0 + 1 : q0;
+    const uniform int q2 = v2 ? q0 + 2 : q0;
+    const uniform int q3 = v3 ? q0 + 3 : q0;
+    const uniform int q4 = v4 ? q0 + 4 : q0;
+    const uniform int q5 = v5 ? q0 + 5 : q0;
+    const uniform int q6 = v6 ? q0 + 6 : q0;
+    const uniform int q7 = v7 ? q0 + 7 : q0;
+    const uniform float<3> p0 = point_at(qpts, q0), p1 = point_at(qpts, q1);
+    const uniform float<3> p2 = point_at(qpts, q2), p3 = point_at(qpts, q3);
+    const uniform float<3> p4 = point_at(qpts, q4), p5 = point_at(qpts, q5);
+    const uniform float<3> p6 = point_at(qpts, q6), p7 = point_at(qpts, q7);
+    uniform int *uniform o0 = row_of(rows, q0);
+    uniform int *uniform o1 = row_of(rows, q1);
+    uniform int *uniform o2 = row_of(rows, q2);
+    uniform int *uniform o3 = row_of(rows, q3);
+    uniform int *uniform o4 = row_of(rows, q4);
+    uniform int *uniform o5 = row_of(rows, q5);
+    uniform int *uniform o6 = row_of(rows, q6);
+    uniform int *uniform o7 = row_of(rows, q7);
+    const uniform int cap0 = rows.row_capacity != NULL ? rows.row_capacity[q0] : rows.capacity;
+    const uniform int cap1 = rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
+    const uniform int cap2 = rows.row_capacity != NULL ? rows.row_capacity[q2] : rows.capacity;
+    const uniform int cap3 = rows.row_capacity != NULL ? rows.row_capacity[q3] : rows.capacity;
+    const uniform int cap4 = rows.row_capacity != NULL ? rows.row_capacity[q4] : rows.capacity;
+    const uniform int cap5 = rows.row_capacity != NULL ? rows.row_capacity[q5] : rows.capacity;
+    const uniform int cap6 = rows.row_capacity != NULL ? rows.row_capacity[q6] : rows.capacity;
+    const uniform int cap7 = rows.row_capacity != NULL ? rows.row_capacity[q7] : rows.capacity;
+    uniform int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uniform int c4 = 0, c5 = 0, c6 = 0, c7 = 0;
+    for (uniform int run = 0; run < num_runs; ++run) {
+      foreach (j = run_start[run]... run_end[run]) {
+        const float<3> pj = point_at(tpts, j);
+        const int value = tpts.index[j];
+        const bool a0 = within_radius(pj, p0, r2) && (!same_set || j != q0);
+        const bool a1 = within_radius(pj, p1, r2) && (!same_set || j != q1);
+        const bool a2 = within_radius(pj, p2, r2) && (!same_set || j != q2);
+        const bool a3 = within_radius(pj, p3, r2) && (!same_set || j != q3);
+        const bool a4 = within_radius(pj, p4, r2) && (!same_set || j != q4);
+        const bool a5 = within_radius(pj, p5, r2) && (!same_set || j != q5);
+        const bool a6 = within_radius(pj, p6, r2) && (!same_set || j != q6);
+        const bool a7 = within_radius(pj, p7, r2) && (!same_set || j != q7);
+        o0 += append_active(o0, c0, a0, value, rows, cap0);
+        if (v1) o1 += append_active(o1, c1, a1, value, rows, cap1);
+        if (v2) o2 += append_active(o2, c2, a2, value, rows, cap2);
+        if (v3) o3 += append_active(o3, c3, a3, value, rows, cap3);
+        if (v4) o4 += append_active(o4, c4, a4, value, rows, cap4);
+        if (v5) o5 += append_active(o5, c5, a5, value, rows, cap5);
+        if (v6) o6 += append_active(o6, c6, a6, value, rows, cap6);
+        if (v7) o7 += append_active(o7, c7, a7, value, rows, cap7);
+      }
+    }
+    rows.counts[q0] = c0;
+    if (v1) rows.counts[q1] = c1;
+    if (v2) rows.counts[q2] = c2;
+    if (v3) rows.counts[q3] = c3;
+    if (v4) rows.counts[q4] = c4;
+    if (v5) rows.counts[q5] = c5;
+    if (v6) rows.counts[q6] = c6;
+    if (v7) rows.counts[q7] = c7;
+  }
+}
+
 // Collects the 27 neighbor cells of cell (cx, cy, cz) as at most 9 runs of
 // contiguous target points (adjacent cells along z are contiguous).
 static inline uniform int dense_runs(const uniform DenseGrid &grid,
@@ -716,9 +793,9 @@ export void write_fixed_rows_pair(
   }
 }
 
-// Candidate runs from precomputed per-cell ranges; four queries share each
+// Candidate runs from precomputed per-cell ranges; eight queries share each
 // target load.
-export void write_fixed_rows_quad(
+export void write_fixed_rows_oct(
     uniform int start_cell, uniform int end_cell,
     const uniform Cells *uniform queries_in,
     const uniform CellRanges *uniform ranges_in,
@@ -733,13 +810,13 @@ export void write_fixed_rows_quad(
   for (uniform int cell = start_cell; cell < end_cell; ++cell) {
     const uniform int first = ranges.offset[cell];
     if (same_set) {
-      rows_quad(queries.starts[cell], queries.ends[cell],
-                ranges.starts + first, ranges.ends + first,
-                ranges.count[cell], qpts, tpts, true, r2, rows);
+      rows_oct(queries.starts[cell], queries.ends[cell],
+               ranges.starts + first, ranges.ends + first,
+               ranges.count[cell], qpts, tpts, true, r2, rows);
     } else {
-      rows_quad(queries.starts[cell], queries.ends[cell],
-                ranges.starts + first, ranges.ends + first,
-                ranges.count[cell], qpts, tpts, false, r2, rows);
+      rows_oct(queries.starts[cell], queries.ends[cell],
+               ranges.starts + first, ranges.ends + first,
+               ranges.count[cell], qpts, tpts, false, r2, rows);
     }
   }
 }

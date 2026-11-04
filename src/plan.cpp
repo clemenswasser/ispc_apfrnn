@@ -73,7 +73,7 @@ SamePlan same_set(const NeighborSearchData &data, int last_capacity,
   if (data.blocks_valid && data.cell_stencil == 1) {
     plan.writer = SameWriter::Blocked;
   } else if (moderate_density(data, last_capacity)) {
-    plan.writer = SameWriter::QueryQuad;
+    plan.writer = SameWriter::QueryOct;
   } else {
     plan.writer = SameWriter::Active2;
   }
