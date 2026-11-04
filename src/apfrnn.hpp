@@ -345,6 +345,26 @@ void write_cross_neighbors_fixed_query_pair_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
     int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts);
 
+// Query-major cross writer with per-query block offsets/capacities. `capacity`
+// is the largest block capacity (the staging row size).
+void write_cross_neighbors_block_rows_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
+    int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity);
+
+// Paired variants of the block-row writer, matching the fixed-row pair and
+// on-the-fly dense-pair kernels.
+void write_cross_neighbors_block_rows_pair_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
+    int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity);
+
+void write_cross_neighbors_block_rows_pair_dense_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data, int capacity,
+    IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity);
+
 // Sparse-target cross writer: iterate target points, scan the dense source
 // cells around each, and scatter source-row entries. Used when the target has
 // far fewer points than cells, where a source-major scan wastes vector lanes.

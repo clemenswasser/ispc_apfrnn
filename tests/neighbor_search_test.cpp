@@ -1302,6 +1302,44 @@ TEST_CASE("block-fixed rows match brute force") {
   check_same_set(search, set, cloud, radius);
 }
 
+TEST_CASE("cross block rows fit a budget the fixed rows cannot") {
+  constexpr float radius = 1.0f;
+  // The source has 2-4 points per cell and the target is denser, so the
+  // on-the-fly dense pair writer is selected. Its global maximum degree needs
+  // a fixed row table larger than the budget; the per-row table does not.
+  auto fluid = apfrnn::support::make_point_cloud(4096, 11.7f, 9101);
+  auto boundary = apfrnn::support::make_point_cloud(6000, 7.5f, 9102);
+  // One dense target cluster makes a few cross rows much longer than the
+  // typical row, which is exactly the padding the per-row table removes.
+  std::mt19937 cluster_generator(9103);
+  std::uniform_real_distribution<float> cluster_offset(-0.4f, 0.4f);
+  for (int i = 0; i < 800; ++i) {
+    boundary.x.push_back(3.0f + cluster_offset(cluster_generator));
+    boundary.y.push_back(3.0f + cluster_offset(cluster_generator));
+    boundary.z.push_back(3.0f + cluster_offset(cluster_generator));
+  }
+  auto fluid_xyz = interleave(fluid);
+  auto boundary_xyz = interleave(boundary);
+
+  apfrnn::NSearch search(radius);
+  search.set_memory_budget(2 << 20);  // below the grown fixed rows
+  const int fluid_id = search.add_point_set(
+      fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_id = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(false);
+  search.set_active_search(fluid_id, boundary_id, true);
+
+  for (int frame = 0; frame < 3; ++frame) {
+    search.run();
+    const auto stats = search.last_stats();
+    CHECK(stats.cross_fixed_pairs == 1);
+    CHECK(stats.cross_csr_pairs == 0);
+    CHECK(stats.neighbor_bytes < (2u << 20));
+    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+  }
+}
+
 TEST_CASE("sparse backends fall back to grid under memory pressure") {
   auto make_clustered_domain = [](int clusters, int per_cluster, float side,
                                   float spread, uint32_t seed) {

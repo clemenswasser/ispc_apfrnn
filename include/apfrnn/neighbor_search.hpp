@@ -194,6 +194,10 @@ private:
   bool build_sweep_same_lists(int set);
   void build_grid_same_lists(int set);
   bool build_same_block_rows(int set, int min_block = 1);
+  bool build_cross_block_rows(Pair &pair, PointSet &source, PointSet &target,
+                              bool pair_queries, bool dense_ranges);
+  bool remember_cross_block_rows(Pair &pair, PointSet &source,
+                                 PointSet &target, int capacity);
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
   void filter_same_active(int set);
   void filter_cross_active(Pair &pair, int source_set, int target_set);

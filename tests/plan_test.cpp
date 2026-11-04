@@ -79,6 +79,15 @@ TEST_CASE("cross plan picks target-major for sparse dense targets") {
   CHECK(plan.first_capacity == 32);
 }
 
+TEST_CASE("cross plan pairs a low-density source with a dense target") {
+  const auto source = grid(20000, 8000, 30);  // 2.5 points per cell
+  const auto target = grid(20000, 2000, 30);  // 10 points per cell
+  const auto plan =
+      apfrnn::plan::cross_set(source, 32, target, 0, kBudget);
+  CHECK_FALSE(plan.build_ranges);
+  CHECK(plan.writer == apfrnn::plan::CrossWriter::PairDense);
+}
+
 TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
   const auto source = grid(20000, 200, 400);  // 100 points per cell
   const auto target = grid(20000, 200, 400);

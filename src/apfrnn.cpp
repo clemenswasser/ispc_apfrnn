@@ -80,6 +80,34 @@ inline void prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
   values.resize(required);
 }
 
+// Sizes the block-row buffers. The layout has already been computed in
+// row_offset/row_capacity, so only the total slot count is needed.
+inline void prepare_block_rows(IntBuffer &values, IntBuffer &counts,
+                               std::size_t num_points,
+                               const IntBuffer &row_offset,
+                               const IntBuffer &row_capacity) {
+  counts.resize(num_points);
+  std::size_t required = 0;
+  if (num_points > 0) {
+    required = static_cast<std::size_t>(
+        row_offset[num_points - 1] + row_capacity[num_points - 1] + 8);
+  }
+#ifndef NDEBUG
+  // finish_row() uses non-temporal vector stores, which require 32-byte
+  // alignment: every row start and stride must be a multiple of eight ints.
+  for (std::size_t i = 0; i < num_points; ++i) {
+    assert(row_offset[i] % 8 == 0);
+    assert(row_capacity[i] % 8 == 0);
+  }
+#endif
+  // Block rows exist to remove padding, so drop a larger fixed-row buffer even
+  // when it is not quite twice the new size.
+  if (required > values.capacity() || 4 * required < 3 * values.capacity()) {
+    IntBuffer().swap(values);
+  }
+  values.resize(required);
+}
+
 inline uint64_t make_key(int cx, int cy, int cz) {
   uint64_t ux = static_cast<uint64_t>(static_cast<uint32_t>(cx)) & 0x1FFFFFULL;
   uint64_t uy = static_cast<uint64_t>(static_cast<uint32_t>(cy)) & 0x1FFFFFULL;
@@ -2207,6 +2235,86 @@ void write_cross_neighbors_fixed_query_active2_parallel(
 }
 
 
+
+void write_cross_neighbors_block_rows_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
+    int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity) {
+  if (query_data.num_points == 0) {
+    return;
+  }
+  prepare_block_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(query_data.num_points),
+                     row_offset, row_capacity);
+  const ispc::Cells queries = query_cells_of(query_data);
+  const ispc::CellRanges ranges = ranges_of(query_data);
+  const ispc::Points qpts = query_points_of(query_data);
+  const ispc::Points tpts = points_of(target_data);
+  const float r2 = query_data.radius * query_data.radius;
+  write_block_rows_parallel(
+      query_data.num_cells, cell_grain(query_data.num_cells), capacity, counts,
+      fixed_neighbors, row_offset, row_capacity,
+      [&](int begin, int end, const ispc::FixedRows &rows) {
+        ispc::write_fixed_rows(begin, end, &queries, &ranges, &qpts, &tpts,
+                               false, r2, &rows);
+      });
+}
+
+void write_cross_neighbors_block_rows_pair_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
+    int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity) {
+  if (query_data.num_points == 0) {
+    return;
+  }
+  prepare_block_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(query_data.num_points),
+                     row_offset, row_capacity);
+  const ispc::Cells queries = query_cells_of(query_data);
+  const ispc::CellRanges ranges = ranges_of(query_data);
+  const ispc::Points qpts = query_points_of(query_data);
+  const ispc::Points tpts = points_of(target_data);
+  const float r2 = query_data.radius * query_data.radius;
+  write_block_rows_parallel(
+      query_data.num_cells, cell_grain(query_data.num_cells), capacity, counts,
+      fixed_neighbors, row_offset, row_capacity,
+      [&](int begin, int end, const ispc::FixedRows &rows) {
+        ispc::write_fixed_rows_pair(begin, end, &queries, &ranges, &qpts,
+                                    &tpts, false, r2, &rows);
+      });
+}
+
+void write_cross_neighbors_block_rows_pair_dense_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data, int capacity,
+    IntBuffer &fixed_neighbors, IntBuffer &counts,
+    const IntBuffer &row_offset, const IntBuffer &row_capacity) {
+  if (source_data.num_points == 0) {
+    return;
+  }
+  prepare_block_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(source_data.num_points),
+                     row_offset, row_capacity);
+  const bool sparse_target =
+      target_data.num_cells > 0 && target_data.num_points > 0 &&
+      target_data.max_cell_points > 0 && target_data.max_cell_points <= 64 &&
+      static_cast<int64_t>(target_data.num_points) <
+          4 * static_cast<int64_t>(target_data.num_cells);
+  const int group = sparse_target ? 4 : 2;
+  const ispc::Cells queries = cells_of(source_data);
+  const ispc::DenseGrid grid = dense_of(target_data);
+  const ispc::Cells targets = cells_of(target_data);
+  const ispc::Points qpts = points_of(source_data);
+  const ispc::Points tpts = points_of(target_data);
+  const float r2 = query_data.radius * query_data.radius;
+  write_block_rows_parallel(
+      source_data.num_cells, cell_grain(source_data.num_cells), capacity, counts,
+      fixed_neighbors, row_offset, row_capacity,
+      [&](int begin, int end, const ispc::FixedRows &rows) {
+        ispc::write_fixed_rows_dense(begin, end, group, &queries, &grid,
+                                     &targets, &qpts, &tpts, false, r2, &rows);
+      });
+}
 
 void write_cross_neighbors_fixed_query_pair_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,

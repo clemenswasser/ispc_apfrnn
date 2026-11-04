@@ -27,6 +27,19 @@ bool moderate_density(const NeighborSearchData &data, int last_capacity) {
          data.num_points < 20 * data.num_cells;
 }
 
+// Low-density sources (2-4 points per cell) are below the pair-writer range,
+// but a dense target still makes the on-the-fly dense runs worthwhile: they
+// skip the per-frame global range build and pair two queries per target load.
+bool low_density_dense_target(const NeighborSearchData &source,
+                              const NeighborSearchData &target) {
+  return source.dense_valid && source.cell_stencil == 1 &&
+         source.num_cells > 0 &&
+         source.num_points >= 2 * source.num_cells &&
+         source.num_points < 4 * source.num_cells && target.dense_valid &&
+         target.num_cells > 0 &&
+         target.num_points >= 8 * target.num_cells;
+}
+
 int grown_capacity(int max_count, int num_points, int max_capacity,
                    int64_t memory_budget) {
   const int grown = (max_count + 63) & ~63;
@@ -113,6 +126,9 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
     plan.writer = CrossWriter::PairDense;
   } else if (moderate) {
     plan.writer = CrossWriter::QueryPair;
+  } else if (low_density_dense_target(source, target)) {
+    plan.build_ranges = false;
+    plan.writer = CrossWriter::PairDense;
   } else if (target.blocks_valid && source.blocks_valid &&
              source.cell_stencil == 1) {
     plan.writer = CrossWriter::Blocked;

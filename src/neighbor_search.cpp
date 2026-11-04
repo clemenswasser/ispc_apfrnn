@@ -25,6 +25,9 @@ namespace apfrnn {
 namespace {
 
 constexpr int kPairParallelMaxPoints = 32768;
+// Below this, the per-row offset/capacity loads cost more than the padding
+// they save, so tiny cross pairs keep the plain fixed layout.
+constexpr int kCrossBlockMinPoints = 4096;
 
 SearchBackend search_backend_from_env() {
   const char *backend = std::getenv("APFRNN_BACKEND");
@@ -200,6 +203,9 @@ struct NSearch::PointSet {
   IntBuffer block_caps;
   IntBuffer row_offset;
   IntBuffer row_capacity;
+  // Bumped whenever the sorted grid (and therefore the cell keys and sorted
+  // index order) is rebuilt. Cross-pair caches compare it to detect reuse.
+  uint64_t grid_generation = 0;
 };
 
 struct NSearch::Pair {
@@ -220,6 +226,19 @@ struct NSearch::Pair {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Per-block cross rows. The block capacities and row offsets depend only
+  // on the source/target grids, so they survive a pair invalidation that
+  // merely rewrites unchanged rows.
+  bool cross_block_valid = false;
+  bool cross_block_active = false;
+  int cross_block_size = 0;
+  int cross_block_capacity = 0;
+  uint64_t cross_block_source_generation = 0;
+  uint64_t cross_block_target_generation = 0;
+  int cross_block_source_points = 0;
+  int cross_block_target_points = 0;
+  IntBuffer cross_row_offset;
+  IntBuffer cross_row_capacity;
 };
 
 // GPU backend state of one NSearch (device buffers, result slots, cached
@@ -976,6 +995,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       return false;
     }
     pair.fixed_valid = true;
+    pair.cross_block_active = false;
     pair.skin_lists = skin_ > 0.0f;
     pair.active_valid = false;
     pair.fixed_capacity = capacity + 8;
@@ -1003,15 +1023,47 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
         return;
       }
     }
-    if (try_fixed(cross_plan.first_capacity)) {
+    const bool pair_queries =
+        cross_plan.writer == plan::CrossWriter::QueryPair ||
+        cross_plan.writer == plan::CrossWriter::PairDense;
+    const bool dense_ranges =
+        cross_plan.writer == plan::CrossWriter::PairDense;
+    const bool block_supported =
+        source.data.num_points >= kCrossBlockMinPoints &&
+        (cross_plan.writer == plan::CrossWriter::Active2 ||
+         cross_plan.writer == plan::CrossWriter::QueryPair ||
+         cross_plan.writer == plan::CrossWriter::PairDense);
+    if (block_supported &&
+        build_cross_block_rows(pair, source, target, pair_queries,
+                               dense_ranges)) {
       return;
     }
+    if (try_fixed(cross_plan.first_capacity)) {
+      remember_cross_block_rows(pair, source, target,
+                                cross_plan.first_capacity);
+      return;
+    }
+    // The failed fixed write still counted every row exactly, so its counts
+    // can seed per-block rows without another counting pass. Compare against
+    // the capacity the fixed path would need (not the small starting
+    // capacity) so a layout that only wins because of padding is accepted.
+    const int max_count = max_row_count(pair.fixed_counts);
     const int grown = plan::cross_grown_capacity(
-        max_row_count(pair.fixed_counts), source.data.num_points,
-        memory_budget_);
+        max_count, source.data.num_points, memory_budget_);
+    if (block_supported) {
+      const int compare_capacity =
+          grown > 0 ? grown : ((max_count + 63) & ~63);
+      if (remember_cross_block_rows(pair, source, target,
+                                    compare_capacity) &&
+          build_cross_block_rows(pair, source, target, pair_queries,
+                                 dense_ranges)) {
+        return;
+      }
+    }
     if (grown > 0) {
       note_path(kPathCrossGrown);
       if (try_fixed(grown)) {
+        remember_cross_block_rows(pair, source, target, grown);
         return;
       }
     }
@@ -1027,6 +1079,12 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   note_path(kPathCrossCsr);
   pair.skin_lists = false;
   pair.active_valid = false;
+  pair.cross_block_active = false;
+  pair.cross_block_valid = false;
+  // The CSR path is the low-memory fallback; release the block-row layout and
+  // cached capacities so it does not keep the memory it was meant to save.
+  IntBuffer().swap(pair.cross_row_offset);
+  IntBuffer().swap(pair.cross_row_capacity);
   // Searched at radius + skin like the fixed rows, then filtered.
   build_cross_neighbor_search_data_from_sorted_inplace(
       pair.cross, source.data, target.data, build_radius());
@@ -1208,6 +1266,17 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
             static_cast<std::size_t>(count)};
   }
 
+  if (!pair.same_set && pair.fixed_valid && pair.cross_block_active) {
+    const int count =
+        pair.fixed_counts[static_cast<std::size_t>(sorted_index)];
+    const int *neighbors =
+        pair.fixed_neighbors.data() +
+        static_cast<std::size_t>(
+            pair.cross_row_offset[static_cast<std::size_t>(sorted_index)]);
+    return {reinterpret_cast<const uint32_t *>(neighbors),
+            static_cast<std::size_t>(count)};
+  }
+
   if (!pair.same_set && pair.fixed_valid) {
     if (skin_ > 0.0f && pair.skin_lists) {
       const int count =
@@ -1293,6 +1362,7 @@ bool NSearch::set_search_backend(SearchBackend backend) {
     for (Pair &pair : row) {
       pair.valid = false;
       pair.fixed_valid = false;
+      pair.cross_block_active = false;
       pair.active_valid = false;
       pair.skin_lists = false;
       pair.gpu_rows = false;
@@ -1343,6 +1413,7 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   point_set.valid = true;
   point_set.same_lists_valid = false;
   point_set.fixed_valid = false;
+  ++point_set.grid_generation;
 }
 
 void NSearch::set_memory_budget(int64_t bytes) {
@@ -1393,6 +1464,7 @@ void NSearch::build_point_grid(int set) {
     sweep::ensure_index(point_set.sweep, point_set.x);
     point_set.use_sweep = true;
     point_set.valid = true;
+    ++point_set.grid_generation;
     return;
   }
 
@@ -1404,6 +1476,7 @@ void NSearch::build_point_grid(int set) {
                            point_set.z, grid_radius, cell_radius);
   update_sorted_mapping(point_set.data, point_set.original_to_sorted);
   point_set.valid = true;
+  ++point_set.grid_generation;
 }
 
 void NSearch::build_same_lists(int set) {
@@ -1718,6 +1791,176 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
   point_set.skin_lists = false;
   point_set.active_valid = false;
   point_set.same_lists_valid = true;
+  return true;
+}
+
+bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
+                                     PointSet &target, bool pair_queries,
+                                     bool dense_ranges) {
+  if (skin_ > 0.0f || !pair.cross_block_valid) {
+    return false;
+  }
+  // Zero means the layout was evaluated and the fixed rows were cheaper.
+  if (pair.cross_block_size == 0) {
+    return false;
+  }
+  const int num_points = source.data.num_points;
+  if (num_points == 0 ||
+      pair.cross_block_source_generation != source.grid_generation ||
+      pair.cross_block_target_generation != target.grid_generation ||
+      pair.cross_block_source_points != num_points ||
+      pair.cross_block_target_points != target.data.num_points ||
+      (!dense_ranges && pair.cross.num_points != num_points) ||
+      pair.cross_row_offset.size() != static_cast<std::size_t>(num_points) ||
+      pair.cross_row_capacity.size() !=
+          static_cast<std::size_t>(num_points)) {
+    pair.cross_block_valid = false;
+    pair.cross_block_active = false;
+    return false;
+  }
+  // A budget lowered after the layout was cached must still be honored.
+  if (memory_budget_ < static_cast<int64_t>(64) << 20) {
+    const int64_t slots =
+        static_cast<int64_t>(
+            pair.cross_row_offset[static_cast<std::size_t>(num_points - 1)]) +
+        pair.cross_row_capacity[static_cast<std::size_t>(num_points - 1)] + 8;
+    const int64_t bytes = slots * static_cast<int64_t>(sizeof(int)) +
+                          static_cast<int64_t>(num_points) * 2 * sizeof(int);
+    if (bytes > memory_budget_) {
+      pair.cross_block_valid = false;
+      pair.cross_block_active = false;
+      return false;
+    }
+  }
+  if (dense_ranges) {
+    write_cross_neighbors_block_rows_pair_dense_parallel(
+        pair.cross, source.data, target.data, pair.cross_block_capacity,
+        pair.fixed_neighbors, pair.fixed_counts, pair.cross_row_offset,
+        pair.cross_row_capacity);
+  } else if (pair_queries) {
+    write_cross_neighbors_block_rows_pair_parallel(
+        pair.cross, target.data, pair.cross_block_capacity,
+        pair.fixed_neighbors, pair.fixed_counts, pair.cross_row_offset,
+        pair.cross_row_capacity);
+  } else {
+    write_cross_neighbors_block_rows_parallel(
+        pair.cross, target.data, pair.cross_block_capacity,
+        pair.fixed_neighbors, pair.fixed_counts, pair.cross_row_offset,
+        pair.cross_row_capacity);
+  }
+  pair.cross_block_active = true;
+  pair.fixed_valid = true;
+  pair.skin_lists = false;
+  pair.active_valid = false;
+  return true;
+}
+
+bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
+                                        PointSet &target, int capacity) {
+  pair.cross_block_active = false;
+  if (skin_ > 0.0f) {
+    pair.cross_block_valid = false;
+    return false;
+  }
+  // A moving set rebuilds its grid every frame, so a block layout learned now
+  // cannot be reused and the scan would only add work. An infinite distance is
+  // the first sync (no previous coordinates), not observed motion, so a static
+  // scene can still build its layout on the first frame.
+  if (std::isfinite(last_stats_.max_displacement_sq) &&
+      last_stats_.max_displacement_sq > 0.0f) {
+    pair.cross_block_valid = false;
+    return false;
+  }
+  const int num_points = source.data.num_points;
+  if (num_points == 0 ||
+      pair.fixed_counts.size() != static_cast<std::size_t>(num_points)) {
+    pair.cross_block_valid = false;
+    return false;
+  }
+  // A zero block size records that the fixed layout was cheaper for this
+  // geometry, so later frames do not rescan the rows.
+  if (pair.cross_block_valid && pair.cross_block_size == 0 &&
+      pair.cross_block_source_generation == source.grid_generation &&
+      pair.cross_block_target_generation == target.grid_generation &&
+      pair.cross_block_source_points == num_points &&
+      pair.cross_block_target_points == target.data.num_points) {
+    return false;
+  }
+  auto mark_fixed_layout = [&] {
+    pair.cross_block_size = 0;
+    pair.cross_block_source_generation = source.grid_generation;
+    pair.cross_block_target_generation = target.grid_generation;
+    pair.cross_block_source_points = num_points;
+    pair.cross_block_target_points = target.data.num_points;
+    pair.cross_block_valid = true;
+    IntBuffer().swap(pair.cross_row_offset);
+    IntBuffer().swap(pair.cross_row_capacity);
+  };
+  // Tiny sources do not amortize the per-row offset/capacity loads.
+  if (num_points < kCrossBlockMinPoints) {
+    mark_fixed_layout();
+    return false;
+  }
+  pair.cross_block_valid = false;
+
+  // One row per block: each row's capacity is just its own degree. Blocks
+  // larger than a row only raise the local maximum without changing the row
+  // offsets, so they add padding for no benefit.
+  constexpr int kBlockSize = 1;
+  int64_t slots = 0;
+  int max_capacity = 0;
+  int64_t exact_neighbors = 0;
+  for (int i = 0; i < num_points; ++i) {
+    const int count = pair.fixed_counts[static_cast<std::size_t>(i)];
+    // Rows are written with non-temporal vector stores, so every row start
+    // must stay 32-byte aligned: round the capacity to a multiple of eight.
+    const int cap = (count + 7) & ~7;
+    exact_neighbors += count;
+    slots += cap + 8;
+    max_capacity = std::max(max_capacity, cap);
+  }
+
+  // Keep the fixed layout unless per-row capacities remove at least half of
+  // the row table. The extra row_offset/row_capacity loads cost more than the
+  // saved stores for moderate padding, and the win only appears when the
+  // global maximum is far above the typical degree.
+  const int64_t fixed_slots =
+      static_cast<int64_t>(num_points) * (capacity + 8);
+  if (slots * 2 > fixed_slots) {
+    mark_fixed_layout();
+    return false;
+  }
+
+  int64_t budget = memory_budget_;
+  if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
+    budget = std::max(budget, plan::block_output_budget(exact_neighbors,
+                                                        num_points));
+  }
+  const int64_t bytes =
+      slots * static_cast<int64_t>(sizeof(int)) +
+      static_cast<int64_t>(num_points) * 2 * sizeof(int);
+  if (bytes > budget) {
+    mark_fixed_layout();
+    return false;
+  }
+
+  pair.cross_block_size = kBlockSize;
+  pair.cross_block_capacity = max_capacity;
+  pair.cross_row_offset.resize(static_cast<std::size_t>(num_points));
+  pair.cross_row_capacity.resize(static_cast<std::size_t>(num_points));
+  int total = 0;
+  for (int i = 0; i < num_points; ++i) {
+    const int cap =
+        (pair.fixed_counts[static_cast<std::size_t>(i)] + 7) & ~7;
+    pair.cross_row_offset[static_cast<std::size_t>(i)] = total;
+    pair.cross_row_capacity[static_cast<std::size_t>(i)] = cap;
+    total += cap + 8;
+  }
+  pair.cross_block_source_generation = source.grid_generation;
+  pair.cross_block_target_generation = target.grid_generation;
+  pair.cross_block_source_points = num_points;
+  pair.cross_block_target_points = target.data.num_points;
+  pair.cross_block_valid = true;
   return true;
 }
 
@@ -2066,6 +2309,7 @@ void NSearch::clear_pair(Pair &pair) {
   pair.valid = false;
   pair.same_set = false;
   pair.fixed_valid = false;
+  pair.cross_block_active = false;
   pair.skin_lists = false;
   pair.active_valid = false;
   pair.gpu_rows = false;
