@@ -74,8 +74,10 @@ SamePlan same_set(const NeighborSearchData &data, int last_capacity,
     plan.writer = SameWriter::Blocked;
   } else if (moderate_density(data, last_capacity)) {
     plan.writer = SameWriter::QueryOct;
-  } else {
+  } else if (data.num_points <= 1024) {
     plan.writer = SameWriter::Active2;
+  } else {
+    plan.writer = SameWriter::QueryOct;
   }
   return plan;
 }

@@ -36,12 +36,19 @@ TEST_CASE("same-set plan uses eight queries for a sparse hash grid") {
   CHECK(plan.writer == apfrnn::plan::SameWriter::QueryOct);
 }
 
-TEST_CASE("same-set plan falls back from the pair writers on long rows") {
+TEST_CASE("same-set plan uses the grouped writer on long rows") {
   const auto data = grid(200000, 20000, 30);
-  // A previous frame needed 300 slots: too long for the pair writers.
+  // A previous frame needed 300 slots.
   const auto plan = apfrnn::plan::same_set(data, 300, kBudget);
   CHECK(plan.first_capacity == 300);
   CHECK(plan.ranges == apfrnn::plan::SameRanges::DenseFused);
+  CHECK(plan.writer == apfrnn::plan::SameWriter::QueryOct);
+}
+
+TEST_CASE("same-set plan keeps the single-query writer for tiny sets") {
+  auto data = grid(512, 512, 5);
+  data.dense_valid = false;
+  const auto plan = apfrnn::plan::same_set(data, 0, kBudget);
   CHECK(plan.writer == apfrnn::plan::SameWriter::Active2);
 }
 
