@@ -157,6 +157,10 @@ struct NeighborSearchData {
   std::vector<uint64_t> scratch_unique_keys;
   IntBuffer scratch_cached_neighbor_cells;
   IntBuffer scratch_cached_neighbor_counts;
+  std::vector<uint64_t> cached_neighbor_keys;
+  int cached_neighbor_stencil = -1;
+  int cached_neighbor_stride = 0;
+  bool cached_neighbor_valid = false;
   IntBuffer block_begin;
   IntBuffer block_end;
   IntBuffer block_cell;

@@ -1436,17 +1436,36 @@ static void build_same_set_candidate_cells_inplace(NeighborSearchData &data) {
   if (data.num_points == 0) {
     data.scratch_cached_neighbor_cells.clear();
     data.scratch_cached_neighbor_counts.clear();
+    data.cached_neighbor_keys.clear();
+    data.cached_neighbor_valid = false;
     return;
   }
 
   const int num_cells = data.num_cells;
-  data.scratch_cached_neighbor_cells.resize(
-      static_cast<std::size_t>(num_cells) * data.max_neighbor_cells);
+  const std::size_t cell_slots =
+      static_cast<std::size_t>(num_cells) * data.max_neighbor_cells;
+  const bool reuse =
+      data.cached_neighbor_valid &&
+      data.cached_neighbor_stencil == data.cell_stencil &&
+      data.cached_neighbor_stride == data.max_neighbor_cells &&
+      data.scratch_cached_neighbor_cells.size() == cell_slots &&
+      data.scratch_cached_neighbor_counts.size() ==
+          static_cast<std::size_t>(num_cells) &&
+      data.cached_neighbor_keys == data.scratch_unique_keys;
+  if (reuse) {
+    return;
+  }
+
+  data.scratch_cached_neighbor_cells.resize(cell_slots);
   data.scratch_cached_neighbor_counts.resize(num_cells);
   collect_neighbor_cells_for_target(
       num_cells, data.scratch_unique_keys, data,
       data.scratch_cached_neighbor_cells, data.scratch_cached_neighbor_counts,
       data.cell_stencil, data.max_neighbor_cells);
+  data.cached_neighbor_keys = data.scratch_unique_keys;
+  data.cached_neighbor_stencil = data.cell_stencil;
+  data.cached_neighbor_stride = data.max_neighbor_cells;
+  data.cached_neighbor_valid = true;
 }
 
 inline int dense_cache_position(const NeighborSearchData &data,

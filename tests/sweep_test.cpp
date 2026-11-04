@@ -155,12 +155,16 @@ TEST_CASE("sparse grid keeps every neighbor after the radix sort") {
   const int set = search.add_point_set(xyz.data(), kPoints);
   search.set_all_searches(false);
   search.set_active_search(set, set, true);
-  search.run();
-  CHECK(search.last_stats().grid_sets == 1);
-  CHECK(search.last_stats().sweep_sets == 0);
-  for (int point = 0; point < kPoints; ++point) {
-    CHECK(search.get_neighbors(set, set, point).size() ==
-          static_cast<std::size_t>(kPerCluster - 1));
+  // The second and third frames reuse the cached neighbor-cell lists: the
+  // occupied cells did not change, so only the point ranges are refreshed.
+  for (int frame = 0; frame < 3; ++frame) {
+    search.run();
+    CHECK(search.last_stats().grid_sets == 1);
+    CHECK(search.last_stats().sweep_sets == 0);
+    for (int point = 0; point < kPoints; ++point) {
+      CHECK(search.get_neighbors(set, set, point).size() ==
+            static_cast<std::size_t>(kPerCluster - 1));
+    }
   }
 }
 
