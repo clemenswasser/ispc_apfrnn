@@ -63,12 +63,26 @@ void update_sorted_mapping(const NeighborSearchData &data,
       });
 }
 
+// Runs after every row writer and again for the frame stats, so for large
+// sets a serial pass is a fixed per-frame cost that stops thread scaling
+// (~2.5 ms of a 9 ms uniform_1m frame on 96 cores).
 int max_row_count(const IntBuffer &counts) {
-  int max_count = 0;
-  for (int count : counts) {
-    max_count = std::max(max_count, count);
+  constexpr int kGrain = 1 << 16;
+  const int n = static_cast<int>(counts.size());
+  if (n <= kGrain) {
+    return n == 0
+               ? 0
+               : std::max(0, *std::max_element(counts.begin(), counts.end()));
   }
-  return max_count;
+  return tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, n, kGrain), 0,
+      [&](const tbb::blocked_range<int> &range, int acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          acc = std::max(acc, counts[static_cast<std::size_t>(i)]);
+        }
+        return acc;
+      },
+      [](int a, int b) { return std::max(a, b); });
 }
 
 double elapsed_ms(std::chrono::steady_clock::time_point start) {
@@ -1156,19 +1170,15 @@ void NSearch::collect_memory_stats() {
           const IntBuffer &counts =
               (skin_ > 0.0f && source.skin_lists) ? source.active_counts
                                                   : source.fixed_counts;
-          for (int count : counts) {
-            last_stats_.max_neighbors =
-                std::max(last_stats_.max_neighbors, count);
-          }
+          last_stats_.max_neighbors =
+              std::max(last_stats_.max_neighbors, max_row_count(counts));
         } else {
           ++last_stats_.same_csr_pairs;
           last_stats_.neighbor_bytes +=
               source.data.row_ptr.capacity() * sizeof(int) +
               source.data.col_idx.capacity() * sizeof(int);
-          for (int count : source.data.counts) {
-            last_stats_.max_neighbors =
-                std::max(last_stats_.max_neighbors, count);
-          }
+          last_stats_.max_neighbors = std::max(
+              last_stats_.max_neighbors, max_row_count(source.data.counts));
         }
       } else if (pair.fixed_valid) {
         ++last_stats_.cross_fixed_pairs;
@@ -1180,19 +1190,15 @@ void NSearch::collect_memory_stats() {
         const IntBuffer &counts =
             (skin_ > 0.0f && pair.skin_lists) ? pair.active_counts
                                               : pair.fixed_counts;
-        for (int count : counts) {
-          last_stats_.max_neighbors =
-              std::max(last_stats_.max_neighbors, count);
-        }
+        last_stats_.max_neighbors =
+            std::max(last_stats_.max_neighbors, max_row_count(counts));
       } else {
         ++last_stats_.cross_csr_pairs;
         last_stats_.neighbor_bytes +=
             pair.cross.row_ptr.capacity() * sizeof(int) +
             pair.cross.col_idx.capacity() * sizeof(int);
-        for (int count : pair.cross.counts) {
-          last_stats_.max_neighbors =
-              std::max(last_stats_.max_neighbors, count);
-        }
+        last_stats_.max_neighbors = std::max(last_stats_.max_neighbors,
+                                             max_row_count(pair.cross.counts));
       }
     }
   }
