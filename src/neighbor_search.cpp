@@ -162,6 +162,7 @@ struct NSearch::PointSet {
   bool use_sweep = false;
   bool sweep_decision_valid = false;
   bool sweep_decision = false;
+  bool refresh_rows = false;
   sweep::Index sweep;
   SourceType source_type = SourceType::None;
   const void *source = nullptr;
@@ -718,6 +719,19 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     }
     last_stats_.max_displacement_sq =
         std::max(last_stats_.max_displacement_sq, max_distance_sq);
+    // With no skin, an unchanged set keeps its sorted coordinates, grid,
+    // ranges and rows. This is not just a target cache: a source set that did
+    // not move needs no rebuild either.
+    if (skin_ <= 0.0f && point_set.valid && max_distance_sq == 0.0f) {
+      point_set.dirty = false;
+      // Keep the unchanged grid, sorted order, ranges and cells. Source sets
+      // still rewrite their rows so consumers always see a fresh run().
+      point_set.refresh_rows =
+          is_source[static_cast<std::size_t>(set)];
+      ++last_stats_.reused_sets;
+      note_path(kPathTargetReuse);
+      continue;
+    }
     // Skin lists are only valid while no point has moved more than skin / 2
     // from the positions they were built at. A per-frame check misses slow
     // motion that accumulates over several frames.
@@ -771,10 +785,11 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   }
 
   std::vector<int> build_sets;
+  std::vector<char> grid_rebuilt(static_cast<std::size_t>(set_count), 0);
   int max_points = 0;
   for (int set = 0; set < set_count; ++set) {
     const PointSet &point_set = sets_[static_cast<std::size_t>(set)];
-    if (!point_set.dirty && point_set.valid) {
+    if (!point_set.dirty && point_set.valid && !point_set.refresh_rows) {
       continue;
     }
     build_sets.push_back(set);
@@ -791,29 +806,35 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   std::vector<double> same_ms(static_cast<std::size_t>(set_count), 0.0);
   auto build_one = [&](int set) {
     PointSet &point_set = sets_[static_cast<std::size_t>(set)];
-    const auto grid_start = std::chrono::steady_clock::now();
-    if (point_set.is_static) {
-      sync_source(set);
+    const bool rebuild_grid =
+        !point_set.valid || point_set.dirty || !point_set.refresh_rows;
+    if (rebuild_grid) {
+      const auto grid_start = std::chrono::steady_clock::now();
+      if (point_set.is_static) {
+        sync_source(set);
+      }
+      build_point_grid(set);
+      grid_ms[static_cast<std::size_t>(set)] = elapsed_ms(grid_start);
+      grid_rebuilt[static_cast<std::size_t>(set)] = 1;
+      if (skin_ > 0.0f) {
+        point_set.skin_x = point_set.x;
+        point_set.skin_y = point_set.y;
+        point_set.skin_z = point_set.z;
+        point_set.skin_ref_valid = true;
+      } else {
+        point_set.skin_x.clear();
+        point_set.skin_y.clear();
+        point_set.skin_z.clear();
+        point_set.skin_ref_valid = false;
+      }
+      if (target_cache && !is_source[static_cast<std::size_t>(set)]) {
+        point_set.cached_x = point_set.x;
+        point_set.cached_y = point_set.y;
+        point_set.cached_z = point_set.z;
+        point_set.target_cache_valid = true;
+      }
     }
-    build_point_grid(set);
-    grid_ms[static_cast<std::size_t>(set)] = elapsed_ms(grid_start);
-    if (skin_ > 0.0f) {
-      point_set.skin_x = point_set.x;
-      point_set.skin_y = point_set.y;
-      point_set.skin_z = point_set.z;
-      point_set.skin_ref_valid = true;
-    } else {
-      point_set.skin_x.clear();
-      point_set.skin_y.clear();
-      point_set.skin_z.clear();
-      point_set.skin_ref_valid = false;
-    }
-    if (target_cache && !is_source[static_cast<std::size_t>(set)]) {
-      point_set.cached_x = point_set.x;
-      point_set.cached_y = point_set.y;
-      point_set.cached_z = point_set.z;
-      point_set.target_cache_valid = true;
-    }
+    point_set.refresh_rows = false;
     if (needs_same_set[static_cast<std::size_t>(set)]) {
       const auto same_start = std::chrono::steady_clock::now();
       build_same_lists(set);
@@ -842,6 +863,9 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
   // Counted after the builds: they may run in parallel, and a set's grid
   // kind is only known once it is built.
   for (int set : build_sets) {
+    if (grid_rebuilt[static_cast<std::size_t>(set)] == 0) {
+      continue;
+    }
     const PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     if (point_set.use_sweep) {
       ++last_stats_.sweep_sets;
