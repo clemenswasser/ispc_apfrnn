@@ -158,3 +158,24 @@ TEST_CASE("high-degree sets size every block row on its own") {
   CHECK(apfrnn::plan::same_min_block(apfrnn::IntBuffer(1000, 10)) == 8);
   CHECK(apfrnn::plan::same_min_block(apfrnn::IntBuffer()) == 8);
 }
+
+TEST_CASE("moving rows keep a margin above the current degree") {
+  using apfrnn::plan::moving_row_capacity;
+  CHECK(moving_row_capacity(0) == apfrnn::round_up_to_row_align(8));
+  CHECK(moving_row_capacity(10) >= 18);
+  CHECK(moving_row_capacity(640) >= 720);
+  CHECK(moving_row_capacity(640) % apfrnn::row_align() == 0);
+  // Per-point rows of very uneven degrees beat rows padded to the maximum.
+  apfrnn::IntBuffer uneven(80000, 20);
+  for (std::size_t i = 0; i < uneven.size(); i += 4) {
+    uneven[i] = 600;
+  }
+  CHECK(
+      apfrnn::plan::prefer_block_rows(apfrnn::plan::same_fixed_slots(uneven),
+                                      apfrnn::plan::same_moving_slots(uneven)));
+  // Near-uniform degrees: the margin costs more than the padding saves.
+  const apfrnn::IntBuffer even(80000, 30);
+  CHECK_FALSE(
+      apfrnn::plan::prefer_block_rows(apfrnn::plan::same_fixed_slots(even),
+                                      apfrnn::plan::same_moving_slots(even)));
+}

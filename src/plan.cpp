@@ -241,6 +241,18 @@ int64_t same_block_slots(const IntBuffer &counts, int block) {
          });
 }
 
+int64_t same_moving_slots(const IntBuffer &counts) {
+  return tbb::parallel_reduce(
+      tbb::blocked_range<std::size_t>(0, counts.size(), 1 << 16), int64_t{0},
+      [&](const tbb::blocked_range<std::size_t> &range, int64_t acc) {
+        for (std::size_t i = range.begin(); i < range.end(); ++i) {
+          acc += moving_row_capacity(counts[i]) + row_slack() + 2;
+        }
+        return acc;
+      },
+      [](int64_t a, int64_t b) { return a + b; });
+}
+
 int same_min_block(const IntBuffer &counts) {
   if (counts.empty()) {
     return kLowDegreeBlock;

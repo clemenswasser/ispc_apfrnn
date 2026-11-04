@@ -2236,6 +2236,47 @@ void write_same_set_block_rows_parallel(
       });
 }
 
+void write_same_set_listed_rows(NeighborSearchData &data,
+                                const IntBuffer &queries, IntBuffer &counts,
+                                IntBuffer &neighbors,
+                                const IntBuffer &row_offset,
+                                const IntBuffer &row_capacity) {
+  const int num_queries = static_cast<int>(queries.size());
+  if (num_queries == 0) {
+    return;
+  }
+  // The blocked writer reads candidate cells, not ranges; every grid build
+  // clears the ranges, so a size mismatch means they are not this grid's.
+  if (data.cell_num_neighbors.size() !=
+      static_cast<std::size_t>(data.num_cells)) {
+    if (data.dense_valid && data.cell_stencil == 1) {
+      build_same_set_cell_ranges_dense_fused_inplace(data);
+    } else {
+      build_same_set_cell_ranges_inplace(data);
+    }
+  }
+  IntBuffer query_cells(static_cast<std::size_t>(num_queries));
+  tbb::parallel_for(0, num_queries, [&](int k) {
+    const int query = queries[static_cast<std::size_t>(k)];
+    query_cells[static_cast<std::size_t>(k)] =
+        static_cast<int>(std::upper_bound(data.cell_starts.begin(),
+                                          data.cell_starts.end(), query) -
+                         data.cell_starts.begin()) -
+        1;
+  });
+  const ispc::CellRanges ranges = ranges_of(data);
+  const ispc::Points pts = points_of(data);
+  const ispc::FixedRows rows =
+      block_rows(0, nullptr, counts, neighbors, row_offset, row_capacity);
+  const float r2 = data.radius * data.radius;
+  tbb::parallel_for(tbb::blocked_range<int>(0, num_queries, 16),
+                    [&](const tbb::blocked_range<int> &range) {
+                      ispc::write_listed_rows(
+                          range.begin(), range.end(), queries.data(),
+                          query_cells.data(), &ranges, &pts, r2, &rows);
+                    });
+}
+
 void write_neighbors_parallel(NeighborSearchData &data) {
   if (data.num_points == 0) {
     return;

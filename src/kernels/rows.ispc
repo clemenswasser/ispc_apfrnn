@@ -382,6 +382,28 @@ export void write_fixed_rows(
   }
 }
 
+// Rewrites the same-set rows of listed queries [begin, end): queries[k] in
+// cell query_cells[k], against that cell's precomputed ranges. Used for the
+// few rows of a moving set that overflowed their capacity and were moved to
+// new space (row_offset/row_capacity), so the other rows are not rewritten.
+export void write_listed_rows(
+    uniform int begin, uniform int end, uniform const int queries[],
+    uniform const int query_cells[],
+    const uniform CellRanges *uniform ranges_in,
+    const uniform Points *uniform pts_in, uniform float r2,
+    const uniform FixedRows *uniform rows_in) {
+  const uniform CellRanges ranges = *ranges_in;
+  const uniform Points pts = *pts_in;
+  const uniform FixedRows rows = *rows_in;
+  for (uniform int k = begin; k < end; ++k) {
+    const uniform int query = queries[k];
+    const uniform int cell = query_cells[k];
+    const uniform int first = ranges.offset[cell];
+    rows_single(query, query + 1, ranges.starts + first, ranges.ends + first,
+                ranges.count[cell], pts, pts, true, r2, rows);
+  }
+}
+
 // Candidate runs from precomputed per-cell ranges; two queries share each
 // target load. For short rows; no staging.
 export void write_fixed_rows_pair(

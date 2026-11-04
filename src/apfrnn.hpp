@@ -300,6 +300,15 @@ void write_same_set_block_rows_parallel(NeighborSearchData &data, int capacity,
                                         const IntBuffer &row_offset,
                                         const IntBuffer &row_capacity);
 
+// Rewrites only the same-set rows of `queries` (sorted point indices) after
+// write_same_set_block_rows_parallel(), e.g. rows that overflowed and were
+// given new space in row_offset/row_capacity.
+void write_same_set_listed_rows(NeighborSearchData &data,
+                                const IntBuffer &queries, IntBuffer &counts,
+                                IntBuffer &neighbors,
+                                const IntBuffer &row_offset,
+                                const IntBuffer &row_capacity);
+
 // Builds the same-set cell ranges, counts, row_ptr, and col_idx using the grid
 // produced by build_point_grid_inplace().
 void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,

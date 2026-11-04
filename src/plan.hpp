@@ -94,6 +94,17 @@ bool prefer_block_rows(int64_t fixed_slots, int64_t block_slots);
 // count) for high-degree sets, where the per-row capacity arrays are small
 // next to the rows, else a shared capacity per 8 rows.
 int same_min_block(const IntBuffer &counts);
+
+// Row capacity of a moving set's point with `count` neighbors: a margin for
+// the degree changing between frames, so few rows overflow and force a
+// rewrite.
+inline int moving_row_capacity(int count) {
+  return round_up_to_row_align(count + std::max(8, count / 8));
+}
+
+// Row slots of per-point rows sized by moving_row_capacity(), including the
+// per-row offset and capacity.
+int64_t same_moving_slots(const IntBuffer &counts);
 int cross_fitted_capacity(int max_count, int capacity);
 
 // True when every point is alone in its cell with no occupied neighbor cell,

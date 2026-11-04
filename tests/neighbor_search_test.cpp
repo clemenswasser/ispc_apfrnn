@@ -1800,12 +1800,13 @@ TEST_CASE("block rows with cached capacities rebuild the grid's ranges") {
   CHECK(block_frames > 0);
 }
 
-TEST_CASE(
-    "block rows are used while the grid is unchanged and left on motion") {
+TEST_CASE("block rows stay exact through motion and back to rest") {
   // Clustered rows have very different lengths. Frame 1 counts exactly and
   // writes block rows directly (no padded fixed rows that overflow and
-  // regrow); moving the points rebuilds the grid and re-sorts the rows, so
-  // frame 2 uses fixed rows; frame 3 is stationary again.
+  // regrow). Moving the points rebuilds the grid and re-sorts the rows:
+  // frame 2 switches to per-point capacities (one count pass), later moving
+  // frames reuse them, and large steps make rows overflow and be rewritten.
+  // A stationary frame returns to the static block rows.
   auto cloud = apfrnn::bench::make_clustered(20000, 30.0f, 23);
   auto xyz = interleave(cloud);
   apfrnn::NSearch search(1.7f);
@@ -1819,18 +1820,21 @@ TEST_CASE(
   check_same_set(search, id, cloud, 1.7f);
 
   std::mt19937 generator(9);
-  std::uniform_real_distribution<float> jitter(-0.3f, 0.3f);
-  for (std::size_t i = 0; i < cloud.x.size(); ++i) {
-    cloud.x[i] += jitter(generator);
-    cloud.y[i] += jitter(generator);
-    cloud.z[i] += jitter(generator);
+  for (const float step : {0.3f, 0.05f, 0.8f, 0.05f}) {
+    CAPTURE(step);
+    std::uniform_real_distribution<float> jitter(-step, step);
+    for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+      cloud.x[i] += jitter(generator);
+      cloud.y[i] += jitter(generator);
+      cloud.z[i] += jitter(generator);
+    }
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    paths = search.last_stats().paths;
+    CHECK((paths & apfrnn::NSearch::kPathSameBlockRows) != 0);
+    check_same_set(search, id, cloud, 1.7f);
   }
-  const auto moved = interleave(cloud);
-  std::copy(moved.begin(), moved.end(), xyz.begin());
-  search.run();
-  paths = search.last_stats().paths;
-  CHECK((paths & apfrnn::NSearch::kPathSameBlockRows) == 0);
-  check_same_set(search, id, cloud, 1.7f);
 
   search.run();
   paths = search.last_stats().paths;

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -19,6 +20,8 @@
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
+#include <tbb/parallel_scan.h>
+#include <vector>
 
 namespace apfrnn {
 
@@ -223,6 +226,11 @@ struct NSearch::PointSet {
   IntBuffer block_caps;
   IntBuffer row_offset;
   IntBuffer row_capacity;
+  // Moving sets (see build_moving_block_rows): per-point row capacities by
+  // original index, which, unlike the sorted index, survives a grid rebuild.
+  IntBuffer moving_caps;
+  bool moving_caps_valid = false;
+  int moving_check_wait = 0; // frames until fixed rows are re-checked
   // Bumped whenever the sorted grid (and therefore the cell keys and sorted
   // index order) is rebuilt. Cross-pair caches compare it to detect reuse.
   uint64_t grid_generation = 0;
@@ -1548,6 +1556,14 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.block_caps_valid = false;
     point_set.block_layout_valid = false;
   }
+  if (grid_rebuilt && !first_lists && skin_ <= 0.0f) {
+    if (build_moving_block_rows(set)) {
+      note_path(kPathSameBlockRows);
+      return;
+    }
+  } else {
+    point_set.moving_caps_valid = false;
+  }
   const plan::SamePlan same_plan =
       plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
@@ -1696,6 +1712,180 @@ void NSearch::build_grid_same_lists(int set) {
   // Searched at radius + skin and filtered in build_same_pair.
   build_same_set_neighbor_lists_inplace(data, build_radius());
   point_set.same_lists_valid = true;
+}
+
+// Block rows for a set whose grid was rebuilt since the last frame. Rows are
+// re-sorted on every rebuild, so capacities are kept per original point:
+// each frame gathers them into sorted order, lays the rows out with a scan
+// and writes them. A point's degree changes slowly, so with the margin of
+// plan::moving_row_capacity() few rows overflow; an overflow grows those
+// points' capacities and rewrites the rows. Capacities far above a point's
+// degree shrink for the next frame.
+bool NSearch::build_moving_block_rows(int set) {
+  PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+  NeighborSearchData &data = point_set.data;
+  const int num_points = data.num_points;
+  if (num_points == 0) {
+    return false;
+  }
+  const std::size_t n = static_cast<std::size_t>(num_points);
+  if (!point_set.moving_caps_valid || point_set.moving_caps.size() != n) {
+    point_set.moving_caps_valid = false;
+    // Decide from the last frame's counts: slot totals do not depend on the
+    // row order. Sets that keep fixed rows are re-checked every 16 frames.
+    if (point_set.fixed_counts.size() != n || point_set.moving_check_wait > 0) {
+      point_set.moving_check_wait =
+          std::max(0, point_set.moving_check_wait - 1);
+      return false;
+    }
+    if (!plan::prefer_block_rows(
+            plan::same_fixed_slots(point_set.fixed_counts),
+            plan::same_moving_slots(point_set.fixed_counts))) {
+      point_set.moving_check_wait = 16;
+      return false;
+    }
+    data.radius = radius_;
+    count_same_set_neighbors_inplace(data);
+    point_set.fixed_counts = data.counts;
+    point_set.moving_caps.resize(n);
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 1 << 14),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            point_set
+                .moving_caps[static_cast<std::size_t>(data.original_index[i])] =
+                plan::moving_row_capacity(point_set.fixed_counts[i]);
+          }
+        });
+    point_set.moving_caps_valid = true;
+  }
+  data.radius = radius_;
+  point_set.row_offset.resize(n);
+  point_set.row_capacity.resize(n);
+  point_set.fixed_counts.resize(n);
+  // Attempt 0 lays out and writes every row; if its overflowed rows do not
+  // fit in the buffer's headroom, attempt 1 lays out again with their grown
+  // capacities.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    // Capacities into sorted order, then offsets by an exclusive scan.
+    const int max_capacity = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, num_points, 1 << 14), 0,
+        [&](const tbb::blocked_range<int> &range, int acc) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const int capacity = point_set.moving_caps[static_cast<std::size_t>(
+                data.original_index[i])];
+            point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
+            acc = std::max(acc, capacity);
+          }
+          return acc;
+        },
+        [](int a, int b) { return std::max(a, b); });
+    const int64_t total = tbb::parallel_scan(
+        tbb::blocked_range<int>(0, num_points, 1 << 14), int64_t{0},
+        [&](const tbb::blocked_range<int> &range, int64_t sum, bool final) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            if (final) {
+              point_set.row_offset[static_cast<std::size_t>(i)] =
+                  static_cast<int>(sum);
+            }
+            sum += point_set.row_capacity[static_cast<std::size_t>(i)] +
+                   row_slack();
+          }
+          return sum;
+        },
+        [](int64_t a, int64_t b) { return a + b; });
+    const int64_t bytes = total * 4 + static_cast<int64_t>(num_points) * 2 * 4;
+    if (total > INT_MAX || bytes > memory_budget_) {
+      point_set.moving_caps_valid = false;
+      return false;
+    }
+    const std::size_t slots = static_cast<std::size_t>(total);
+    IntBuffer &values = point_set.fixed_neighbors;
+    // Keep at least 1/16 headroom for overflowed rows: once the growing
+    // capacities ate it, every frame fell back to a full relayout.
+    if (values.capacity() < slots + slots / 16 ||
+        values.capacity() > 2 * slots) {
+      // Headroom, so the next frames' small growth reuses the buffer.
+      IntBuffer fresh;
+      fresh.reserve(slots + slots / 8);
+      values.swap(fresh);
+    }
+    values.resize(slots);
+    write_same_set_block_rows_parallel(
+        data, max_capacity, point_set.fixed_counts, values,
+        point_set.row_offset, point_set.row_capacity);
+    // Grow the points whose rows overflowed and collect those rows; shrink
+    // capacities far above the degree for the next frame (their rows are
+    // complete now).
+    using Rows = std::vector<int>;
+    Rows overflowed = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, num_points, 1 << 14), Rows{},
+        [&](const tbb::blocked_range<int> &range, Rows acc) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const std::size_t row = static_cast<std::size_t>(i);
+            const int count = point_set.fixed_counts[row];
+            const int fitted = plan::moving_row_capacity(count);
+            int &capacity = point_set.moving_caps[static_cast<std::size_t>(
+                data.original_index[i])];
+            if (count > point_set.row_capacity[row]) {
+              capacity = fitted;
+              acc.push_back(i);
+            } else if (2 * fitted < capacity) {
+              capacity = fitted;
+            }
+          }
+          return acc;
+        },
+        [](Rows a, const Rows &b) {
+          a.insert(a.end(), b.begin(), b.end());
+          return a;
+        });
+    bool complete = overflowed.empty();
+    if (!complete) {
+      // A point's degree rarely jumps, so only a few rows overflow (and by
+      // little): give them new space after the rows, which the buffer's
+      // headroom usually holds, and rewrite only them. Their grown
+      // capacities place them inline from the next frame on.
+      int64_t spilled = total;
+      for (int row : overflowed) {
+        spilled += point_set.moving_caps[static_cast<std::size_t>(
+                       data.original_index[row])] +
+                   row_slack();
+      }
+      if (spilled <= static_cast<int64_t>(values.capacity()) &&
+          spilled * 4 + static_cast<int64_t>(num_points) * 2 * 4 <=
+              memory_budget_) {
+        int offset = static_cast<int>(total);
+        for (int row : overflowed) {
+          const int capacity = point_set.moving_caps[static_cast<std::size_t>(
+              data.original_index[row])];
+          point_set.row_offset[static_cast<std::size_t>(row)] = offset;
+          point_set.row_capacity[static_cast<std::size_t>(row)] = capacity;
+          offset += capacity + row_slack();
+        }
+        values.resize(static_cast<std::size_t>(spilled));
+        IntBuffer queries(overflowed.begin(), overflowed.end());
+        write_same_set_listed_rows(data, queries, point_set.fixed_counts,
+                                   values, point_set.row_offset,
+                                   point_set.row_capacity);
+        complete = true;
+      }
+    }
+    if (complete) {
+      point_set.block_rows = true;
+      point_set.block_caps_valid = false;
+      point_set.block_layout_valid = false;
+      point_set.fixed_valid = true;
+      point_set.fixed_capacity = 0;
+      point_set.last_fixed_capacity = 0;
+      point_set.skin_lists = false;
+      point_set.active_valid = false;
+      point_set.same_lists_valid = true;
+      return true;
+    }
+  }
+  point_set.moving_caps_valid = false;
+  return false;
 }
 
 bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {

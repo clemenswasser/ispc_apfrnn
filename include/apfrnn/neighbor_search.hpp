@@ -193,6 +193,7 @@ private:
   void build_same_lists(int set);
   bool build_sweep_same_lists(int set);
   void build_grid_same_lists(int set);
+  bool build_moving_block_rows(int set);
   bool build_same_block_rows(int set, int min_block = 1,
                              bool counts_ready = false);
   bool build_cross_block_rows(Pair &pair, PointSet &source, PointSet &target,
