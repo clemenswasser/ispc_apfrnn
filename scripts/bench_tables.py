@@ -80,7 +80,9 @@ BACKENDS = ["apfrnn_cpu", "tree", "compact"]
 
 
 def scene_names(rows):
-    return [scene for _, scene in rows]
+    # Headline/stress rows are (label, scene); learnsph rows also carry the
+    # point-count label in the third column.
+    return [row[1] for row in rows]
 
 
 def run_bench(build: Path, cpus: str, family: str, scenes, backends,
@@ -126,11 +128,15 @@ def run_matrix(args, work: Path):
               work / "learnsph.json",
               [f"--learnsph_res={args.learnsph_res}"], args.min_time,
               args.repetitions)
-    run_bench(args.build, args.cpus, "Frame",
-              [s for _, _, s, _ in MOTION], ["apfrnn_cpu"],
-              work / "motion.json", [], args.min_time, args.repetitions)
-    run_bench(args.build, args.cpus, "Stress",
-              [s for _, family, _, s in MOTION if family == "Stress"],
+    motion_scenes = {
+        family: [name for _, row_family, static, jitter in MOTION
+                 if row_family == family for name in (static, jitter)]
+        for family in ("Frame", "Stress")
+    }
+    run_bench(args.build, args.cpus, "Frame", motion_scenes["Frame"],
+              ["apfrnn_cpu"], work / "motion.json", [], args.min_time,
+              args.repetitions)
+    run_bench(args.build, args.cpus, "Stress", motion_scenes["Stress"],
               ["apfrnn_cpu"], work / "droplets_motion.json", [],
               args.min_time, args.repetitions)
     memory = {}
