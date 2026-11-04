@@ -14,9 +14,8 @@ To verify that README is already current without running the benchmarks:
 
     scripts/bench_tables.py --json-dir build/bench-tables --check
 
---from-json expects headline.json, stress.json, learnsph.json, motion.json,
-droplets_motion.json, k50.json, memory.json and learnsph_memory.json in that
-directory.
+--json-dir expects headline.json, stress.json, learnsph.json, motion.json,
+droplets_motion.json and memory.json in that directory.
 """
 
 from __future__ import annotations
