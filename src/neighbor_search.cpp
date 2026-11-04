@@ -1451,7 +1451,8 @@ void NSearch::build_grid_same_lists(int set) {
   // to block rows with a block size large enough to amortize task overhead.
   if (same_plan.fixed_rows && data.dense_valid &&
       data.num_points >= 100000 && data.num_points <= 200000 &&
-      !point_set.fixed_counts.empty()) {
+      point_set.fixed_counts.size() ==
+          static_cast<std::size_t>(data.num_points)) {
     long long total_count = 0;
     int max_count = 0;
     for (int count : point_set.fixed_counts) {
