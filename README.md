@@ -105,6 +105,7 @@ set-equal to CPU results.
 
 Earlier SYCL build; its CPU column is not the current CPU table.
 
+<!-- bench:gpu:start -->
 | Scene | CPU | GPU | Auto | GPU / CPU |
 |---|---:|---:|---:|---:|
 | uniform, 1M | 31.9 ms | 19.9 ms | 19.0 ms | 1.60x |
@@ -118,6 +119,7 @@ Earlier SYCL build; its CPU column is not the current CPU table.
 | learnsph bowl | 3.28 ms | 2.05 ms | 3.29 ms | 1.60x |
 
 \* Falls back to the CPU because the output exceeds `APFRNN_SYCL_MAX_OUTPUT_MB`.
+<!-- bench:gpu:end -->
 
 ## Performance
 
@@ -232,6 +234,7 @@ Fixed-row capacity and resident memory:
 `scripts/bench_tables.py` runs the matrix, regenerates the tables above and
 updates `README.md`. Review the `git diff`: a changed row is the measured
 delta for the commit. `--check` verifies the tables without rewriting them.
+Pass `--gpu-json <json>` from a SYCL run to regenerate the separate GPU table.
 
 ## Development
 

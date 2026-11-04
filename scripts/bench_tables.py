@@ -15,7 +15,8 @@ To verify that README is already current without running the benchmarks:
     scripts/bench_tables.py --json-dir build/bench-tables --check
 
 --json-dir expects headline.json, stress.json, learnsph.json, motion.json,
-droplets_motion.json and memory.json in that directory.
+droplets_motion.json and memory.json in that directory. Pass a SYCL
+benchmark JSON with --gpu-json to regenerate the separate GPU table.
 """
 
 from __future__ import annotations
@@ -200,6 +201,70 @@ def fmt_mb(value):
     return f"{value:.0f}"
 
 
+def gpu_label(scene):
+    special = {
+        "uniform_1m": "uniform, 1M",
+        "uniform_200k": "uniform, 200k",
+        "uniform_50k": "uniform, 50k",
+        "uniform_200k_moving": "uniform, moving",
+        "jittered_200k": "jittered lattice, 200k",
+        "jittered_50k": "jittered lattice, 50k",
+        "slab_200k": "SPH-like slab, 200k",
+        "slab_50k": "SPH-like slab, 50k",
+        "slab_200k_moving": "slab, moving",
+        "surface_200k": "surface, 200k",
+        "surface_50k": "surface, 50k",
+        "clustered_200k": "clustered, 200k",
+        "thin_slab_200k": "thin slab, 200k",
+        "huge_domain_200k": "huge sparse domain, 200k",
+        "two_scale_200k": "two-scale clusters, 200k",
+        "thin_pipe_200k": "thin pipe, 200k",
+        "thin_pipe_50k": "thin pipe, 50k",
+        "pathological_10k": "pathological, 10k",
+    }
+    if scene in special:
+        return special[scene]
+    if scene.startswith("learnsph_"):
+        return scene.replace("_", " ")
+    return scene.replace("_", " ")
+
+
+def table_gpu(data):
+    lines = [
+        "| Scene | CPU | GPU | Auto | GPU / CPU |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    fallback = False
+    for name, cpu in data.items():
+        if "/apfrnn_cpu/" not in name:
+            continue
+        parts = name.split("/")
+        if len(parts) != 4:
+            continue
+        family, _, scene = parts[:3]
+        gpu_name = f"{family}/apfrnn_gpu/{scene}/real_time_median"
+        auto_name = f"{family}/apfrnn_auto/{scene}/real_time_median"
+        if gpu_name not in data or auto_name not in data:
+            continue
+        gpu = data[gpu_name]
+        auto = data[auto_name]
+        star = ""
+        if gpu.get("Fallback", 0):
+            star = "*"
+            fallback = True
+        label = gpu_label(scene)
+        if family != "Frame":
+            label = f"{family}: {label}"
+        lines.append(
+            f"| {label} | {fmt_ms(cpu['real_time'])} | "
+            f"{fmt_ms(gpu['real_time'])}{star} | {fmt_ms(auto['real_time'])} | "
+            f"{gpu['real_time']/cpu['real_time']:.2f}x |")
+    if fallback:
+        lines.append("")
+        lines.append("\\* CPU fallback.")
+    return "\n".join(lines)
+
+
 def table_timing(data, rows, family):
     lines = [
         "| Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |",
@@ -281,7 +346,7 @@ def replace_block(text: str, name: str, content: str):
     return text[:left] + start + "\n" + content + "\n" + text[right:]
 
 
-def generate(data, memory):
+def generate(data, memory, gpu_data=None):
     text = Path("README.md").read_text()
     replacements = {
         "headline-timing": table_timing(data["headline"], HEADLINE, "Frame"),
@@ -293,6 +358,8 @@ def generate(data, memory):
         "motion": table_motion(data),
         "learnsph": table_learnsph(data, memory),
     }
+    if gpu_data is not None:
+        replacements["gpu"] = table_gpu(gpu_data)
     for name, content in replacements.items():
         text = replace_block(text, name, content)
     return text
@@ -311,6 +378,8 @@ def main():
     parser.add_argument("--memory-time", default="0.5s")
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument("--learnsph-res", default="../learnsph/res")
+    parser.add_argument("--gpu-json", type=Path,
+                        help="optional JSON from a SYCL GPU benchmark run")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--write", action="store_true",
                        help="write README.md")
@@ -324,7 +393,8 @@ def main():
         run_matrix(args, args.work_dir)
         data, memory = load_inputs(args.work_dir)
 
-    expected = generate(data, memory)
+    gpu_data = load_medians(args.gpu_json) if args.gpu_json else None
+    expected = generate(data, memory, gpu_data)
     current = Path("README.md").read_text()
     if expected == current:
         print("README benchmark tables are up to date.", file=sys.stderr)
