@@ -253,10 +253,14 @@ scene list when their files exist.
   fits the memory budget, and a hash otherwise. Uniformly sparse sets use a
   sweep fallback; sparse sets with dense clusters keep the hash grid, because
   an x-window sweep would scan each cluster repeatedly.
-- Points are counting-sorted by cell. Results are mapped back to the caller's
-  order.
+- Dense cell domains are counting-sorted by cell; sparse domains use a stable
+  radix sort over the cell key. Results are mapped back to the caller's order.
+- Neighbor-cell and merged-range tables are reused when the occupied cells and
+  their point ranges are unchanged, so stationary or slow sets skip the hash
+  stencil and range merge. Moving sets fall back to a rebuild.
 - Rows are written in one pass into fixed-capacity rows, with CSR as the
-  fallback when a row overflows. Row capacity adapts to the observed degree.
+  fallback when a row overflows. Up to eight queries share a target load.
+  Row capacity adapts to the observed degree.
 - Dense cells are split into point blocks with bounding boxes, and
   high-degree rows are written with non-temporal stores.
 
@@ -294,8 +298,8 @@ are the synthetic distributions uniform, jittered lattice, lattice, clustered,
 slab, thin slab, huge domain, surface, thin pipe and two-scale at 50k and
 200k, uniform at 1k/10k/1M, clustered at 10k, pathological at 10k, the moving
 variants (`_moving`: small rigid motion, `_fast`: large rigid motion,
-`_jitter`: non-rigid per-point motion, covering uniform, slab and clustered at
-200k and thin pipe at 50k), slab with the boundary also querying
+`_jitter`: non-rigid per-point motion, covering uniform, slab, clustered and
+droplets at 200k and thin pipe at 50k), slab with the boundary also querying
 (`_boundary_queries`), a 1k probe set queried into 200k/1M points, and any
 learnsph frames found under `--learnsph_res` (default `../learnsph/res`). `scripts/bench.sh` accepts `APFRNN_FILTER` and
 `APFRNN_CPUS`.

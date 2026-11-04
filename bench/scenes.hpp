@@ -158,9 +158,13 @@ inline SceneSpec probe_scene(int points) {
 // is far too large for the dense cell lookup, so this is the hash grid with
 // a real neighbor count; huge_domain only covers the empty (sweep) case.
 inline SceneSpec droplet_scene(int droplets, int points_per_droplet,
-                               float domain) {
+                               float domain, bool jitter = false) {
   const int points = droplets * points_per_droplet;
-  return {"droplets_" + std::to_string(points / 1000) + "k", [=] {
+  std::string name = "droplets_" + std::to_string(points / 1000) + "k";
+  if (jitter) {
+    name += "_jitter";
+  }
+  return {name, [=] {
             SceneData data;
             data.radius = 2.0f;
             std::mt19937 generator(5);
@@ -191,6 +195,9 @@ inline SceneSpec droplet_scene(int droplets, int points_per_droplet,
             data.xyz = {std::move(xyz)};
             data.is_static = {false};
             data.pairs = {{0, 0}};
+            if (jitter) {
+              data.jitter = 0.25f;
+            }
             return data;
           }};
 }
@@ -278,6 +285,7 @@ inline std::vector<SceneSpec> stress_scenes() {
   scenes.push_back(many_set_scene("many_sets_100k", 8, 12500));
   scenes.push_back(many_set_scene("many_sets_16x1250", 16, 1250));
   scenes.push_back(droplet_scene(400, 500, 20000.0f));
+  scenes.push_back(droplet_scene(400, 500, 20000.0f, true));
   return scenes;
 }
 

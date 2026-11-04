@@ -638,14 +638,22 @@ static inline void rows_oct(uniform int q_start, uniform int q_end,
     uniform int *uniform o5 = row_of(rows, q5);
     uniform int *uniform o6 = row_of(rows, q6);
     uniform int *uniform o7 = row_of(rows, q7);
-    const uniform int cap0 = rows.row_capacity != NULL ? rows.row_capacity[q0] : rows.capacity;
-    const uniform int cap1 = rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
-    const uniform int cap2 = rows.row_capacity != NULL ? rows.row_capacity[q2] : rows.capacity;
-    const uniform int cap3 = rows.row_capacity != NULL ? rows.row_capacity[q3] : rows.capacity;
-    const uniform int cap4 = rows.row_capacity != NULL ? rows.row_capacity[q4] : rows.capacity;
-    const uniform int cap5 = rows.row_capacity != NULL ? rows.row_capacity[q5] : rows.capacity;
-    const uniform int cap6 = rows.row_capacity != NULL ? rows.row_capacity[q6] : rows.capacity;
-    const uniform int cap7 = rows.row_capacity != NULL ? rows.row_capacity[q7] : rows.capacity;
+    const uniform int cap0 =
+        rows.row_capacity != NULL ? rows.row_capacity[q0] : rows.capacity;
+    const uniform int cap1 =
+        rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
+    const uniform int cap2 =
+        rows.row_capacity != NULL ? rows.row_capacity[q2] : rows.capacity;
+    const uniform int cap3 =
+        rows.row_capacity != NULL ? rows.row_capacity[q3] : rows.capacity;
+    const uniform int cap4 =
+        rows.row_capacity != NULL ? rows.row_capacity[q4] : rows.capacity;
+    const uniform int cap5 =
+        rows.row_capacity != NULL ? rows.row_capacity[q5] : rows.capacity;
+    const uniform int cap6 =
+        rows.row_capacity != NULL ? rows.row_capacity[q6] : rows.capacity;
+    const uniform int cap7 =
+        rows.row_capacity != NULL ? rows.row_capacity[q7] : rows.capacity;
     uniform int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     uniform int c4 = 0, c5 = 0, c6 = 0, c7 = 0;
     for (uniform int run = 0; run < num_runs; ++run) {
