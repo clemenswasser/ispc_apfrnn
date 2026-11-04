@@ -26,7 +26,16 @@ add_library(ispc_apfrnn_kernels
   src/neighbor_search.cpp
   src/plan.cpp
   src/sweep.cpp
-  src/kernel.ispc)
+  src/kernels/cells.ispc
+  src/kernels/rows.ispc
+  src/kernels/csr.ispc
+  src/kernels/sync.ispc)
+# Each component's generated header goes to ispc/; src/kernels_ispc.h
+# includes them all.
+set_target_properties(ispc_apfrnn_kernels PROPERTIES
+  ISPC_HEADER_DIRECTORY ispc)
+target_include_directories(ispc_apfrnn_kernels PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/ispc")
 target_sources(ispc_apfrnn_kernels PUBLIC
   FILE_SET HEADERS BASE_DIRS include FILES include/apfrnn/neighbor_search.hpp)
 target_compile_features(ispc_apfrnn_kernels PUBLIC cxx_std_17)

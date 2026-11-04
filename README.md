@@ -17,7 +17,12 @@ src/
   plan.{hpp,cpp}        strategy selection: which writer, ranges, capacities
   sweep.{hpp,cpp}       sweep backend for extremely sparse sets
   apfrnn.{hpp,cpp}      grid build, cell ranges, fixed-row/CSR writers
-  kernel.ispc           SIMD kernels (no raw intrinsics)
+  kernels/              SIMD kernels (ISPC, no raw intrinsics):
+    common.isph         structs shared with C++, cell keys, hash lookup
+    cells.ispc          candidate cells and point ranges per query cell
+    rows.ispc           fixed-capacity row writers
+    csr.ispc            exact CSR count and write passes
+    sync.ispc           coordinate sync from the caller's xyz
   sycl/                 optional static SYCL GPU backend
 support/                synthetic scenes and VTK loader shared by tests/bench
 tests/                  doctest suite (brute-force comparisons)

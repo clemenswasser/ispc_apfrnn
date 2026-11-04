@@ -1,6 +1,6 @@
 #include "apfrnn.hpp"
 
-#include "kernel_ispc.h"
+#include "kernels_ispc.h"
 
 #include <algorithm>
 #include <cassert>

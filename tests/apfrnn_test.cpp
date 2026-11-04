@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 
 #include "point_cloud.hpp"
-#include "kernel_ispc.h"
+#include "kernels_ispc.h"
 
 #include <doctest/doctest.h>
 

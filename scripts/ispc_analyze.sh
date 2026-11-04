@@ -34,24 +34,32 @@ for tool in ispc llvm-mca llvm-objdump; do
 done
 
 mkdir -p "${out}"
-src="${root}/src/kernel.ispc"
-common=(--target="${target}" -O3 --opt=fast-math)
+# The same flags as CMakeLists.txt.
+common=(--target="${target}" -O3 --opt=fast-math --addressing=64
+        --enable-llvm-intrinsics)
 
-echo "==> ${src} (target ${target})"
-ispc "${src}" "${common[@]}" --emit-asm -o "${out}/kernel.s"
-ispc "${src}" "${common[@]}" --emit-llvm-text -o "${out}/kernel.ll"
-ispc "${src}" "${common[@]}" --emit-obj -o "${out}/kernel.o"
-llvm-objdump -d --no-show-raw-insn "${out}/kernel.o" \
-  > "${out}/kernel.disasm.s"
+# One assembly listing over all components (src/kernels/*.ispc).
+: > "${out}/kernel.s"
+: > "${out}/kernel.disasm.s"
+for src in "${root}"/src/kernels/*.ispc; do
+  name="$(basename "${src}" .ispc)"
+  echo "==> ${src} (target ${target})"
+  ispc "${src}" "${common[@]}" --emit-asm -o "${out}/${name}.s"
+  ispc "${src}" "${common[@]}" --emit-llvm-text -o "${out}/${name}.ll"
+  ispc "${src}" "${common[@]}" --emit-obj -o "${out}/${name}.o"
+  cat "${out}/${name}.s" >> "${out}/kernel.s"
+  llvm-objdump -d --no-show-raw-insn "${out}/${name}.o" \
+    >> "${out}/kernel.disasm.s"
+done
 
 kernels=("$@")
 if [ "${#kernels[@]}" -eq 0 ]; then
   kernels=(
-    write_neighbors_fixed_ispc
-    write_neighbors_fixed_query_ispc
-    write_neighbors_fixed_query_active2_ispc
-    write_cross_neighbors_fixed_ispc
-    write_cross_neighbors_fixed_query_active2_ispc
+    write_fixed_rows
+    write_fixed_rows_oct
+    write_fixed_rows_dense
+    hash_stencil_ranges
+    csr_rows_pair
   )
 fi
 
