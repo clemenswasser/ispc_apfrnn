@@ -289,6 +289,11 @@ void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
                                                IntBuffer &fixed_neighbors,
                                                IntBuffer &counts);
 
+void write_neighbors_fixed_query_quad_parallel(NeighborSearchData &data,
+                                               int capacity,
+                                               IntBuffer &fixed_neighbors,
+                                               IntBuffer &counts);
+
 // Block-AABB filtered query-major writer for dense cells.
 void write_neighbors_fixed_query_blocked_parallel(NeighborSearchData &data,
                                                   int capacity,

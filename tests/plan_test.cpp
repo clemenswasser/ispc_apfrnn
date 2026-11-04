@@ -28,6 +28,14 @@ TEST_CASE("same-set plan picks the on-the-fly pair writer for moderate density")
   CHECK(plan.writer == apfrnn::plan::SameWriter::PairDense);
 }
 
+TEST_CASE("same-set plan uses quad queries for a sparse hash grid") {
+  auto data = grid(200000, 38170, 5);
+  data.dense_valid = false;
+  const auto plan = apfrnn::plan::same_set(data, 0, kBudget);
+  CHECK(plan.ranges == apfrnn::plan::SameRanges::Merged);
+  CHECK(plan.writer == apfrnn::plan::SameWriter::QueryQuad);
+}
+
 TEST_CASE("same-set plan falls back from the pair writers on long rows") {
   const auto data = grid(200000, 20000, 30);
   // A previous frame needed 300 slots: too long for the pair writers.

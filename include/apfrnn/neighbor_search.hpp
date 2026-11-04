@@ -63,7 +63,7 @@ public:
     kPathSameRangesMerged = 1ull << 15,
     kPathSamePairDense = 1ull << 16,
     kPathSameBlocked = 1ull << 17,
-    kPathSameQueryPair = 1ull << 18,
+    kPathSameQueryQuad = 1ull << 18,
     kPathSameActive2 = 1ull << 19,
     kPathSameGrown = 1ull << 20,      // fixed rows overflowed and regrew
     kPathSameCsr = 1ull << 21,

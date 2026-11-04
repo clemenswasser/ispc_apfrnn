@@ -423,7 +423,7 @@ const char *NSearch::path_name(uint64_t path) {
   case kPathSameRangesMerged: return "same_ranges_merged";
   case kPathSamePairDense: return "same_pair_dense";
   case kPathSameBlocked: return "same_blocked";
-  case kPathSameQueryPair: return "same_query_pair";
+  case kPathSameQueryQuad: return "same_query_quad";
   case kPathSameActive2: return "same_active2";
   case kPathSameGrown: return "same_grown";
   case kPathSameCsr: return "same_csr";
@@ -1433,9 +1433,9 @@ void NSearch::build_grid_same_lists(int set) {
       write_neighbors_fixed_query_blocked_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
-    case plan::SameWriter::QueryPair:
-      note_path(kPathSameQueryPair);
-      write_neighbors_fixed_query_pair_parallel(
+    case plan::SameWriter::QueryQuad:
+      note_path(kPathSameQueryQuad);
+      write_neighbors_fixed_query_quad_parallel(
           data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
       break;
     case plan::SameWriter::Active2:

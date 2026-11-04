@@ -1830,6 +1830,27 @@ void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
       });
 }
 
+void write_neighbors_fixed_query_quad_parallel(NeighborSearchData &data,
+                                               int capacity,
+                                               IntBuffer &fixed_neighbors,
+                                               IntBuffer &counts) {
+  prepare_fixed_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(data.num_points), capacity + 8);
+  if (data.num_points == 0) {
+    return;
+  }
+  const ispc::Cells cells = cells_of(data);
+  const ispc::CellRanges ranges = ranges_of(data);
+  const ispc::Points pts = points_of(data);
+  const float r2 = data.radius * data.radius;
+  write_rows_parallel(
+      data.num_cells, cell_grain(data.num_cells), capacity, false, counts,
+      fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
+        ispc::write_fixed_rows_quad(begin, end, &cells, &ranges, &pts, &pts,
+                                    true, r2, &rows);
+      });
+}
+
 void write_neighbors_fixed_query_blocked_parallel(
     NeighborSearchData &data, int capacity, IntBuffer &fixed_neighbors,
     IntBuffer &counts) {

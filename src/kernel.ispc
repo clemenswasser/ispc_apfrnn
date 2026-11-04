@@ -716,6 +716,34 @@ export void write_fixed_rows_pair(
   }
 }
 
+// Candidate runs from precomputed per-cell ranges; four queries share each
+// target load.
+export void write_fixed_rows_quad(
+    uniform int start_cell, uniform int end_cell,
+    const uniform Cells *uniform queries_in,
+    const uniform CellRanges *uniform ranges_in,
+    const uniform Points *uniform qpts_in,
+    const uniform Points *uniform tpts_in, uniform bool same_set,
+    uniform float r2, const uniform FixedRows *uniform rows_in) {
+  const uniform Cells queries = *queries_in;
+  const uniform CellRanges ranges = *ranges_in;
+  const uniform Points qpts = *qpts_in;
+  const uniform Points tpts = *tpts_in;
+  const uniform FixedRows rows = *rows_in;
+  for (uniform int cell = start_cell; cell < end_cell; ++cell) {
+    const uniform int first = ranges.offset[cell];
+    if (same_set) {
+      rows_quad(queries.starts[cell], queries.ends[cell],
+                ranges.starts + first, ranges.ends + first,
+                ranges.count[cell], qpts, tpts, true, r2, rows);
+    } else {
+      rows_quad(queries.starts[cell], queries.ends[cell],
+                ranges.starts + first, ranges.ends + first,
+                ranges.count[cell], qpts, tpts, false, r2, rows);
+    }
+  }
+}
+
 // Candidate runs merged on the fly from the target's dense grid; `group`
 // (2 or 4) queries share each target load. For short rows; no staging. Each
 // branch below passes literals so the helpers are specialized.
