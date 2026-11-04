@@ -94,15 +94,16 @@ inline void prepare_block_rows(IntBuffer &values, IntBuffer &counts,
   counts.resize(num_points);
   std::size_t required = 0;
   if (num_points > 0) {
-    required = static_cast<std::size_t>(
-        row_offset[num_points - 1] + row_capacity[num_points - 1] + 8);
+    required =
+        static_cast<std::size_t>(row_offset[num_points - 1] +
+                                 row_capacity[num_points - 1] + row_slack());
   }
 #ifndef NDEBUG
-  // finish_row() uses non-temporal vector stores, which require 32-byte
-  // alignment: every row start and stride must be a multiple of eight ints.
+  // finish_row() uses aligned non-temporal stores of a whole gang: every row
+  // start and capacity must be a multiple of row_align() ints.
   for (std::size_t i = 0; i < num_points; ++i) {
-    assert(row_offset[i] % 8 == 0);
-    assert(row_capacity[i] % 8 == 0);
+    assert(row_offset[i] % row_align() == 0);
+    assert(row_capacity[i] % row_align() == 0);
   }
 #endif
   // Block rows exist to remove padding, so drop a larger fixed-row buffer even

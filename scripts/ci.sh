@@ -14,12 +14,15 @@ ctest --test-dir "${release_build}" --output-on-failure
 
 # Gang-width matrix: no kernel or host code may assume the 8 lanes of the
 # AVX2 default. Both targets run on any AVX2 host (avx2-i32x16 double-pumps
-# 16 lanes, the AVX-512 width), so this needs no AVX-512 machine.
+# 16 lanes, the AVX-512 width), so this needs no AVX-512 machine. Optimized
+# but with asserts: the row-layout alignment asserts are what catch a
+# hard-coded 8 that does not crash outright.
 for target in sse4-i32x4:4 avx2-i32x16:16; do
   isa="${target%%:*}"
   width="${target##*:}"
   cmake -S . -B "${release_build}-${isa}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_FLAGS_RELEASE=-O3 \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_ISPC_INSTRUCTION_SETS="${isa}" \
     -DAPFRNN_BUILD_BENCHMARKS=OFF \

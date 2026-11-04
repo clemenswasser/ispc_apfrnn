@@ -1829,7 +1829,8 @@ bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
     const int64_t slots =
         static_cast<int64_t>(
             pair.cross_row_offset[static_cast<std::size_t>(num_points - 1)]) +
-        pair.cross_row_capacity[static_cast<std::size_t>(num_points - 1)] + 8;
+        pair.cross_row_capacity[static_cast<std::size_t>(num_points - 1)] +
+        row_slack();
     const int64_t bytes = slots * static_cast<int64_t>(sizeof(int)) +
                           static_cast<int64_t>(num_points) * 2 * sizeof(int);
     if (bytes > memory_budget_) {
@@ -1918,11 +1919,11 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   int64_t exact_neighbors = 0;
   for (int i = 0; i < num_points; ++i) {
     const int count = pair.fixed_counts[static_cast<std::size_t>(i)];
-    // Rows are written with non-temporal vector stores, so every row start
-    // must stay 32-byte aligned: round the capacity to a multiple of eight.
-    const int cap = (count + 7) & ~7;
+    // Rows are written with aligned non-temporal stores of a whole gang, so
+    // every row start must stay gang-aligned: round to row_align().
+    const int cap = round_up_to_row_align(count);
     exact_neighbors += count;
-    slots += cap + 8;
+    slots += cap + row_slack();
     max_capacity = std::max(max_capacity, cap);
   }
 
@@ -1931,7 +1932,7 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   // saved stores for moderate padding, and the win only appears when the
   // global maximum is far above the typical degree.
   const int64_t fixed_slots =
-      static_cast<int64_t>(num_points) * (capacity + 8);
+      static_cast<int64_t>(num_points) * (capacity + row_slack());
   if (slots * 2 > fixed_slots) {
     mark_fixed_layout();
     return false;
@@ -1957,10 +1958,10 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   int total = 0;
   for (int i = 0; i < num_points; ++i) {
     const int cap =
-        (pair.fixed_counts[static_cast<std::size_t>(i)] + 7) & ~7;
+        round_up_to_row_align(pair.fixed_counts[static_cast<std::size_t>(i)]);
     pair.cross_row_offset[static_cast<std::size_t>(i)] = total;
     pair.cross_row_capacity[static_cast<std::size_t>(i)] = cap;
-    total += cap + 8;
+    total += cap + row_slack();
   }
   pair.cross_block_source_generation = source.grid_generation;
   pair.cross_block_target_generation = target.grid_generation;
