@@ -6,6 +6,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -42,6 +43,18 @@ void translate_cloud(apfrnn::support::PointCloud &cloud, float dx, float dy,
 }
 
 } // namespace
+
+// The CI gang-width matrix sets APFRNN_EXPECT_GANG_WIDTH, so a build whose
+// ISPC target silently fell back to the default width fails here instead of
+// passing on the width every other build already covers.
+TEST_CASE("kernels run with the expected ISPC gang width") {
+  MESSAGE("ISPC gang width: " << apfrnn::gang_width());
+  CHECK(apfrnn::row_slack() >= apfrnn::gang_width());
+  CHECK(apfrnn::row_align() % apfrnn::gang_width() == 0);
+  if (const char *expected = std::getenv("APFRNN_EXPECT_GANG_WIDTH")) {
+    CHECK(apfrnn::gang_width() == std::atoi(expected));
+  }
+}
 
 TEST_CASE("CSR writer forms the row base in 64-bit") {
   // The 32-bit addressing bug only appears when a row offset passes 2^29

@@ -907,11 +907,11 @@ TEST_CASE("query-major fixed writers match brute force") {
 
   apfrnn::write_neighbors_fixed_query_pair_parallel(data, capacity, values,
                                                     counts);
-  verify_rows(values, counts, capacity + 8);
+  verify_rows(values, counts, capacity + apfrnn::row_slack());
 
   apfrnn::write_neighbors_fixed_query_active2_parallel(data, capacity, values,
                                                        counts);
-  verify_rows(values, counts, capacity + 8);
+  verify_rows(values, counts, capacity + apfrnn::row_slack());
 }
 
 TEST_CASE("native search handles empty cross-set directions") {
@@ -1012,11 +1012,11 @@ TEST_CASE("query-major cross fixed writer matches brute force") {
   apfrnn::IntBuffer counts;
   apfrnn::write_cross_neighbors_fixed_query_pair_parallel(
       cross, target_data, capacity, values, counts);
-  verify_rows(values, counts, capacity + 8);
+  verify_rows(values, counts, capacity + apfrnn::row_slack());
 
   apfrnn::write_cross_neighbors_fixed_query_active2_parallel(
       cross, target_data, capacity, values, counts);
-  verify_rows(values, counts, capacity + 8);
+  verify_rows(values, counts, capacity + apfrnn::row_slack());
 }
 
 TEST_CASE("active2 writers stay in bounds when rows overflow") {
@@ -1033,8 +1033,8 @@ TEST_CASE("active2 writers stay in bounds when rows overflow") {
   apfrnn::IntBuffer counts;
   apfrnn::write_neighbors_fixed_query_active2_parallel(data, capacity, values,
                                                        counts);
-  REQUIRE(values.size() ==
-          static_cast<std::size_t>(num_points) * (capacity + 8));
+  REQUIRE(values.size() == static_cast<std::size_t>(num_points) *
+                               (capacity + apfrnn::row_slack()));
   REQUIRE(counts.size() == static_cast<std::size_t>(num_points));
   for (int count : counts) {
     CHECK(count == num_points - 1);
@@ -1048,8 +1048,8 @@ TEST_CASE("active2 writers stay in bounds when rows overflow") {
       cross, data, target_data, radius);
   apfrnn::write_cross_neighbors_fixed_query_active2_parallel(
       cross, target_data, capacity, values, counts);
-  REQUIRE(values.size() ==
-          static_cast<std::size_t>(num_points) * (capacity + 8));
+  REQUIRE(values.size() == static_cast<std::size_t>(num_points) *
+                               (capacity + apfrnn::row_slack()));
   for (int count : counts) {
     CHECK(count == 64);
   }

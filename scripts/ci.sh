@@ -12,6 +12,23 @@ cmake -S . -B "${release_build}" -G Ninja \
 cmake --build "${release_build}" -j 8
 ctest --test-dir "${release_build}" --output-on-failure
 
+# Gang-width matrix: no kernel or host code may assume the 8 lanes of the
+# AVX2 default. Both targets run on any AVX2 host (avx2-i32x16 double-pumps
+# 16 lanes, the AVX-512 width), so this needs no AVX-512 machine.
+for target in sse4-i32x4:4 avx2-i32x16:16; do
+  isa="${target%%:*}"
+  width="${target##*:}"
+  cmake -S . -B "${release_build}-${isa}" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_ISPC_INSTRUCTION_SETS="${isa}" \
+    -DAPFRNN_BUILD_BENCHMARKS=OFF \
+    -DAPFRNN_BUILD_BASELINES=OFF
+  cmake --build "${release_build}-${isa}" -j 8
+  APFRNN_EXPECT_GANG_WIDTH="${width}" \
+    ctest --test-dir "${release_build}-${isa}" --output-on-failure
+done
+
 cmake -S . -B "${asan_build}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER=clang++ \

@@ -62,7 +62,7 @@ TEST_CASE("same-set plan uses the blocked writer when blocks exist") {
 
 TEST_CASE("same-set plan resets the first capacity to fit the budget") {
   const auto data = grid(1000, 100, 30);
-  const int64_t budget = 1000LL * (512 + 8) * 4 - 1;
+  const int64_t budget = 1000LL * (512 + apfrnn::row_slack()) * 4 - 1;
   CHECK(apfrnn::plan::same_set(data, 512, budget).first_capacity == 128);
   CHECK(apfrnn::plan::same_set(data, 512, budget + 1).first_capacity == 512);
 }
@@ -100,7 +100,8 @@ TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
 TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(10, 128) == 32);
   CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 80);
-  CHECK(apfrnn::plan::same_fitted_capacity(8000, 16384) == 8504);
+  CHECK(apfrnn::plan::same_fitted_capacity(8000, 16384) ==
+        apfrnn::round_up_to_row_align(8500));
   CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) == 80);
   CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == 64);
 }

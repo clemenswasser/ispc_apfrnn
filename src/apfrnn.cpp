@@ -20,6 +20,11 @@ namespace apfrnn {
 
 inline int dense_cache_position(const NeighborSearchData &data, uint64_t key);
 
+int gang_width() {
+  static const int width = ispc::gang_width();
+  return width;
+}
+
 const int *neighbor_permutation_table() {
   struct NeighborPermutationTable {
     alignas(32) int values[256 * 8];
@@ -762,8 +767,9 @@ template <typename Write>
 void write_rows_parallel(int num_items, int grain, int capacity,
                          bool allow_staging, IntBuffer &counts,
                          IntBuffer &neighbors, Write write) {
-  const int stride = capacity + 8;
-  const bool staged = allow_staging && capacity >= 256 && capacity % 8 == 0;
+  const int stride = capacity + row_slack();
+  const bool staged =
+      allow_staging && capacity >= 256 && capacity % row_align() == 0;
   const int max_threads =
       staged ? tbb::this_task_arena::max_concurrency() : 0;
   IntBuffer scratch;
@@ -792,7 +798,7 @@ void write_block_rows_parallel(int num_items, int grain, int scratch_capacity,
                                IntBuffer &counts, IntBuffer &neighbors,
                                const IntBuffer &row_offset,
                                const IntBuffer &row_capacity, Write write) {
-  const int stride = scratch_capacity + 8;
+  const int stride = scratch_capacity + row_slack();
   int max_threads = tbb::this_task_arena::max_concurrency();
   if (max_threads < 1) {
     max_threads = 1;
@@ -817,7 +823,7 @@ void write_block_rows_parallel(int num_items, int grain, int scratch_capacity,
 template <typename Write>
 void write_csr_rows_pair_parallel(int num_items, int grain, int capacity,
                                   Write write) {
-  const int stride = capacity + 8;
+  const int stride = capacity + row_slack();
   int max_threads = tbb::this_task_arena::max_concurrency();
   if (max_threads < 1) {
     max_threads = 1;
@@ -1862,7 +1868,8 @@ void write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
                                                   IntBuffer &fixed_neighbors,
                                                   IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points), capacity + 8);
+                     static_cast<std::size_t>(data.num_points),
+                     capacity + row_slack());
   if (data.num_points == 0) {
     return;
   }
@@ -1886,7 +1893,8 @@ void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
                                                IntBuffer &fixed_neighbors,
                                                IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points), capacity + 8);
+                     static_cast<std::size_t>(data.num_points),
+                     capacity + row_slack());
   if (data.num_points == 0) {
     return;
   }
@@ -1907,7 +1915,8 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
                                               IntBuffer &fixed_neighbors,
                                               IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points), capacity + 8);
+                     static_cast<std::size_t>(data.num_points),
+                     capacity + row_slack());
   if (data.num_points == 0) {
     return;
   }
@@ -1927,7 +1936,8 @@ void write_neighbors_fixed_query_blocked_parallel(
     NeighborSearchData &data, int capacity, IntBuffer &fixed_neighbors,
     IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points), capacity + 8);
+                     static_cast<std::size_t>(data.num_points),
+                     capacity + row_slack());
   if (data.num_points == 0) {
     return;
   }
@@ -2097,7 +2107,8 @@ void write_neighbors_range(NeighborSearchData &data, int start_cell,
   const ispc::CellRanges ranges = ranges_of(data);
   const ispc::Points pts = points_of(data);
   IntBuffer scratch;
-  scratch.resize(static_cast<std::size_t>(max_row_count(data.counts) + 8));
+  scratch.resize(
+      static_cast<std::size_t>(max_row_count(data.counts) + row_slack()));
   ispc::csr_rows(start_cell, end_cell, &cells, &ranges, &pts, &pts, true,
                  data.radius * data.radius, data.row_ptr.data(),
                  data.col_idx.data(), scratch.data(),
@@ -2169,7 +2180,8 @@ void write_neighbors_parallel(NeighborSearchData &data) {
       [&](int begin, int end, int *scratch) {
         ispc::csr_rows_pair(begin, end, &cells, &ranges, &pts, &pts, true, r2,
                             data.row_ptr.data(), data.col_idx.data(), scratch,
-                            capacity + 8, neighbor_permutation_table());
+                            capacity + row_slack(),
+                            neighbor_permutation_table());
       });
 }
 
@@ -2182,7 +2194,7 @@ void write_cross_neighbors_range(CrossNeighborSearchData &query_data,
   const ispc::Points tpts = points_of(target_data);
   IntBuffer scratch;
   scratch.resize(
-      static_cast<std::size_t>(max_row_count(query_data.counts) + 8));
+      static_cast<std::size_t>(max_row_count(query_data.counts) + row_slack()));
   ispc::csr_rows(start_cell, end_cell, &queries, &ranges, &qpts, &tpts, false,
                  query_data.radius * query_data.radius,
                  query_data.row_ptr.data(), query_data.col_idx.data(),
@@ -2204,10 +2216,10 @@ void write_cross_neighbors_parallel(CrossNeighborSearchData &query_data,
   write_csr_rows_pair_parallel(
       query_data.num_cells, cell_grain(query_data.num_cells), capacity,
       [&](int begin, int end, int *scratch) {
-        ispc::csr_rows_pair(begin, end, &queries, &ranges, &qpts, &tpts, false,
-                            r2, query_data.row_ptr.data(),
-                            query_data.col_idx.data(), scratch, capacity + 8,
-                            neighbor_permutation_table());
+        ispc::csr_rows_pair(
+            begin, end, &queries, &ranges, &qpts, &tpts, false, r2,
+            query_data.row_ptr.data(), query_data.col_idx.data(), scratch,
+            capacity + row_slack(), neighbor_permutation_table());
       });
 }
 
@@ -2216,7 +2228,7 @@ void write_cross_neighbors_fixed_query_active2_parallel(
     int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(query_data.num_points),
-                     capacity + 8);
+                     capacity + row_slack());
   if (query_data.num_points == 0) {
     return;
   }
@@ -2321,7 +2333,7 @@ void write_cross_neighbors_fixed_query_pair_parallel(
     int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(query_data.num_points),
-                     capacity + 8);
+                     capacity + row_slack());
   if (query_data.num_points == 0) {
     return;
   }
@@ -2345,7 +2357,7 @@ void write_cross_neighbors_target_major_parallel(
     IntBuffer &fixed_neighbors, IntBuffer &counts) {
   const int num_source = source_data.num_points;
   const int num_target = target_data.num_points;
-  const int row_stride = capacity + 8;
+  const int row_stride = capacity + row_slack();
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(num_source), row_stride);
   if (num_source == 0 || num_target == 0) {
@@ -2433,7 +2445,8 @@ void write_neighbors_fixed_query_pair_dense_parallel(
     NeighborSearchData &data, int capacity, IntBuffer &fixed_neighbors,
     IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points), capacity + 8);
+                     static_cast<std::size_t>(data.num_points),
+                     capacity + row_slack());
   if (data.num_points == 0) {
     return;
   }
@@ -2456,7 +2469,7 @@ void write_cross_neighbors_fixed_query_pair_dense_parallel(
     IntBuffer &fixed_neighbors, IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(source_data.num_points),
-                     capacity + 8);
+                     capacity + row_slack());
   if (source_data.num_points == 0) {
     return;
   }
@@ -2489,7 +2502,7 @@ void write_cross_neighbors_fixed_query_blocked_parallel(
     IntBuffer &fixed_neighbors, IntBuffer &counts) {
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(query_data.num_points),
-                     capacity + 8);
+                     capacity + row_slack());
   if (query_data.num_points == 0) {
     return;
   }

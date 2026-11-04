@@ -14,8 +14,9 @@
 
 namespace apfrnn {
 
-template <typename T, std::size_t Alignment = 32>
-struct DefaultInitAllocator {
+// 64 bytes: a whole 16-lane gang of ints, so the kernels' aligned streaming
+// stores (vmovnt* of one gang) are legal on AVX-512.
+template <typename T, std::size_t Alignment = 64> struct DefaultInitAllocator {
   using value_type = T;
   using is_always_equal = std::true_type;
 
@@ -59,9 +60,28 @@ struct DefaultInitAllocator {
 
 using IntBuffer = std::vector<int, DefaultInitAllocator<int>>;
 
-// Compaction lookup table shared by the row writers. Internal, but exposed so
-// the CSR regression can call the same ISPC writer as the library.
+// Compaction lookup table shared by the row writers (read by 8-wide kernel
+// builds only). Internal, but exposed so the CSR regression can call the same
+// ISPC writer as the library.
 const int *neighbor_permutation_table();
+
+// Lanes of the ISPC gang the kernels run with (programCount of the target
+// ISPC built or dispatched to). Nothing on the host may hard-code it.
+int gang_width();
+
+// Spare slots after every fixed row and staging row: the compacting writers
+// store a whole gang at the current row end.
+inline int row_slack() { return gang_width(); }
+
+// Fixed-row capacities, and so row strides (capacity + row_slack()), are
+// multiples of this, which keeps every row start gang-aligned for the
+// kernels' aligned streaming stores. At least 8, the AVX2 layout.
+inline int row_align() { return std::max(8, gang_width()); }
+
+inline int round_up_to_row_align(int n) {
+  const int align = row_align();
+  return (n + align - 1) / align * align;
+}
 
 // Axis-aligned bounding box of a point set. Empty when min > max.
 struct Bounds {
@@ -282,8 +302,8 @@ void write_same_set_block_rows_parallel(NeighborSearchData &data, int capacity,
 void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,
                                            float radius);
 
-// Query-major ISPC writer using packed_store_active2. Rows have capacity + 8
-// slots so a full vector store can overshoot the requested capacity.
+// Query-major ISPC writer using packed_store_active2. Rows have capacity +
+// row_slack() slots so a full-gang store can overshoot the capacity.
 void write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
                                                   int capacity,
                                                   IntBuffer &fixed_neighbors,
@@ -335,8 +355,8 @@ void build_cross_neighbor_search_data_from_sorted_inplace(
     CrossNeighborSearchData &data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, float radius);
 
-// Query-major cross writer using packed_store_active2. Rows have capacity + 8
-// slots so a full vector store can overshoot the requested capacity.
+// Query-major cross writer using packed_store_active2. Rows have capacity +
+// row_slack() slots so a full-gang store can overshoot the capacity.
 void write_cross_neighbors_fixed_query_active2_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &target_data,
     int capacity, IntBuffer &fixed_neighbors, IntBuffer &counts);

@@ -15,7 +15,7 @@ constexpr int kFixedMaxPoints = 1000000;
 
 int64_t row_bytes(int num_points, int capacity) {
   return static_cast<int64_t>(num_points) *
-         static_cast<int64_t>(capacity + 8) *
+         static_cast<int64_t>(capacity + row_slack()) *
          static_cast<int64_t>(sizeof(int));
 }
 
@@ -161,12 +161,14 @@ int same_fitted_capacity(int max_count, int capacity) {
   // alternate frames.
   const int margin =
       max_count <= 64 ? 0 : std::max(8, max_count / 16);
-  return std::min(capacity, std::max(32, (max_count + margin + 7) & ~7));
+  return std::min(capacity,
+                  std::max(32, round_up_to_row_align(max_count + margin)));
 }
 
 int cross_fitted_capacity(int max_count, int capacity) {
   const int margin = std::max(8, max_count / 16);
-  return std::min(capacity, std::max(32, (max_count + margin + 7) & ~7));
+  return std::min(capacity,
+                  std::max(32, round_up_to_row_align(max_count + margin)));
 }
 
 bool same_set_isolated(const NeighborSearchData &data) {

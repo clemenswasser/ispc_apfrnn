@@ -998,7 +998,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.cross_block_active = false;
     pair.skin_lists = skin_ > 0.0f;
     pair.active_valid = false;
-    pair.fixed_capacity = capacity + 8;
+    pair.fixed_capacity = capacity + row_slack();
     pair.last_fixed_capacity = plan::cross_fitted_capacity(max_count, capacity);
     return true;
   };
@@ -1569,7 +1569,7 @@ void NSearch::build_grid_same_lists(int set) {
     if (max_count > capacity) {
       return false;
     }
-    point_set.fixed_capacity = capacity + 8;
+    point_set.fixed_capacity = capacity + row_slack();
     point_set.last_fixed_capacity =
         plan::same_fitted_capacity(max_count, capacity);
     point_set.block_rows = false;
@@ -1687,9 +1687,9 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
         for (int i = begin; i < end; ++i) {
           max_count = std::max(max_count, data.counts[i]);
         }
-        const int cap = (max_count + 15) & ~7;
+        const int cap = round_up_to_row_align(max_count + 8);
         caps[static_cast<std::size_t>(block)] = cap;
-        bytes += static_cast<int64_t>(end - begin) * (cap + 8) * 4;
+        bytes += static_cast<int64_t>(end - begin) * (cap + row_slack()) * 4;
       }
       if (bytes <= block_budget) {
         point_set.block_size = candidate;
@@ -1731,7 +1731,7 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
       const int end = std::min(begin + block_size, num_points);
       const int capacity =
           point_set.block_caps[static_cast<std::size_t>(block)];
-      const int stride = capacity + 8;
+      const int stride = capacity + row_slack();
       point_set.block_offsets[static_cast<std::size_t>(block)] = total;
       for (int i = begin; i < end; ++i) {
         point_set.row_offset[static_cast<std::size_t>(i)] =
@@ -1771,7 +1771,7 @@ bool NSearch::build_same_block_rows(int set, int min_block) {
           point_set.block_caps[static_cast<std::size_t>(block)];
       if (max_count > current) {
         point_set.block_caps[static_cast<std::size_t>(block)] =
-            (max_count + 15) & ~7;
+            round_up_to_row_align(max_count + 8);
         grew = true;
       }
     }

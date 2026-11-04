@@ -71,10 +71,11 @@ struct Blocks {
   Coords cell_lo, cell_hi;
 };
 
-// Fixed-capacity output rows: row q starts at neighbors + q * (capacity + 8);
-// the 8 slack slots absorb full-vector compaction stores. perm is the
-// compaction lookup table, scratch one row of per-thread staging (only used
-// by the _nt writers).
+// Fixed-capacity output rows: row q starts at
+// neighbors + q * (capacity + programCount); the programCount slack slots
+// absorb full-gang compaction stores. perm is the 8-lane compaction lookup
+// table (see store_compacted), scratch one row of per-thread staging (only
+// used by the _nt writers).
 struct FixedRows {
   uniform int capacity;
   const uniform int *uniform perm;
@@ -86,6 +87,35 @@ struct FixedRows {
   const uniform int *uniform row_offset;
   const uniform int *uniform row_capacity;
 };
+
+// Nothing below may assume a particular gang width: the kernels are built
+// for whatever target ISPC is given (4-, 8- and 16-wide are tested, see
+// scripts/ci.sh). The host side sizes row slack and alignment from
+// gang_width().
+export uniform int gang_width() { return programCount; }
+
+// Stores the active lanes of `value` contiguously at out[0, n) and returns n.
+// Always writes a whole gang (programCount ints) at `out`, so every buffer
+// it writes to needs programCount slack slots past its last valid element.
+static inline uniform int store_compacted(uniform int *uniform out,
+                                          varying bool active,
+                                          varying int value,
+                                          const uniform int *uniform perm) {
+#if TARGET_WIDTH == 8
+  // One table-driven shuffle: what the 8-wide AVX2 writers were tuned with.
+  // The 256x8 table only covers 8 lanes.
+  const uniform int mask = packmask(active);
+  out[programIndex] = shuffle(value, perm[mask * 8 + programIndex]);
+  return popcnt(mask);
+#else
+  // Any width; vpcompressd on AVX-512.
+  uniform int added = 0;
+  if (active) {
+    added = packed_store_active2(out, value);
+  }
+  return added;
+#endif
+}
 
 inline varying uint64 make_key(varying int cx, varying int cy,
                                     varying int cz) {
@@ -380,7 +410,8 @@ export void dense_stencil9_ranges(
 // searches: with `same_set`, queries and targets are the same point set and
 // a query never lists itself.
 //
-// Fixed rows: row q starts at rows.neighbors + q * (capacity + 8). Writers
+// Fixed rows: row q starts at rows.neighbors + q * (capacity + programCount).
+// Writers
 // count every neighbor but stop storing once a row is past capacity, so the
 // caller can detect the overflow and retry with the exact maximum. When
 // rows.scratch is set, rows are staged there and copied out with streaming
@@ -415,12 +446,12 @@ static inline uniform int *uniform row_of(const uniform FixedRows &rows,
   if (rows.row_offset != NULL) {
     return rows.neighbors + (uniform int64)rows.row_offset[query];
   }
-  return rows.neighbors + (uniform int64)query * (rows.capacity + 8);
+  return rows.neighbors + (uniform int64)query * (rows.capacity + programCount);
 }
 
-// Appends the active lanes of `value`: compacts them with the lookup table
-// and stores a full vector at `out`, which the 8 slack slots absorb. Returns
-// how far `out` advances (0 once the row is past capacity).
+// Appends the active lanes of `value` at `out` (see store_compacted; the
+// row's slack absorbs the full-gang store). Returns how far `out` advances
+// (0 once the row is past capacity).
 static inline uniform int append_active(uniform int *uniform out,
                                         uniform int &count, varying bool active,
                                         varying int value,
@@ -430,9 +461,7 @@ static inline uniform int append_active(uniform int *uniform out,
     count += reduce_add(select(active, 1, 0));
     return 0;
   }
-  const uniform int mask = packmask(active);
-  out[programIndex] = shuffle(value, rows.perm[mask * 8 + programIndex]);
-  const uniform int added = popcnt(mask);
+  const uniform int added = store_compacted(out, active, value, rows.perm);
   count += added;
   return added;
 }
@@ -443,6 +472,8 @@ static inline uniform int *uniform row_output(const uniform FixedRows &rows,
 }
 
 // Stores the count and, when staged, streams the row to its destination.
+// Row starts are gang-aligned (the host rounds capacities to row_align()), so
+// the aligned streaming stores are legal.
 static inline void finish_row(const uniform FixedRows &rows,
                               uniform int query, uniform int count) {
   if (rows.scratch != NULL) {
@@ -991,8 +1022,9 @@ export void csr_count_rows(
   }
 }
 
-// Copies a staged row to its exact CSR slot. col_idx is 32-byte aligned, so
-// align the row start with a short scalar prefix and stream the rest.
+// Copies a staged row to its exact CSR slot. col_idx is 64-byte aligned (at
+// least one gang of ints up to 16 lanes), so align the row start to the gang
+// with a short scalar prefix and stream the rest.
 static inline void copy_csr_row(uniform const int row_ptr[],
                                 uniform int col_idx[],
                                 uniform const int scratch[], uniform int query,
@@ -1019,9 +1051,10 @@ static inline void copy_csr_row(uniform const int row_ptr[],
 // CSR write pass: writes each query's neighbors from col_idx[row_ptr[q]] on.
 // Queries are visited one at a time and targets are vectorized, so the active
 // targets can be compacted with packmask/shuffle instead of a per-lane
-// scatter. Each row is staged in scratch (capacity + 8 ints) and copied out
-// with vector stores; the row base is formed in 64-bit because a CSR offset
-// past 2^29 entries would otherwise sign-extend a 32-bit byte offset.
+// scatter. Each row is staged in scratch (capacity + programCount ints) and
+// copied out with vector stores; the row base is formed in 64-bit because a
+// CSR offset past 2^29 entries would otherwise sign-extend a 32-bit byte
+// offset.
 export void csr_rows(
     uniform int start_cell, uniform int end_cell,
     const uniform Cells *uniform queries_in,
@@ -1049,10 +1082,8 @@ export void csr_rows(
           // exactly, or the write can run past the counted row.
           const bool hit =
               length_sq(point_at(tpts, j) - q) <= r2 && (!same_set || j != query);
-          const uniform int mask = packmask(hit);
-          out[programIndex] =
-              shuffle(tpts.index[j], perm[mask * 8 + programIndex]);
-          const uniform int added = popcnt(mask);
+          const uniform int added =
+              store_compacted(out, hit, tpts.index[j], perm);
           out += added;
           count += added;
         }
@@ -1099,19 +1130,14 @@ export void csr_rows_pair(
           const varying int value = tpts.index[j];
           const bool hit0 =
               length_sq(pj - p0) <= r2 && (!same_set || j != q0);
-          const uniform int mask0 = packmask(hit0);
-          o0[programIndex] =
-              shuffle(value, perm[mask0 * 8 + programIndex]);
-          const uniform int added0 = popcnt(mask0);
+          const uniform int added0 = store_compacted(o0, hit0, value, perm);
           o0 += added0;
           c0 += added0;
           if (has_q1) {
             const bool hit1 =
                 length_sq(pj - p1) <= r2 && (!same_set || j != q1);
-            const uniform int mask1 = packmask(hit1);
-            o1[programIndex] =
-                shuffle(value, perm[mask1 * 8 + programIndex]);
-            const uniform int added1 = popcnt(mask1);
+            const uniform int added1 =
+                store_compacted(o1, hit1, value, perm);
             o1 += added1;
             c1 += added1;
           }
