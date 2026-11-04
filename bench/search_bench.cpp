@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -289,6 +290,27 @@ int main(int argc, char **argv) {
   for (SceneSpec &scene : apfrnn::bench::learnsph_scenes(learnsph_res)) {
     if (scene.name == "learnsph_ramp_split_lv") {
       scaling.push_back({std::move(scene), {1, 4, 16}});
+    }
+  }
+  // APFRNN_SCALING_THREADS=1,2,4,...,96 replaces every scene's thread
+  // counts, for machines with more cores than the defaults reach.
+  if (const char *env = std::getenv("APFRNN_SCALING_THREADS")) {
+    std::vector<int> counts;
+    for (const char *p = env; *p != '\0';) {
+      char *end = nullptr;
+      const long value = std::strtol(p, &end, 10);
+      if (end == p) {
+        break;
+      }
+      if (value > 0) {
+        counts.push_back(static_cast<int>(value));
+      }
+      p = *end == ',' ? end + 1 : end;
+    }
+    if (!counts.empty()) {
+      for (auto &entry : scaling) {
+        entry.second = counts;
+      }
     }
   }
   for (const auto &[scaling_scene, thread_counts] : scaling) {

@@ -94,6 +94,25 @@ struct FixedRows {
 // gang_width().
 export uniform int gang_width() { return programCount; }
 
+// Compaction strategy (APFRNN_COMPACT_TABLE overrides it on 8-wide builds):
+//   table:    8 lanes with vector-of-int masks (AVX2): one shuffle through
+//             the 256x8 lookup table, what the AVX2 writers were tuned with.
+//   compress: bit-mask targets (AVX-512, AVX10): register vpcompressd plus a
+//             plain full-gang store. Not packed_store_active2: it compresses
+//             straight to memory, which is microcoded and 2.5-3.5x slower
+//             end to end on Zen 4.
+//   generic:  anything else (SSE4, AVX2 x16, ...): packed_store_active2.
+#ifndef APFRNN_COMPACT_TABLE
+#if TARGET_WIDTH == 8 && ISPC_MASK_BITS != 1
+#define APFRNN_COMPACT_TABLE 1
+#else
+#define APFRNN_COMPACT_TABLE 0
+#endif
+#endif
+#if APFRNN_COMPACT_TABLE && TARGET_WIDTH != 8
+#error "APFRNN_COMPACT_TABLE needs an 8-wide target: the table covers 8 lanes"
+#endif
+
 // Stores the active lanes of `value` contiguously at out[0, n) and returns n.
 // Always writes a whole gang (programCount ints) at `out`, so every buffer
 // it writes to needs programCount slack slots past its last valid element.
@@ -101,14 +120,14 @@ static inline uniform int store_compacted(uniform int *uniform out,
                                           varying bool active,
                                           varying int value,
                                           const uniform int *uniform perm) {
-#if TARGET_WIDTH == 8
-  // One table-driven shuffle: what the 8-wide AVX2 writers were tuned with.
-  // The 256x8 table only covers 8 lanes.
+#if APFRNN_COMPACT_TABLE
   const uniform int mask = packmask(active);
   out[programIndex] = shuffle(value, perm[mask * 8 + programIndex]);
   return popcnt(mask);
+#elif ISPC_MASK_BITS == 1
+  out[programIndex] = @llvm.experimental.vector.compress(value, active, value);
+  return popcnt(packmask(active));
 #else
-  // Any width; vpcompressd on AVX-512.
   uniform int added = 0;
   if (active) {
     added = packed_store_active2(out, value);

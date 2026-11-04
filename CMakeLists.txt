@@ -34,7 +34,9 @@ target_compile_options(ispc_apfrnn_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Debug>>:-O3>>
   $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Release>>:-g>>
   $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>
-  $<$<COMPILE_LANGUAGE:ISPC>:--addressing=64>)
+  $<$<COMPILE_LANGUAGE:ISPC>:--addressing=64>
+  # store_compacted calls llvm.experimental.vector.compress on AVX-512.
+  $<$<COMPILE_LANGUAGE:ISPC>:--enable-llvm-intrinsics>)
 target_link_libraries(ispc_apfrnn_kernels PUBLIC
   TBB::tbb TBB::tbbmalloc $<TARGET_NAME_IF_EXISTS:TBB::tbbmalloc_proxy>)
 
