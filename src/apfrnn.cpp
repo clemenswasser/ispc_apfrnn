@@ -1341,12 +1341,10 @@ void build_point_grid_inplace(NeighborSearchData &data,
   data.cell_max_x.clear();
   data.cell_max_y.clear();
   data.cell_max_z.clear();
-  // Invalidate any same-set neighbor rows from a previous grid build.
+  // Invalidate any shared range pointers from a previous grid build. The
+  // same-set range buffers are kept until the new cell ranges are known, so
+  // an unchanged grid can reuse them.
   use_own_ranges(data);
-  data.cell_neighbor_offset.clear();
-  data.cell_num_neighbors.clear();
-  data.cell_neighbor_starts.clear();
-  data.cell_neighbor_ends.clear();
   data.counts.clear();
   data.col_idx.clear();
   data.row_ptr.clear();
@@ -1388,6 +1386,11 @@ void build_point_grid_inplace(NeighborSearchData &data,
     data.cell_block_count.clear();
     data.blocks_valid = false;
     data.max_cell_points = 0;
+    data.cell_neighbor_offset.clear();
+    data.cell_num_neighbors.clear();
+    data.cell_neighbor_starts.clear();
+    data.cell_neighbor_ends.clear();
+    data.cached_range_valid = false;
     return;
   }
 
@@ -1397,6 +1400,27 @@ void build_point_grid_inplace(NeighborSearchData &data,
                  data.cell_ends, data.scratch_point_keys,
                  data.scratch_point_keys_alt, data.scratch_unique_keys);
   auto const &unique_keys = data.scratch_unique_keys;
+
+  const std::size_t num_cells_size = data.cell_starts.size();
+  const bool keep_ranges =
+      data.cached_range_valid &&
+      data.cached_range_stencil == data.cell_stencil &&
+      data.cached_range_stride == data.max_neighbor_cells &&
+      data.cached_range_cell_starts == data.cell_starts &&
+      data.cached_range_cell_ends == data.cell_ends &&
+      data.cell_neighbor_offset.size() == num_cells_size &&
+      data.cell_num_neighbors.size() == num_cells_size &&
+      data.cell_neighbor_starts.size() ==
+          static_cast<std::size_t>(data.cached_range_total) &&
+      data.cell_neighbor_ends.size() ==
+          static_cast<std::size_t>(data.cached_range_total);
+  if (!keep_ranges) {
+    data.cell_neighbor_offset.clear();
+    data.cell_num_neighbors.clear();
+    data.cell_neighbor_starts.clear();
+    data.cell_neighbor_ends.clear();
+    data.cached_range_valid = false;
+  }
 
   int num_cells = static_cast<int>(data.cell_starts.size());
   data.num_cells = num_cells;
@@ -1466,6 +1490,7 @@ static void build_same_set_candidate_cells_inplace(NeighborSearchData &data) {
   data.cached_neighbor_stencil = data.cell_stencil;
   data.cached_neighbor_stride = data.max_neighbor_cells;
   data.cached_neighbor_valid = true;
+  ++data.neighbor_generation;
 }
 
 inline int dense_cache_position(const NeighborSearchData &data,
@@ -1580,11 +1605,29 @@ void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
     data.cell_num_neighbors.clear();
     data.cell_neighbor_starts.clear();
     data.cell_neighbor_ends.clear();
+    data.cached_range_valid = false;
     return;
   }
 
   build_same_set_candidate_cells_inplace(data);
   const int num_cells = data.num_cells;
+  const bool reuse_ranges =
+      data.cached_range_valid &&
+      data.cached_range_generation == data.neighbor_generation &&
+      data.cached_range_stencil == data.cell_stencil &&
+      data.cached_range_stride == data.max_neighbor_cells &&
+      data.cached_range_cell_starts == data.cell_starts &&
+      data.cached_range_cell_ends == data.cell_ends &&
+      data.cell_num_neighbors.size() == static_cast<std::size_t>(num_cells) &&
+      data.cell_neighbor_offset.size() == static_cast<std::size_t>(num_cells) &&
+      data.cell_neighbor_starts.size() ==
+          static_cast<std::size_t>(data.cached_range_total) &&
+      data.cell_neighbor_ends.size() ==
+          static_cast<std::size_t>(data.cached_range_total);
+  if (reuse_ranges) {
+    return;
+  }
+
   data.cell_num_neighbors.resize(num_cells);
   data.cell_neighbor_offset.resize(num_cells);
 
@@ -1625,12 +1668,21 @@ void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
             &ncells, nullptr, data.cell_neighbor_offset.data(),
             data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data());
       });
+
+  data.cached_range_cell_starts = data.cell_starts;
+  data.cached_range_cell_ends = data.cell_ends;
+  data.cached_range_stencil = data.cell_stencil;
+  data.cached_range_stride = data.max_neighbor_cells;
+  data.cached_range_total = total_cell_neighbors;
+  data.cached_range_generation = data.neighbor_generation;
+  data.cached_range_valid = true;
 }
 
 
 void build_same_set_cell_ranges_dense_fused_inplace(
     NeighborSearchData &data) {
   use_own_ranges(data);
+  data.cached_range_valid = false;
   if (data.num_points == 0) {
     data.cell_neighbor_offset.clear();
     data.cell_num_neighbors.clear();

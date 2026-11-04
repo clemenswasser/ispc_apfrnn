@@ -161,6 +161,14 @@ struct NeighborSearchData {
   int cached_neighbor_stencil = -1;
   int cached_neighbor_stride = 0;
   bool cached_neighbor_valid = false;
+  uint64_t neighbor_generation = 0;
+  IntBuffer cached_range_cell_starts;
+  IntBuffer cached_range_cell_ends;
+  int cached_range_stencil = -1;
+  int cached_range_stride = 0;
+  int cached_range_total = -1;
+  uint64_t cached_range_generation = 0;
+  bool cached_range_valid = false;
   IntBuffer block_begin;
   IntBuffer block_end;
   IntBuffer block_cell;
