@@ -14,7 +14,7 @@ constexpr int kSameInitialCapacity = 128;
 constexpr int kSameMaxCapacity = 32768;
 constexpr int kCrossInitialCapacity = 32;
 constexpr int kCrossMaxCapacity = 4096;
-constexpr int kFixedMaxPoints = 1000000;
+constexpr int kFixedMaxPoints = 4000000;
 // prefer_block_rows: block rows must save this fraction of the fixed slots
 // and this many bytes.
 constexpr int64_t kBlockRowMinSavingNum = 1;
