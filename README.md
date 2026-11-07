@@ -7,29 +7,6 @@ built from ISPC kernels and TBB parallelism. The main consumer is learnsph.
 [CompactNSearch]: https://github.com/InteractiveComputerGraphics/CompactNSearch
 [TreeNSearch]: https://github.com/InteractiveComputerGraphics/TreeNSearch
 
-## Layout
-
-```
-include/apfrnn/
-  neighbor_search.hpp   NSearch: the public API (the only public header)
-src/
-  neighbor_search.cpp   set/pair state, caching, run() phases, skin filtering
-  plan.{hpp,cpp}        strategy selection: which writer, ranges, capacities
-  sweep.{hpp,cpp}       sweep backend for extremely sparse sets
-  apfrnn.{hpp,cpp}      grid build, cell ranges, fixed-row/CSR writers
-  kernels/              SIMD kernels (ISPC, no raw intrinsics):
-    common.isph         structs shared with C++, cell keys, hash lookup
-    cells.ispc          candidate cells and point ranges per query cell
-    rows.ispc           fixed-capacity row writers
-    csr.ispc            exact CSR count and write passes
-    sync.ispc           coordinate sync from the caller's xyz
-  sycl/                 optional static SYCL GPU backend
-support/                synthetic scenes and VTK loader shared by tests/bench
-tests/                  doctest suite (brute-force comparisons)
-bench/                  Google Benchmark suite (Frame/, Threads/, Api/)
-scripts/                benchmark, CI, coverage and profiling helpers
-```
-
 ## Usage
 
 ```cpp
@@ -90,62 +67,3 @@ ctest --test-dir build --output-on-failure
 | `APFRNN_BUILD_BENCHMARKS` | top-level | Google Benchmark targets |
 | `APFRNN_BUILD_BASELINES` | `OFF` | fetches CompactNSearch/TreeNSearch |
 | `APFRNN_ENABLE_SYCL` | `OFF` | static SYCL GPU backend, requires icpx |
-
-## Optional SYCL GPU backend
-
-```sh
-source /opt/intel/oneapi/setvars.sh
-cmake --preset sycl-release
-cmake --build --preset sycl-release
-```
-
-```cpp
-search.set_search_backend(apfrnn::SearchBackend::GpuExact);
-search.set_search_backend(apfrnn::SearchBackend::Auto);
-```
-
-`APFRNN_BACKEND=cpu|gpu|auto` preselects the backend. GPU results are
-set-equal to CPU results.
-
-### GPU frame times
-
-Earlier SYCL build; its CPU column is not the current CPU table.
-
-<!-- bench:gpu:start -->
-| Scene | CPU | GPU | Auto | GPU / CPU |
-|---|---:|---:|---:|---:|
-| uniform, 1M | 31.9 ms | 19.9 ms | 19.0 ms | 1.60x |
-| uniform, 200k | 5.62 ms | 4.67 ms | 4.73 ms | 1.20x |
-| SPH-like slab, 200k | 7.16 ms | 5.84 ms | 5.88 ms | 1.23x |
-| uniform, 50k | 1.19 ms | 2.03 ms | 1.20 ms | 0.59x |
-| surface, 200k | 15.0 ms | 19.0 ms | 15.6 ms | 0.79x |
-| clustered, 200k | 24.8 ms | 34.4 ms | 24.8 ms | 0.72x |
-| thin pipe, 200k | 107 ms | 104 ms* | 106 ms | 0.97x* |
-| learnsph wall | 3.41 ms | 2.25 ms | 3.42 ms | 1.52x |
-| learnsph bowl | 3.28 ms | 2.05 ms | 3.29 ms | 1.60x |
-
-\* Falls back to the CPU because the output exceeds `APFRNN_SYCL_MAX_OUTPUT_MB`.
-<!-- bench:gpu:end -->
-
-## Benchmarks
-
-```sh
-./scripts/bench.sh build
-./scripts/bench_tables.py --write
-./build/bench/ispc_apfrnn_bench --benchmark_filter='^Stress/'
-./build/bench/ispc_apfrnn_bench --benchmark_filter='^Api/'
-```
-
-`scripts/bench_tables.py` runs the matrix, regenerates the tables above and
-updates `README.md`. Review the `git diff`: a changed row is the measured
-delta for the commit. `--check` verifies the tables without rewriting them.
-Pass `--gpu-json <json>` from a SYCL run to regenerate the separate GPU table.
-
-## Development
-
-```sh
-./scripts/ci.sh
-./scripts/coverage.sh
-./scripts/profile.sh build 50000
-./scripts/ispc_analyze.sh
-```
