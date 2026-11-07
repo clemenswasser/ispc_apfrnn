@@ -1862,6 +1862,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
   data.cell_x_valid = false;
   data.occupancy_valid = false;
   data.cell_ranges_implicit = false;
+  data.ordered_x_valid = false;
   // Blocks and their cell bounds describe the previous sorted order.
   data.blocks_valid = false;
   data.block_begin.clear();
@@ -2763,6 +2764,91 @@ void ensure_cell_ranges(NeighborSearchData &data) {
   data.cell_ranges_implicit = false;
 }
 
+// Builds the x-slab index in order-key space. Raw keys are XORed with the
+// sign mask when the sort used signed-coordinate ordering, so negative
+// coordinates remain supported: the ordered field is (coord + 2^20) for the
+// 21-bit packed field, which is monotonic in the real coordinate.
+void ensure_ordered_cell_x(NeighborSearchData &data) {
+  if (data.ordered_x_valid) {
+    return;
+  }
+  const int num_cells = data.num_cells;
+  if (num_cells <= 0 || data.scratch_unique_keys.size() !=
+                            static_cast<std::size_t>(num_cells)) {
+    data.ordered_x_start.clear();
+    return;
+  }
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const uint64_t mask =
+      data.cell_keys_signed_order ? SortPointKey::kSignBits : 0;
+  // Order-space fields are unsigned 21-bit offsets (real coordinate plus
+  // 2^20 when signed ordering is used), so mask the field instead of
+  // sign-extending it.
+  auto coord = [&](uint64_t key, int shift) {
+    return static_cast<int>(((key ^ mask) >> shift) & 0x1FFFFFULL);
+  };
+  const int min_x = coord(keys[0], 42);
+  const int max_x = coord(keys[num_cells - 1], 42);
+  const int span = max_x - min_x + 1;
+  if (span <= 0 || span > 4 * num_cells + 65536) {
+    data.ordered_x_start.clear();
+    return;
+  }
+  data.ordered_x_start.resize(static_cast<std::size_t>(span) + 1);
+  int *slab = data.ordered_x_start.data();
+  slab[span] = num_cells;
+  auto slab_x_less = [&](uint64_t key, uint64_t want) {
+    return (key ^ mask) < want;
+  };
+  constexpr int kChunks = 32;
+  if (span < 4096 || num_cells < 65536) {
+    int cell = 0;
+    for (int i = 0; i < span; ++i) {
+      const int x = min_x + i;
+      while (cell < num_cells && coord(keys[cell], 42) < x) {
+        ++cell;
+      }
+      slab[i] = cell;
+    }
+  } else {
+    // Parallel fill: the cell scan is monotonic, so each chunk starts at the
+    // lower-bound position for its first slab and only scans its own cells.
+    std::vector<int> chunk_start(static_cast<std::size_t>(kChunks) + 1, 0);
+    for (int chunk = 1; chunk <= kChunks; ++chunk) {
+      const int i = static_cast<int>(static_cast<long long>(chunk) * span /
+                                     kChunks);
+      const uint64_t want = make_key(min_x + i, 0, 0);
+      chunk_start[static_cast<std::size_t>(chunk)] =
+          static_cast<int>(std::lower_bound(keys, keys + num_cells, want,
+                                            slab_x_less) -
+                           keys);
+    }
+    tbb::parallel_for(0, kChunks, [&](int chunk) {
+      const int i0 = static_cast<int>(static_cast<long long>(chunk) * span /
+                                      kChunks);
+      const int i1 = static_cast<int>(static_cast<long long>(chunk + 1) *
+                                      span / kChunks);
+      int cell = chunk_start[static_cast<std::size_t>(chunk)];
+      const int end = chunk_start[static_cast<std::size_t>(chunk) + 1];
+      for (int i = i0; i < i1; ++i) {
+        const int x = min_x + i;
+        while (cell < end && coord(keys[cell], 42) < x) {
+          ++cell;
+        }
+        slab[i] = cell;
+      }
+    });
+  }
+  // Y/Z windows are only clamps; the full field range is exact for the
+  // lower-bound scans, so no extra pass over the keys is needed.
+  data.ordered_x_min = min_x;
+  data.ordered_y_min = 0;
+  data.ordered_y_max = 0x1FFFFF;
+  data.ordered_z_min = 0;
+  data.ordered_z_max = 0x1FFFFF;
+  data.ordered_x_valid = true;
+}
+
 void ensure_cell_x_index(NeighborSearchData &data) {
   if (data.cell_x_valid) {
     return;
@@ -2813,7 +2899,7 @@ void ensure_cell_x_index(NeighborSearchData &data) {
 // of edge >= 2*radius, so a query only needs the 2x2x2 blocks its sphere can
 // touch. The bitmap is capped near 16 MiB; wide sparse domains are exactly
 // where it pays off.
-void ensure_occupancy(NeighborSearchData &data) {
+void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   if (data.occupancy_valid) {
     return;
   }
@@ -2833,29 +2919,41 @@ void ensure_occupancy(NeighborSearchData &data) {
     float max_y = std::numeric_limits<float>::lowest();
     float max_z = std::numeric_limits<float>::lowest();
   };
-  const Box box = tbb::parallel_reduce(
-      tbb::blocked_range<int>(0, num_points, 65536), Box{},
-      [&](const tbb::blocked_range<int> &range, Box acc) {
-        for (int i = range.begin(); i < range.end(); ++i) {
-          const std::size_t at = static_cast<std::size_t>(i);
-          acc.min_x = std::min(acc.min_x, x[at]);
-          acc.min_y = std::min(acc.min_y, y[at]);
-          acc.min_z = std::min(acc.min_z, z[at]);
-          acc.max_x = std::max(acc.max_x, x[at]);
-          acc.max_y = std::max(acc.max_y, y[at]);
-          acc.max_z = std::max(acc.max_z, z[at]);
-        }
-        return acc;
-      },
-      [](Box a, const Box &b) {
-        a.min_x = std::min(a.min_x, b.min_x);
-        a.min_y = std::min(a.min_y, b.min_y);
-        a.min_z = std::min(a.min_z, b.min_z);
-        a.max_x = std::max(a.max_x, b.max_x);
-        a.max_y = std::max(a.max_y, b.max_y);
-        a.max_z = std::max(a.max_z, b.max_z);
-        return a;
-      });
+  Box box;
+  if (known != nullptr && !known->empty()) {
+    // The caller already tracks the set's AABB (sync_source); reuse it
+    // instead of another full pass over the coordinates.
+    box.min_x = known->min_x;
+    box.min_y = known->min_y;
+    box.min_z = known->min_z;
+    box.max_x = known->max_x;
+    box.max_y = known->max_y;
+    box.max_z = known->max_z;
+  } else {
+    box = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, num_points, 65536), Box{},
+        [&](const tbb::blocked_range<int> &range, Box acc) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const std::size_t at = static_cast<std::size_t>(i);
+            acc.min_x = std::min(acc.min_x, x[at]);
+            acc.min_y = std::min(acc.min_y, y[at]);
+            acc.min_z = std::min(acc.min_z, z[at]);
+            acc.max_x = std::max(acc.max_x, x[at]);
+            acc.max_y = std::max(acc.max_y, y[at]);
+            acc.max_z = std::max(acc.max_z, z[at]);
+          }
+          return acc;
+        },
+        [](Box a, const Box &b) {
+          a.min_x = std::min(a.min_x, b.min_x);
+          a.min_y = std::min(a.min_y, b.min_y);
+          a.min_z = std::min(a.min_z, b.min_z);
+          a.max_x = std::max(a.max_x, b.max_x);
+          a.max_y = std::max(a.max_y, b.max_y);
+          a.max_z = std::max(a.max_z, b.max_z);
+          return a;
+        });
+  }
   const float extent_x = box.max_x - box.min_x;
   const float extent_y = box.max_y - box.min_y;
   const float extent_z = box.max_z - box.min_z;
@@ -3137,6 +3235,148 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
             }
           }
           row_counts[point] = count;
+        }
+      });
+  return max_row_count(counts) <= capacity;
+}
+
+bool write_cross_rows_target_major(NeighborSearchData &source,
+                                   NeighborSearchData &target, float radius,
+                                   int capacity, IntBuffer &fixed_neighbors,
+                                   IntBuffer &counts) {
+  const int num_source = source.num_points;
+  const int num_target = target.num_points;
+  const int stride = capacity;
+  // Rows must exist even when one side is empty: the query API reads the
+  // fixed counts buffer for every source point.
+  prepare_fixed_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(num_source), stride);
+  std::fill(counts.begin(), counts.end(), 0);
+  if (num_source == 0 || num_target == 0) {
+    return true;
+  }
+  ensure_ordered_cell_x(source);
+  ensure_occupancy(source);
+  if (!source.ordered_x_valid || source.num_cells <= 0 ||
+      source.scratch_unique_keys.size() !=
+          static_cast<std::size_t>(source.num_cells)) {
+    return false;
+  }
+  const float r2 = radius * radius;
+  const float inv_cell =
+      source.cell_radius > 0.0f ? 1.0f / source.cell_radius : 1.0f;
+  const int stencil =
+      std::max(1, static_cast<int>(std::ceil(radius * inv_cell - 1.0e-6f)));
+  const int num_cells = source.num_cells;
+  const bool implicit_cells = source.cell_ranges_implicit;
+  const uint64_t *keys = source.scratch_unique_keys.data();
+  const int *cell_starts =
+      implicit_cells ? nullptr : source.cell_starts.data();
+  const int *cell_ends = implicit_cells ? nullptr : source.cell_ends.data();
+  const float *sx = source.sorted_x.data();
+  const float *sy = source.sorted_y.data();
+  const float *sz = source.sorted_z.data();
+  const int *cell_x_start = source.ordered_x_start.data();
+  const int x_min = source.ordered_x_min;
+  const int x_span = static_cast<int>(source.ordered_x_start.size()) - 1;
+  const int y_min = source.ordered_y_min;
+  const int y_max = source.ordered_y_max;
+  const int z_min = source.ordered_z_min;
+  const int z_max = source.ordered_z_max;
+  const float *tx = target.sorted_x.data();
+  const float *ty = target.sorted_y.data();
+  const float *tz = target.sorted_z.data();
+  const int *target_index = target.original_index.data();
+  // Work in order-key space: the raw key array is sorted by (key ^ mask), so
+  // lower_bound must compare transformed values. Positive-coordinate grids
+  // have mask == 0 and ordered fields equal raw fields.
+  const uint64_t mask =
+      source.cell_keys_signed_order ? SortPointKey::kSignBits : 0;
+  const int field_offset = mask != 0 ? 0x100000 : 0;
+  constexpr int kMaxField = 0x1FFFFF;
+  auto ordered_coord = [&](int coord) { return coord + field_offset; };
+  auto lower = [&](int begin, int end, uint64_t want) {
+    return static_cast<int>(
+        std::lower_bound(keys + begin, keys + end, want,
+                         [mask](uint64_t a, uint64_t b) {
+                           return (a ^ mask) < b;
+                         }) -
+        keys);
+  };
+  int *row_counts = counts.data();
+  int *row_values = fixed_neighbors.data();
+  constexpr int kGrain = 2048;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_target, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int point = range.begin(); point < range.end(); ++point) {
+          const float px = tx[point];
+          const float py = ty[point];
+          const float pz = tz[point];
+          if (source.occupancy_valid &&
+              !occupancy_may_contain(source, px, py, pz, radius)) {
+            continue;
+          }
+          const int ox = ordered_coord(floor_to_cell(px * inv_cell));
+          const int oy = ordered_coord(floor_to_cell(py * inv_cell));
+          const int oz = ordered_coord(floor_to_cell(pz * inv_cell));
+          const int neighbor = target_index[point];
+          const int x0 = std::max(ox - stencil, x_min);
+          const int x1 = std::min(ox + stencil, x_min + x_span - 1);
+          for (int tcx = x0; tcx <= x1; ++tcx) {
+            const int xb = cell_x_start[tcx - x_min];
+            const int xe = cell_x_start[tcx - x_min + 1];
+            if (xb >= xe) {
+              continue;
+            }
+            const int y0 = std::max(oy - stencil, y_min);
+            const int y1 = std::min(oy + stencil, y_max);
+            if (y0 > y1) {
+              continue;
+            }
+            const int yb = lower(xb, xe, make_key(tcx, y0, 0));
+            const int ye =
+                y1 == kMaxField ? xe : lower(xb, xe, make_key(tcx, y1 + 1, 0));
+            for (int cell = yb; cell < ye;) {
+              const int y =
+                  static_cast<int>(((keys[cell] ^ mask) >> 21) & 0x1FFFFFULL);
+              if (y > y1) {
+                break;
+              }
+              const int y_end =
+                  y == kMaxField ? ye
+                                 : lower(cell, ye, make_key(tcx, y + 1, 0));
+              const int z0 = std::max(oz - stencil, z_min);
+              const int z1 = std::min(oz + stencil, z_max);
+              if (z0 <= z1) {
+                const int zb = lower(cell, y_end, make_key(tcx, y, z0));
+                const int ze =
+                    z1 == kMaxField
+                        ? y_end
+                        : lower(zb, y_end, make_key(tcx, y, z1 + 1));
+                for (int c = zb; c < ze; ++c) {
+                  const int begin = implicit_cells ? c : cell_starts[c];
+                  const int end = implicit_cells ? c + 1 : cell_ends[c];
+                  for (int p = begin; p < end; ++p) {
+                    const std::size_t pi = static_cast<std::size_t>(p);
+                    const float dx = sx[pi] - px;
+                    const float dy = sy[pi] - py;
+                    const float dz = sz[pi] - pz;
+                    if (dx * dx + dy * dy + dz * dz <= r2) {
+                      // Rows are indexed by the source's sorted position, the
+                      // same layout the query API reads.
+                      const int position = __atomic_fetch_add(
+                          &row_counts[p], 1, __ATOMIC_RELAXED);
+                      if (position < stride) {
+                        row_values[pi * stride + position] = neighbor;
+                      }
+                    }
+                  }
+                }
+              }
+              cell = y_end;
+            }
+          }
         }
       });
   return max_row_count(counts) <= capacity;

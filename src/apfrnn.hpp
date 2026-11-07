@@ -181,6 +181,15 @@ struct NeighborSearchData {
   // cell coordinates (the comparison/counting sorts); false for the radix
   // sort, which orders by the raw packed key.
   bool cell_ranges_implicit = false;
+  // X-slab index in order-key space (raw key XOR sign mask) for grids whose
+  // sort used signed-coordinate ordering (negative coordinates are possible).
+  std::vector<int> ordered_x_start;
+  int ordered_x_min = 0;
+  int ordered_y_min = 0;
+  int ordered_y_max = 0;
+  int ordered_z_min = 0;
+  int ordered_z_max = 0;
+  bool ordered_x_valid = false;
   bool cell_keys_signed_order = false;
   // Incremental cell-order state for moving sets. `incremental_keys` is the
   // previous cell key per original index, `incremental_sorted_keys` the same
@@ -410,13 +419,25 @@ void ensure_hash_table(NeighborSearchData &data);
 // index (x slab -> y range -> z range) instead of scanning an x-window or
 // probing a hash. Returns false when a row exceeded `capacity`.
 void ensure_cell_ranges(NeighborSearchData &data);
+void ensure_ordered_cell_x(NeighborSearchData &data);
 void ensure_cell_x_index(NeighborSearchData &data);
-void ensure_occupancy(NeighborSearchData &data);
+void ensure_occupancy(NeighborSearchData &data,
+                      const Bounds *known = nullptr);
 
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
                                  int capacity, IntBuffer &fixed_neighbors,
                                  IntBuffer &counts);
+
+// Sparse target-major cross writer: iterates the (smaller) target's points
+// and searches the (larger) source's sorted-cell grid, scattering each hit
+// into the source row with an atomic row cursor. Produces the same source->
+// target pair set as write_cross_rows_cell_range; neighbor order within a row
+// is unspecified. Returns false when a row exceeds `capacity`.
+bool write_cross_rows_target_major(NeighborSearchData &source,
+                                   NeighborSearchData &target, float radius,
+                                   int capacity, IntBuffer &fixed_neighbors,
+                                   IntBuffer &counts);
 
 // Block-AABB filtered query-major writer for dense cells.
 void write_neighbors_fixed_query_blocked_parallel(NeighborSearchData &data,

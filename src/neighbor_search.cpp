@@ -636,6 +636,75 @@ void NSearch::run() {
     }
   }
 
+  // Sparse target-major cross pairs: when the target is much smaller than the
+  // source and both are sparse unique-cell sets, iterate the target's points
+  // against the source grid. This cuts per-query index overhead by the
+  // source/target size ratio while producing the same pair set.
+  {
+    const auto target_major_start = std::chrono::steady_clock::now();
+    for (int set_i = 0; set_i < set_count; ++set_i) {
+      PointSet &source = sets_[static_cast<std::size_t>(set_i)];
+      if (source.use_sweep || !source.valid) {
+        continue;
+      }
+      for (int set_j = 0; set_j < set_count; ++set_j) {
+        if (set_j == set_i) {
+          continue;
+        }
+        Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                           [static_cast<std::size_t>(set_j)];
+        PointSet &target = sets_[static_cast<std::size_t>(set_j)];
+        if (!pair.active || pair.valid) {
+          continue;
+        }
+        if (target.use_sweep || !target.valid ||
+            target.data.num_points * 2 > source.data.num_points) {
+          continue;
+        }
+        // The searched source must be a sparse cell grid with a valid
+        // order-space x-slab index. Multi-point cells are fine (their ranges
+        // are materialized); the ordered index also supports negative
+        // coordinates from jittered moving sets. Dense grids keep the
+        // query-major writer, which amortizes the search over many neighbors.
+        if (source.data.cell_stencil != 1 ||
+            source.data.num_points < 2000000 ||
+            static_cast<long long>(source.data.num_cells) * 4 <
+                static_cast<long long>(source.data.num_points)) {
+          continue;
+        }
+        ensure_ordered_cell_x(source.data);
+        ensure_occupancy(source.data, &source.bounds);
+        if (!source.data.ordered_x_valid || source.data.num_cells <= 0 ||
+            source.data.scratch_unique_keys.size() !=
+                static_cast<std::size_t>(source.data.num_cells)) {
+          continue;
+        }
+        const float radius = build_radius();
+        for (int capacity : {1, 2, 4, 8, 16, 32}) {
+          if (!write_cross_rows_target_major(source.data, target.data, radius,
+                                             capacity, pair.fixed_neighbors,
+                                             pair.fixed_counts)) {
+            continue;
+          }
+          const int max_count = max_row_count(pair.fixed_counts);
+          pair.fixed_valid = true;
+          pair.fixed_capacity = capacity;
+          pair.last_fixed_capacity =
+              plan::cross_fitted_capacity(max_count, capacity);
+          pair.skin_lists = skin_ > 0.0f;
+          pair.active_valid = false;
+          pair.cross_block_active = false;
+          pair.same_set = false;
+          pair.valid = true;
+          pair.cross.radius = radius;
+          note_path(kPathCrossTargetMajor);
+          break;
+        }
+      }
+    }
+    last_stats_.cross_set_ms += elapsed_ms(target_major_start);
+  }
+
   auto build_cpu_pair = [&](Pair &pair, int set_i, int set_j) {
     if (set_i == set_j) {
       build_same_pair(pair, set_i);
