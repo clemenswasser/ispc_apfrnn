@@ -1223,6 +1223,10 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     }
   }
 
+  // Any writer below reads the source's sorted coordinates directly.
+  if (!source.data.sorted_coords_valid) {
+    ensure_sorted_coords(source.data);
+  }
   const bool sparse_target =
       target.data.num_points > 0 && !target.data.dense_valid;
   const bool short_target_window =
@@ -1735,7 +1739,8 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   Bounds world;
   const bool inverse_written = build_point_grid_inplace(
       point_set.data, point_set.x, point_set.y, point_set.z, grid_radius,
-      cell_radius, interleaved, &world, &point_set.original_to_sorted);
+      cell_radius, interleaved, &world, &point_set.original_to_sorted,
+      lazy_sorted_coords(point_set));
   if (!world.empty()) {
     point_set.bounds = world;
   }
@@ -1750,6 +1755,40 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
 
 void NSearch::set_memory_budget(int64_t bytes) {
   memory_budget_ = std::max<int64_t>(0, bytes);
+}
+
+bool NSearch::lazy_sorted_coords(const PointSet &point_set) const {
+  if (effective_backend_ != SearchBackend::CpuExact || skin_ > 0.0f) {
+    return false;
+  }
+  if (point_set.source_type != SourceType::Float ||
+      point_set.source == nullptr || point_set.data.dense_valid) {
+    return false;
+  }
+  const int set =
+      static_cast<int>(&point_set - sets_.data());
+  if (set < 0 || set >= static_cast<int>(sets_.size())) {
+    return false;
+  }
+  bool is_source = false;
+  bool is_cross_target = false;
+  const int set_count = static_cast<int>(sets_.size());
+  for (int i = 0; i < set_count; ++i) {
+    for (int j = 0; j < set_count; ++j) {
+      if (!pairs_[static_cast<std::size_t>(i)]
+                 [static_cast<std::size_t>(j)]
+                     .active) {
+        continue;
+      }
+      if (i == set) {
+        is_source = true;
+      }
+      if (j == set && i != set) {
+        is_cross_target = true;
+      }
+    }
+  }
+  return is_source && !is_cross_target;
 }
 
 void NSearch::build_point_grid(int set) {
@@ -1815,7 +1854,8 @@ void NSearch::build_point_grid(int set) {
   Bounds world;
   const bool inverse_written = build_point_grid_inplace(
       point_set.data, point_set.x, point_set.y, point_set.z, grid_radius,
-      cell_radius, interleaved, &world, &point_set.original_to_sorted);
+      cell_radius, interleaved, &world, &point_set.original_to_sorted,
+      lazy_sorted_coords(point_set));
   if (!world.empty()) {
     point_set.bounds = world;
   }
@@ -1929,6 +1969,9 @@ void NSearch::build_grid_same_lists(int set) {
       note_path(kPathSameQueryOct);
       return;
     }
+  }
+  if (!data.sorted_coords_valid) {
+    ensure_sorted_coords(data);
   }
   if (data.cell_ranges_implicit) {
     ensure_cell_ranges(data);

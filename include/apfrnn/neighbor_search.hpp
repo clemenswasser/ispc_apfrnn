@@ -173,6 +173,9 @@ private:
   struct GpuState;
 
   bool valid_set(int set) const;
+  // True when this grid set is only ever a source (never a cross target) and
+  // is not dense, so its sorted coordinates can stay lazy.
+  bool lazy_sorted_coords(const PointSet &point_set) const;
   // True when this run skipped a position copy for a large moving source; the
   // per-frame block-layout scan assumes a static scene and must not run.
   bool skipped_position_sync_ = false;

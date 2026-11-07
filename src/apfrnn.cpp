@@ -791,7 +791,8 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
                                     const std::vector<float> &z,
                                     float inv_radius,
                                     const float *interleaved,
-                                    Bounds *world_out) {
+                                    Bounds *world_out,
+                                    bool skip_sorted_coords) {
   const int num_points = static_cast<int>(x.size());
   if (!data.incremental_valid || num_points == 0 ||
       data.incremental_points != num_points ||
@@ -1033,7 +1034,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
 
   // Independent random reads, eight or more in flight per thread; inside
   // the branchy merge each gather sat on the merge's critical path.
-  {
+  auto gather_coords = [&]() {
     tbb::parallel_for(
         tbb::blocked_range<int>(0, num_points, 4096),
         [&](const tbb::blocked_range<int> &range) {
@@ -1053,7 +1054,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
             }
           }
         });
-  }
+  };
 
   // Cell ranges from the merged key order. Position 0 and every key change
   // starts a cell; chunks count locally, a short prefix assigns cell ids.
@@ -1078,6 +1079,13 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
       }
     }
   }
+  // Lazy coordinates: a source-only unique-cell set keeps the caller's
+  // interleaved buffer as the source of truth and gathers on demand.
+  const bool lazy_coords = skip_sorted_coords && all_unique;
+  if (!lazy_coords) {
+    gather_coords();
+  }
+  data.sorted_coords_valid = !lazy_coords;
   if (all_unique) {
     data.incremental_starts.clear();
     data.incremental_ends.clear();
@@ -2096,8 +2104,10 @@ bool build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &y,
                               const std::vector<float> &z, float radius,
                               float cell_radius, const float *interleaved,
-                              Bounds *world_bounds, IntBuffer *inverse_out) {
+                              Bounds *world_bounds, IntBuffer *inverse_out,
+                              bool skip_sorted_coords) {
   data.num_points = static_cast<int>(x.size());
+  data.interleaved_source = interleaved;
   data.radius = radius;
   data.cell_radius = cell_radius > 0.0f ? cell_radius : radius;
   // A zero (or invalid) radius has no meaningful ratio; one ring of cells
@@ -2190,7 +2200,8 @@ bool build_point_grid_inplace(NeighborSearchData &data,
 
   float inv_radius = 1.0f / data.cell_radius;
   const bool incremental = try_incremental_sort_point_set(
-      data, x, y, z, inv_radius, interleaved, world_bounds);
+      data, x, y, z, inv_radius, interleaved, world_bounds,
+      skip_sorted_coords);
   bool inverse_written = false;
   if (!incremental) {
     CellBounds bounds;
@@ -2298,6 +2309,31 @@ bool build_point_grid_inplace(NeighborSearchData &data,
   }
   build_dense_range_cache(data);
   return inverse_written;
+}
+
+void ensure_sorted_coords(NeighborSearchData &data) {
+  if (data.sorted_coords_valid || data.interleaved_source == nullptr ||
+      data.sorted_x.size() != static_cast<std::size_t>(data.num_points) ||
+      data.original_index.size() != static_cast<std::size_t>(data.num_points)) {
+    return;
+  }
+  const int n = data.num_points;
+  const float *src = data.interleaved_source;
+  const int *order = data.original_index.data();
+  float *sx = data.sorted_x.data();
+  float *sy = data.sorted_y.data();
+  float *sz = data.sorted_z.data();
+  tbb::parallel_for(tbb::blocked_range<int>(0, n, 4096),
+                    [&](const tbb::blocked_range<int> &range) {
+                      for (int i = range.begin(); i < range.end(); ++i) {
+                        const float *q = src + 3 * static_cast<std::size_t>(
+                                                   order[i]);
+                        sx[i] = q[0];
+                        sy[i] = q[1];
+                        sz[i] = q[2];
+                      }
+                    });
+  data.sorted_coords_valid = true;
 }
 
 void ensure_point_blocks(NeighborSearchData &data) {
@@ -2667,6 +2703,7 @@ void count_same_set_neighbors_inplace(NeighborSearchData &data) {
 
 void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,
                                            float radius) {
+  ensure_sorted_coords(data);
   ensure_cell_ranges(data);
   data.radius = radius;
   if (data.num_points == 0) {
@@ -2824,7 +2861,25 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
   const float r2 = data.radius * data.radius;
   int *row_counts = counts.data();
   int *row_values = fixed_neighbors.data();
-  // The counting and comparison sorts order cells by signed coordinates; the
+  // A lazy sparse build keeps the caller's interleaved buffer as the source
+  // of truth; gather the few coordinates the exact tests need.
+  const bool coords_valid = data.sorted_coords_valid;
+  const float *interleaved = data.interleaved_source;
+  auto coord_at = [&](int p, float &x_, float &y_, float &z_) {
+    if (coords_valid || interleaved == nullptr) {
+      x_ = sx[p];
+      y_ = sy[p];
+      z_ = sz[p];
+    } else {
+      const float *q =
+          interleaved + 3 * static_cast<std::size_t>(original[p]);
+      x_ = q[0];
+      y_ = q[1];
+      z_ = q[2];
+    }
+  };
+  // The counting and comparison sorts order cells by signed coordinates;
+  // the
   // radix sort orders the raw packed keys. Flip the sign bit of every field
   // for the former so lower_bound sees the order the array was built with.
   const bool signed_order = data.cell_keys_signed_order;
@@ -2862,9 +2917,17 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
     if (other == query) {
       return;
     }
-    const float dx = sx[other] - sx[query];
-    const float dy = sy[other] - sy[query];
-    const float dz = sz[other] - sz[query];
+    float ox;
+    float oy;
+    float oz;
+    float qx_;
+    float qy_;
+    float qz_;
+    coord_at(other, ox, oy, oz);
+    coord_at(query, qx_, qy_, qz_);
+    const float dx = ox - qx_;
+    const float dy = oy - qy_;
+    const float dz = oz - qz_;
     if (dx * dx + dy * dy + dz * dz <= r2) {
       append(query, original[other]);
       append(other, original[query]);
@@ -3151,6 +3214,7 @@ void ensure_cell_x_index(NeighborSearchData &data) {
   if (data.cell_x_valid) {
     return;
   }
+  ensure_sorted_coords(data);
   const int num_cells = data.num_cells;
   if (num_cells <= 0) {
     data.cell_x_start.clear();
@@ -3201,6 +3265,7 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   if (data.occupancy_valid) {
     return;
   }
+  ensure_sorted_coords(data);
   const int num_points = data.num_points;
   if (num_points <= 0 || !(data.cell_radius > 0.0f) ||
       data.sorted_x.size() != static_cast<std::size_t>(num_points)) {
@@ -3619,6 +3684,10 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
   const float *qx = source.sorted_x.data();
   const float *qy = source.sorted_y.data();
   const float *qz = source.sorted_z.data();
+  // Lazy source coordinates: gather per query from the interleaved buffer.
+  const bool q_gather =
+      !source.sorted_coords_valid && source.interleaved_source != nullptr;
+  const int *q_order = source.original_index.data();
   const int *cell_x_start = target.cell_x_start.data();
   const int x_min = target.cell_x_min;
   const int x_span = static_cast<int>(target.cell_x_start.size()) - 1;
@@ -3654,9 +3723,20 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
         task_touched.reserve(16);
         int task_max = 0;
         for (int point = range.begin(); point < range.end(); ++point) {
-          const float px = qx[point];
-          const float py = qy[point];
-          const float pz = qz[point];
+          float px;
+          float py;
+          float pz;
+          if (q_gather) {
+            const float *q = source.interleaved_source +
+                             3 * static_cast<std::size_t>(q_order[point]);
+            px = q[0];
+            py = q[1];
+            pz = q[2];
+          } else {
+            px = qx[point];
+            py = qy[point];
+            pz = qz[point];
+          }
           if (target.occupancy_valid &&
               !occupancy_may_contain(target, px, py, pz, radius)) {
             continue;
@@ -4062,6 +4142,7 @@ void build_cross_cell_ranges_from_sorted_inplace(
 void build_cross_neighbor_search_data_from_sorted_inplace(
     CrossNeighborSearchData &data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, float radius) {
+  ensure_sorted_coords(const_cast<NeighborSearchData &>(source_data));
   use_own_ranges(data);
   data.num_points = source_data.num_points;
   data.radius = radius;

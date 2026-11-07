@@ -176,6 +176,11 @@ struct NeighborSearchData {
   bool hash_valid = false;
   std::vector<SortPointKey> scratch_point_keys;
   std::vector<SortPointKey> scratch_point_keys_alt;
+  // Sparse sources can skip materializing sorted_x/y/z (their writers gather
+  // from the caller's interleaved buffer via original_index instead); the
+  // pointer is remembered so any on-demand materialization can rebuild them.
+  const float *interleaved_source = nullptr;
+  bool sorted_coords_valid = true;
   // Compact 64-bit cell keys for the dense counting-sort path (the original
   // index is the array position, so the per-point index field is not stored).
   std::vector<uint64_t> dense_keys;
@@ -359,6 +364,10 @@ struct CrossNeighborSearchData {
 // Builds blocks lazily for a cross-set target when the source is dense.
 void ensure_point_blocks(NeighborSearchData &data);
 
+// Rebuilds sorted_x/y/z from the remembered interleaved source when a lazy
+// sparse build skipped them and a reader needs the materialized order.
+void ensure_sorted_coords(NeighborSearchData &data);
+
 // Builds only the cell grid, sorted order, unique cell keys, and hash table.
 // Same-set cell ranges and neighbor rows are left empty. This is enough for a
 // point set that is only used as a cross-search target.
@@ -374,7 +383,8 @@ bool build_point_grid_inplace(NeighborSearchData &data,
                               float cell_radius = 0.0f,
                               const float *interleaved = nullptr,
                               Bounds *world_bounds = nullptr,
-                              IntBuffer *inverse_out = nullptr);
+                              IntBuffer *inverse_out = nullptr,
+                              bool skip_sorted_coords = false);
 
 // Builds the same-set neighbor-cell ranges using the grid produced by
 // build_point_grid_inplace().
