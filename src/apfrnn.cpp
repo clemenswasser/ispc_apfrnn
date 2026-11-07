@@ -3246,12 +3246,14 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   const float extent_y = box.max_y - box.min_y;
   const float extent_z = box.max_z - box.min_z;
   const float longest = std::max(extent_x, std::max(extent_y, extent_z));
-  // Size the bitmap to the target (~8 bits per point, capped at 16 MiB), not
-  // to a fixed 500^3 grid. A 2M-target boundary gets a 2 MiB bitmap and a
-  // 200k emitter gets ~200 KiB, so both culling lookups stay in cache.
+  // Size the bitmap to the target (~64 blocks per point, capped at 16 MiB),
+  // not to a fixed 500^3 grid. That keeps the expected occupancy of a block
+  // near 1.5%, so a query's radius-2 sphere is culled unless a target point
+  // really is nearby (the coarser 8-bits-per-point grid passed ~12% of
+  // queries and rescanned target cells for almost all of them).
   constexpr std::size_t kMaxBits = std::size_t{1} << 27;
   const std::size_t target_bits = std::min(
-      kMaxBits, std::max<std::size_t>(1024, 8 * static_cast<std::size_t>(num_points)));
+      kMaxBits, std::max<std::size_t>(1024, 64 * static_cast<std::size_t>(num_points)));
   int axis = std::max(
       1, static_cast<int>(std::cbrt(static_cast<double>(target_bits))));
   float block = std::max(2.0f * data.cell_radius, longest / axis);
