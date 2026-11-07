@@ -1620,6 +1620,7 @@ void NSearch::build_point_grid(int set) {
     data.hash_mask = 0;
     data.hash_valid = false;
     data.dense_valid = false;
+    data.cell_ranges_implicit = false;
     data.row_ptr.push_back(0);
     data.original_index.resize(static_cast<std::size_t>(num_points));
     std::iota(data.original_index.begin(), data.original_index.end(), 0);
@@ -1730,6 +1731,9 @@ void NSearch::build_grid_same_lists(int set) {
       note_path(kPathSameQueryOct);
       return;
     }
+  }
+  if (data.cell_ranges_implicit) {
+    ensure_cell_ranges(data);
   }
   if (point_set.block_rows) {
     if (block_rows_ok && build_same_block_rows(set)) {

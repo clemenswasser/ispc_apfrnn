@@ -180,6 +180,7 @@ struct NeighborSearchData {
   // True when cell_starts/cell_ends/scratch_unique_keys are ordered by signed
   // cell coordinates (the comparison/counting sorts); false for the radix
   // sort, which orders by the raw packed key.
+  bool cell_ranges_implicit = false;
   bool cell_keys_signed_order = false;
   // Incremental cell-order state for moving sets. `incremental_keys` is the
   // previous cell key per original index, `incremental_sorted_keys` the same
@@ -407,6 +408,7 @@ void ensure_hash_table(NeighborSearchData &data);
 // coordinates. The target's sorted cell keys are searched as a log-time range
 // index (x slab -> y range -> z range) instead of scanning an x-window or
 // probing a hash. Returns false when a row exceeded `capacity`.
+void ensure_cell_ranges(NeighborSearchData &data);
 void ensure_cell_x_index(NeighborSearchData &data);
 void ensure_occupancy(NeighborSearchData &data);
 

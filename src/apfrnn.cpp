@@ -843,18 +843,8 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
     all_unique &= duplicate == 0;
   }
   if (all_unique) {
-    data.incremental_starts.resize(static_cast<std::size_t>(num_points));
-    data.incremental_ends.resize(static_cast<std::size_t>(num_points));
-    int *starts = data.incremental_starts.data();
-    int *ends = data.incremental_ends.data();
-    tbb::parallel_for(0, chunks, [&](int chunk) {
-      const int begin = chunk * kRangeGrain;
-      const int end = std::min(num_points, begin + kRangeGrain);
-      for (int i = begin; i < end; ++i) {
-        starts[i] = i;
-        ends[i] = i + 1;
-      }
-    });
+    data.incremental_starts.clear();
+    data.incremental_ends.clear();
     data.sorted_x.swap(data.incremental_x);
     data.sorted_y.swap(data.incremental_y);
     data.sorted_z.swap(data.incremental_z);
@@ -863,6 +853,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
     data.cell_ends.swap(data.incremental_ends);
     data.scratch_unique_keys.swap(data.incremental_merge_keys);
     data.incremental_keys_are_unique = true;
+    data.cell_ranges_implicit = true;
     data.cell_keys_signed_order = signed_order;
     return true;
   }
@@ -1041,6 +1032,9 @@ inline void build_dense_cell_lookup(NeighborSearchData &data) {
   }
 
   const int64_t total_cells = nx * ny * nz;
+  if (data.cell_ranges_implicit) {
+    ensure_cell_ranges(data);
+  }
   data.dense_cells.assign(static_cast<std::size_t>(total_cells), -1);
   data.dense_nx = static_cast<int>(nx);
   data.dense_ny = static_cast<int>(ny);
@@ -1312,6 +1306,7 @@ collect_neighbor_cells_for_target(int num_cells,
     return;
   }
 
+  ensure_cell_ranges(const_cast<NeighborSearchData &>(target));
   ensure_hash_table(const_cast<NeighborSearchData &>(target));
   if (target.dense_valid) {
     tbb::parallel_for(
@@ -1341,6 +1336,7 @@ template <typename Data>
 inline void build_dense_stencil9_ranges_impl(
     Data &data, const std::vector<uint64_t> &query_keys,
     const NeighborSearchData &target) {
+  ensure_cell_ranges(const_cast<NeighborSearchData &>(target));
   use_own_ranges(data);
   const int num_cells = data.num_cells;
   data.cell_num_neighbors.assign(static_cast<std::size_t>(num_cells), 9);
@@ -1422,6 +1418,7 @@ inline void build_cross_hash_stencil_ranges_impl(
     CrossNeighborSearchData &data,
     const std::vector<uint64_t> &source_unique_keys,
     const NeighborSearchData &target_data) {
+  ensure_cell_ranges(const_cast<NeighborSearchData &>(target_data));
   ensure_hash_table(const_cast<NeighborSearchData &>(target_data));
   use_own_ranges(data);
   const int num_cells = data.num_cells;
@@ -1452,6 +1449,7 @@ inline void build_cross_cell_ranges_from_sorted_impl(
     CrossNeighborSearchData &data,
     const std::vector<uint64_t> &source_unique_keys,
     const NeighborSearchData &target_data, float radius) {
+  ensure_cell_ranges(const_cast<NeighborSearchData &>(target_data));
   use_own_ranges(data);
   const int num_cells = data.num_cells;
   data.radius = radius;
@@ -1863,6 +1861,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
   // The cell-x slab index and occupancy describe the previous sorted order.
   data.cell_x_valid = false;
   data.occupancy_valid = false;
+  data.cell_ranges_implicit = false;
   // Blocks and their cell bounds describe the previous sorted order.
   data.blocks_valid = false;
   data.block_begin.clear();
@@ -1959,7 +1958,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
 
   const std::size_t num_cells_size = data.cell_starts.size();
   const bool keep_ranges =
-      data.cached_range_valid &&
+      !data.cell_ranges_implicit && data.cached_range_valid &&
       data.cached_range_stencil == data.cell_stencil &&
       data.cached_range_stride == data.max_neighbor_cells &&
       data.cached_range_cell_starts == data.cell_starts &&
@@ -1971,7 +1970,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
       data.cell_neighbor_ends.size() ==
           static_cast<std::size_t>(data.cached_range_total);
   const bool keep_dense_stencil =
-      data.dense_stencil_cache_valid &&
+      !data.cell_ranges_implicit && data.dense_stencil_cache_valid &&
       data.dense_stencil_keys == unique_keys &&
       data.dense_stencil_cell_starts == data.cell_starts &&
       data.dense_stencil_cell_ends == data.cell_ends &&
@@ -1994,15 +1993,20 @@ void build_point_grid_inplace(NeighborSearchData &data,
     data.dense_stencil_cache_valid = false;
   }
 
-  int num_cells = static_cast<int>(data.cell_starts.size());
+  int num_cells = data.cell_ranges_implicit
+                      ? data.num_points
+                      : static_cast<int>(data.cell_starts.size());
   data.num_cells = num_cells;
   build_dense_cell_lookup(data);
-  int max_cell_points = 0;
-  for (int cell = 0; cell < num_cells; ++cell) {
-    max_cell_points = std::max(
-        max_cell_points,
-        data.cell_ends[static_cast<std::size_t>(cell)] -
-            data.cell_starts[static_cast<std::size_t>(cell)]);
+  int max_cell_points = 1;
+  if (!data.cell_ranges_implicit) {
+    max_cell_points = 0;
+    for (int cell = 0; cell < num_cells; ++cell) {
+      max_cell_points = std::max(
+          max_cell_points,
+          data.cell_ends[static_cast<std::size_t>(cell)] -
+              data.cell_starts[static_cast<std::size_t>(cell)]);
+    }
   }
   data.max_cell_points = max_cell_points;
   if (!incremental) {
@@ -2041,6 +2045,7 @@ void ensure_point_blocks(NeighborSearchData &data) {
 }
 
 static void build_same_set_candidate_cells_inplace(NeighborSearchData &data) {
+  ensure_cell_ranges(data);
   if (data.num_points == 0) {
     data.scratch_cached_neighbor_cells.clear();
     data.scratch_cached_neighbor_counts.clear();
@@ -2107,6 +2112,7 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
       data.dense_nz <= 0) {
     return;
   }
+  ensure_cell_ranges(data);
   // One extra ring lets a source cell just outside the target AABB see its
   // target neighbors.
   const int nx = data.dense_nx + 2;
@@ -2186,6 +2192,7 @@ inline int find_cell_index_cpp(const NeighborSearchData &data,
 // every cell's merged runs into fixed slots, instead of collecting the 27
 // neighbor cells and merging them in a count pass, a scan and a write pass.
 static void build_hash_stencil_ranges(NeighborSearchData &data) {
+  ensure_cell_ranges(data);
   ensure_hash_table(data);
   const int num_cells = data.num_cells;
   const bool reuse =
@@ -2221,6 +2228,7 @@ static void build_hash_stencil_ranges(NeighborSearchData &data) {
 }
 
 void build_same_set_cell_ranges_inplace(NeighborSearchData &data) {
+  ensure_cell_ranges(data);
   use_own_ranges(data);
   data.dense_stencil_cache_valid = false;
   if (data.num_points == 0) {
@@ -2396,6 +2404,7 @@ void count_same_set_neighbors_inplace(NeighborSearchData &data) {
 
 void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,
                                            float radius) {
+  ensure_cell_ranges(data);
   data.radius = radius;
   if (data.num_points == 0) {
     data.cell_neighbor_offset.clear();
@@ -2521,8 +2530,13 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
   }
   std::fill(counts.begin(), counts.end(), 0);
   const int num_cells = data.num_cells;
+  const bool implicit_cells = data.cell_ranges_implicit;
   const uint64_t *keys = data.scratch_unique_keys.data();
-  const int *cell_starts = data.cell_starts.data();
+  const int *cell_starts = implicit_cells ? nullptr
+                                          : data.cell_starts.data();
+  auto cell_point = [&](int cell) {
+    return implicit_cells ? cell : cell_starts[cell];
+  };
   const float *sx = data.sorted_x.data();
   const float *sy = data.sorted_y.data();
   const float *sz = data.sorted_z.data();
@@ -2554,7 +2568,7 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
     }
   };
   auto test_cell = [&](int query, int other_cell) {
-    const int other = cell_starts[other_cell];
+    const int other = cell_point(other_cell);
     if (other == query) {
       return;
     }
@@ -2591,7 +2605,7 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
           cursor[k] = lower_bound_key(last[k]);
         }
         for (int cell = begin; cell < end; ++cell) {
-          const int query = cell_starts[cell];
+          const int query = cell_point(cell);
           const uint64_t key = keys[cell];
           const int cx = unpack_coord(key, 42);
           const int cy = unpack_coord(key, 21);
@@ -2679,6 +2693,25 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
 // Builds the cell-x slab index and the cell y/z bounds. The cell keys must be
 // in lexicographic (x, y, z) order with non-negative coordinates; callers gate
 // on that, so raw key order is also coordinate order.
+void ensure_cell_ranges(NeighborSearchData &data) {
+  if (!data.cell_ranges_implicit) {
+    return;
+  }
+  const int count = data.num_points;
+  data.cell_starts.resize(static_cast<std::size_t>(count));
+  data.cell_ends.resize(static_cast<std::size_t>(count));
+  int *starts = data.cell_starts.data();
+  int *ends = data.cell_ends.data();
+  tbb::parallel_for(tbb::blocked_range<int>(0, count, 16384),
+                    [&](const tbb::blocked_range<int> &range) {
+                      for (int i = range.begin(); i < range.end(); ++i) {
+                        starts[i] = i;
+                        ends[i] = i + 1;
+                      }
+                    });
+  data.cell_ranges_implicit = false;
+}
+
 void ensure_cell_x_index(NeighborSearchData &data) {
   if (data.cell_x_valid) {
     return;
@@ -2891,6 +2924,7 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  int capacity, IntBuffer &fixed_neighbors,
                                  IntBuffer &counts) {
   ensure_cell_x_index(target);
+  ensure_cell_ranges(target);
   if (!target.cell_x_valid || target.num_cells <= 0) {
     return false;
   }
@@ -3311,6 +3345,7 @@ void write_same_set_listed_rows(NeighborSearchData &data,
 }
 
 void write_neighbors_parallel(NeighborSearchData &data) {
+  ensure_cell_ranges(data);
   if (data.num_points == 0) {
     return;
   }
