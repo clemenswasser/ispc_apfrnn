@@ -325,7 +325,7 @@ bool NSearch::valid_set(int set) const {
   return set >= 0 && set < static_cast<int>(sets_.size());
 }
 
-float NSearch::sync_source(int set_index) {
+float NSearch::sync_source(int set_index, bool skip_positions) {
   PointSet &set = sets_[static_cast<std::size_t>(set_index)];
   const int n = set.source_count;
   const bool comparable =
@@ -344,6 +344,20 @@ float NSearch::sync_source(int set_index) {
     return max_distance_sq;
   }
 
+  if (skip_positions) {
+    // Grid builds read the caller's interleaved buffer directly, so the SoA
+    // copy is not needed. Keep the vectors sized for the API's index checks;
+    // the exact bounds are computed in the grid key pass.
+    if (set.x.size() != static_cast<std::size_t>(n)) {
+      set.x.resize(static_cast<std::size_t>(n));
+      set.y.resize(static_cast<std::size_t>(n));
+      set.z.resize(static_cast<std::size_t>(n));
+    }
+    set.bounds = Bounds{};
+    set.sweep.valid = false;
+    set.sweep_decision_valid = false;
+    return std::numeric_limits<float>::infinity();
+  }
   if (!comparable) {
     set.x.resize(static_cast<std::size_t>(n));
     set.y.resize(static_cast<std::size_t>(n));
@@ -520,6 +534,7 @@ const char *NSearch::path_name(uint64_t path) {
 
 void NSearch::run() {
   last_stats_ = RunStats{};
+  skipped_position_sync_ = false;
   path_bits_.store(0, std::memory_order_relaxed);
   if (sets_.empty()) {
     return;
@@ -935,7 +950,19 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     if (point_set.is_static) {
       continue;
     }
-    const float max_distance_sq = sync_source(set);
+    // Large moving float source sets always build a grid (the sweep path is
+    // disabled at this size), so the per-frame SoA copy is redundant: the key
+    // pass reads the caller's interleaved buffer and computes the AABB.
+    const bool skip_positions =
+        search_backend_ == SearchBackend::CpuExact && skin_ <= 0.0f &&
+        is_source[static_cast<std::size_t>(set)] &&
+        point_set.source_type == SourceType::Float &&
+        point_set.source != nullptr && point_set.source_count >= 1000000 &&
+        !point_set.is_static;
+    if (skip_positions) {
+      skipped_position_sync_ = true;
+    }
+    const float max_distance_sq = sync_source(set, skip_positions);
     if (max_distance_sq > 0.0f) {
       // The packed GPU copy and the cached grid are stale once any point
       // moved. A static frame keeps both across runs.
@@ -1677,8 +1704,17 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   point_set.data.incremental_valid = false;
   const float grid_radius = build_radius();
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;
+  const float *interleaved =
+      point_set.source_type == SourceType::Float && point_set.source != nullptr
+          ? static_cast<const float *>(point_set.source)
+          : nullptr;
+  Bounds world;
   build_point_grid_inplace(point_set.data, point_set.x, point_set.y,
-                           point_set.z, grid_radius, cell_radius);
+                           point_set.z, grid_radius, cell_radius, interleaved,
+                           &world);
+  if (!world.empty()) {
+    point_set.bounds = world;
+  }
   update_sorted_mapping(point_set.data, point_set.original_to_sorted);
   point_set.valid = true;
   point_set.same_lists_valid = false;
@@ -1746,8 +1782,17 @@ void NSearch::build_point_grid(int set) {
   point_set.sweep.clear();
   const float grid_radius = build_radius();
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;
+  const float *interleaved =
+      point_set.source_type == SourceType::Float && point_set.source != nullptr
+          ? static_cast<const float *>(point_set.source)
+          : nullptr;
+  Bounds world;
   build_point_grid_inplace(point_set.data, point_set.x, point_set.y,
-                           point_set.z, grid_radius, cell_radius);
+                           point_set.z, grid_radius, cell_radius, interleaved,
+                           &world);
+  if (!world.empty()) {
+    point_set.bounds = world;
+  }
   update_sorted_mapping(point_set.data, point_set.original_to_sorted);
   point_set.valid = true;
   ++point_set.grid_generation;
@@ -2468,8 +2513,9 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   // cannot be reused and the scan would only add work. An infinite distance is
   // the first sync (no previous coordinates), not observed motion, so a static
   // scene can still build its layout on the first frame.
-  if (std::isfinite(last_stats_.max_displacement_sq) &&
-      last_stats_.max_displacement_sq > 0.0f) {
+  if (skipped_position_sync_ ||
+      (std::isfinite(last_stats_.max_displacement_sq) &&
+       last_stats_.max_displacement_sq > 0.0f)) {
     pair.cross_block_valid = false;
     return false;
   }

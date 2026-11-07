@@ -348,11 +348,16 @@ void ensure_point_blocks(NeighborSearchData &data);
 // Builds only the cell grid, sorted order, unique cell keys, and hash table.
 // Same-set cell ranges and neighbor rows are left empty. This is enough for a
 // point set that is only used as a cross-search target.
+// `interleaved` (optional) points at the caller's packed xyz array; when set,
+// the build reads positions directly from it instead of the SoA x/y/z copies,
+// and `world_bounds` receives the exact float AABB computed in the key pass.
 void build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &x,
                               const std::vector<float> &y,
                               const std::vector<float> &z, float radius,
-                              float cell_radius = 0.0f);
+                              float cell_radius = 0.0f,
+                              const float *interleaved = nullptr,
+                              Bounds *world_bounds = nullptr);
 
 // Builds the same-set neighbor-cell ranges using the grid produced by
 // build_point_grid_inplace().

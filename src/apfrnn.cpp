@@ -265,6 +265,7 @@ struct CellBounds {
   int max_cx = INT_MIN;
   int max_cy = INT_MIN;
   int max_cz = INT_MIN;
+  Bounds world;
 };
 
 inline void sort_point_set(
@@ -275,28 +276,39 @@ inline void sort_point_set(
     std::vector<SortPointKey> &point_keys,
     std::vector<SortPointKey> &point_keys_alt,
     std::vector<uint64_t> &unique_keys, bool &signed_order,
-    CellBounds *bounds_out) {
+    CellBounds *bounds_out, const float *interleaved) {
   int const num_points = static_cast<int>(x.size());
   point_keys.resize(num_points);
   const CellBounds bounds = tbb::parallel_reduce(
       tbb::blocked_range<int>(0, num_points, 2048), CellBounds{},
       [&](const tbb::blocked_range<int> &range, CellBounds acc) {
         for (int i = range.begin(); i < range.end(); ++i) {
-          const int cx = floor_to_cell(x[static_cast<std::size_t>(i)] *
-                                       inv_radius);
-          const int cy = floor_to_cell(y[static_cast<std::size_t>(i)] *
-                                       inv_radius);
-          const int cz = floor_to_cell(z[static_cast<std::size_t>(i)] *
-                                       inv_radius);
-          point_keys[static_cast<std::size_t>(i)].key =
-              make_key(cx, cy, cz);
-          point_keys[static_cast<std::size_t>(i)].index = i;
+          const std::size_t at = static_cast<std::size_t>(i);
+          float gx;
+          float gy;
+          float gz;
+          if (interleaved != nullptr) {
+            const float *q = interleaved + 3 * at;
+            gx = q[0];
+            gy = q[1];
+            gz = q[2];
+          } else {
+            gx = x[at];
+            gy = y[at];
+            gz = z[at];
+          }
+          const int cx = floor_to_cell(gx * inv_radius);
+          const int cy = floor_to_cell(gy * inv_radius);
+          const int cz = floor_to_cell(gz * inv_radius);
+          point_keys[at].key = make_key(cx, cy, cz);
+          point_keys[at].index = i;
           acc.min_cx = std::min(acc.min_cx, cx);
           acc.min_cy = std::min(acc.min_cy, cy);
           acc.min_cz = std::min(acc.min_cz, cz);
           acc.max_cx = std::max(acc.max_cx, cx);
           acc.max_cy = std::max(acc.max_cy, cy);
           acc.max_cz = std::max(acc.max_cz, cz);
+          acc.world.add(gx, gy, gz);
         }
         return acc;
       },
@@ -307,6 +319,7 @@ inline void sort_point_set(
         a.max_cx = std::max(a.max_cx, b.max_cx);
         a.max_cy = std::max(a.max_cy, b.max_cy);
         a.max_cz = std::max(a.max_cz, b.max_cz);
+        a.world.add(b.world);
         return a;
       });
   if (bounds_out != nullptr) {
@@ -455,12 +468,19 @@ inline void sort_point_set(
             const int position = __atomic_fetch_add(
                 &offsets[static_cast<std::size_t>(cell)], 1,
                 __ATOMIC_RELAXED);
-            sorted_x[static_cast<std::size_t>(position)] =
-                x[static_cast<std::size_t>(i)];
-            sorted_y[static_cast<std::size_t>(position)] =
-                y[static_cast<std::size_t>(i)];
-            sorted_z[static_cast<std::size_t>(position)] =
-                z[static_cast<std::size_t>(i)];
+            if (interleaved != nullptr) {
+              const float *q = interleaved + 3 * static_cast<std::size_t>(i);
+              sorted_x[static_cast<std::size_t>(position)] = q[0];
+              sorted_y[static_cast<std::size_t>(position)] = q[1];
+              sorted_z[static_cast<std::size_t>(position)] = q[2];
+            } else {
+              sorted_x[static_cast<std::size_t>(position)] =
+                  x[static_cast<std::size_t>(i)];
+              sorted_y[static_cast<std::size_t>(position)] =
+                  y[static_cast<std::size_t>(i)];
+              sorted_z[static_cast<std::size_t>(position)] =
+                  z[static_cast<std::size_t>(i)];
+            }
             original_index[static_cast<std::size_t>(position)] = i;
           }
         });
@@ -536,10 +556,17 @@ inline void sort_point_set(
   original_index.resize(num_points);
 
   tbb::parallel_for(0, num_points, [&](int i) {
-    int idx = point_keys[i].index;
-    sorted_x[i] = x[idx];
-    sorted_y[i] = y[idx];
-    sorted_z[i] = z[idx];
+    const int idx = point_keys[i].index;
+    if (interleaved != nullptr) {
+      const float *q = interleaved + 3 * static_cast<std::size_t>(idx);
+      sorted_x[i] = q[0];
+      sorted_y[i] = q[1];
+      sorted_z[i] = q[2];
+    } else {
+      sorted_x[i] = x[static_cast<std::size_t>(idx)];
+      sorted_y[i] = y[static_cast<std::size_t>(idx)];
+      sorted_z[i] = z[static_cast<std::size_t>(idx)];
+    }
     original_index[i] = idx;
   });
 
@@ -693,7 +720,9 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
                                     const std::vector<float> &x,
                                     const std::vector<float> &y,
                                     const std::vector<float> &z,
-                                    float inv_radius) {
+                                    float inv_radius,
+                                    const float *interleaved,
+                                    Bounds *world_out) {
   const int num_points = static_cast<int>(x.size());
   if (!data.incremental_valid || num_points == 0 ||
       data.incremental_points != num_points ||
@@ -719,9 +748,22 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
       [&](const tbb::blocked_range<int> &range, KeyPass acc) {
         for (int i = range.begin(); i < range.end(); ++i) {
           const std::size_t at = static_cast<std::size_t>(i);
-          const int cx = floor_to_cell(x[at] * inv_radius);
-          const int cy = floor_to_cell(y[at] * inv_radius);
-          const int cz = floor_to_cell(z[at] * inv_radius);
+          float gx;
+          float gy;
+          float gz;
+          if (interleaved != nullptr) {
+            const float *q = interleaved + 3 * at;
+            gx = q[0];
+            gy = q[1];
+            gz = q[2];
+          } else {
+            gx = x[at];
+            gy = y[at];
+            gz = z[at];
+          }
+          const int cx = floor_to_cell(gx * inv_radius);
+          const int cy = floor_to_cell(gy * inv_radius);
+          const int cz = floor_to_cell(gz * inv_radius);
           const uint64_t key = make_key(cx, cy, cz);
           const bool differs = key != previous_keys[at];
           changed[at] = differs ? 1 : 0;
@@ -733,11 +775,13 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
           acc.bounds.max_cx = std::max(acc.bounds.max_cx, cx);
           acc.bounds.max_cy = std::max(acc.bounds.max_cy, cy);
           acc.bounds.max_cz = std::max(acc.bounds.max_cz, cz);
+          acc.bounds.world.add(gx, gy, gz);
         }
         return acc;
       },
       [](KeyPass a, const KeyPass &b) {
         a.changed += b.changed;
+        a.bounds.world.add(b.bounds.world);
         a.bounds.min_cx = std::min(a.bounds.min_cx, b.bounds.min_cx);
         a.bounds.min_cy = std::min(a.bounds.min_cy, b.bounds.min_cy);
         a.bounds.min_cz = std::min(a.bounds.min_cz, b.bounds.min_cz);
@@ -747,6 +791,9 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
         return a;
       });
   const int changed_count = pass.changed;
+  if (world_out != nullptr) {
+    *world_out = pass.bounds.world;
+  }
   data.cell_coord_min_x = pass.bounds.min_cx;
   data.cell_coord_max_x = pass.bounds.max_cx;
   data.cell_coord_min_y = pass.bounds.min_cy;
@@ -829,6 +876,19 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
   int *out_order = data.incremental_order.data();
   uint64_t *out_keys = data.incremental_merge_keys.data();
 
+  auto gather_xyz = [&](int idx, float &gx, float &gy, float &gz) {
+    if (interleaved != nullptr) {
+      const float *q = interleaved + 3 * static_cast<std::size_t>(idx);
+      gx = q[0];
+      gy = q[1];
+      gz = q[2];
+    } else {
+      const std::size_t at = static_cast<std::size_t>(idx);
+      gx = x[at];
+      gy = y[at];
+      gz = z[at];
+    }
+  };
   const int num_a = unchanged_count;
   const int num_b = changed_count;
   const int *unchanged_at = unchanged_positions.data();
@@ -881,29 +941,41 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
         key = b[ib].key;
         idx = b[ib++].index;
       }
+      float gx;
+      float gy;
+      float gz;
+      gather_xyz(idx, gx, gy, gz);
       out_keys[write] = key;
-      out_x[write] = x[static_cast<std::size_t>(idx)];
-      out_y[write] = y[static_cast<std::size_t>(idx)];
-      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_x[write] = gx;
+      out_y[write] = gy;
+      out_z[write] = gz;
       out_order[write] = idx;
       ++write;
     }
     for (; ia < end_a; ++ia) {
       const int position = unchanged_at[ia];
       const int idx = previous_order[position];
+      float gx;
+      float gy;
+      float gz;
+      gather_xyz(idx, gx, gy, gz);
       out_keys[write] = previous_sorted[position];
-      out_x[write] = x[static_cast<std::size_t>(idx)];
-      out_y[write] = y[static_cast<std::size_t>(idx)];
-      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_x[write] = gx;
+      out_y[write] = gy;
+      out_z[write] = gz;
       out_order[write] = idx;
       ++write;
     }
     for (; ib < end_b; ++ib) {
       const int idx = b[ib].index;
+      float gx;
+      float gy;
+      float gz;
+      gather_xyz(idx, gx, gy, gz);
       out_keys[write] = b[ib].key;
-      out_x[write] = x[static_cast<std::size_t>(idx)];
-      out_y[write] = y[static_cast<std::size_t>(idx)];
-      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_x[write] = gx;
+      out_y[write] = gy;
+      out_z[write] = gz;
       out_order[write] = idx;
       ++write;
     }
@@ -1006,7 +1078,8 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
 void reset_incremental_state(NeighborSearchData &data,
                              const std::vector<float> &x,
                              const std::vector<float> &y,
-                             const std::vector<float> &z, float inv_radius) {
+                             const std::vector<float> &z, float inv_radius,
+                             const float *interleaved) {
   const int num_points = static_cast<int>(x.size());
   data.incremental_keys.resize(static_cast<std::size_t>(num_points));
   tbb::parallel_for(
@@ -1014,10 +1087,23 @@ void reset_incremental_state(NeighborSearchData &data,
       [&](const tbb::blocked_range<int> &range) {
         for (int i = range.begin(); i < range.end(); ++i) {
           const std::size_t at = static_cast<std::size_t>(i);
+          float gx;
+          float gy;
+          float gz;
+          if (interleaved != nullptr) {
+            const float *q = interleaved + 3 * at;
+            gx = q[0];
+            gy = q[1];
+            gz = q[2];
+          } else {
+            gx = x[at];
+            gy = y[at];
+            gz = z[at];
+          }
           data.incremental_keys[at] =
-              make_key(floor_to_cell(x[at] * inv_radius),
-                       floor_to_cell(y[at] * inv_radius),
-                       floor_to_cell(z[at] * inv_radius));
+              make_key(floor_to_cell(gx * inv_radius),
+                       floor_to_cell(gy * inv_radius),
+                       floor_to_cell(gz * inv_radius));
         }
       });
   data.incremental_sorted_keys.resize(static_cast<std::size_t>(num_points));
@@ -1936,7 +2022,8 @@ void build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &x,
                               const std::vector<float> &y,
                               const std::vector<float> &z, float radius,
-                              float cell_radius) {
+                              float cell_radius, const float *interleaved,
+                              Bounds *world_bounds) {
   data.num_points = static_cast<int>(x.size());
   data.radius = radius;
   data.cell_radius = cell_radius > 0.0f ? cell_radius : radius;
@@ -2029,15 +2116,18 @@ void build_point_grid_inplace(NeighborSearchData &data,
   }
 
   float inv_radius = 1.0f / data.cell_radius;
-  const bool incremental =
-      try_incremental_sort_point_set(data, x, y, z, inv_radius);
+  const bool incremental = try_incremental_sort_point_set(
+      data, x, y, z, inv_radius, interleaved, world_bounds);
   if (!incremental) {
     CellBounds bounds;
     sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
                    data.sorted_z, data.original_index, data.cell_starts,
                    data.cell_ends, data.scratch_point_keys,
                    data.scratch_point_keys_alt, data.scratch_unique_keys,
-                   data.cell_keys_signed_order, &bounds);
+                   data.cell_keys_signed_order, &bounds, interleaved);
+    if (world_bounds != nullptr) {
+      *world_bounds = bounds.world;
+    }
     data.cell_coord_min_x = bounds.min_cx;
     data.cell_coord_max_x = bounds.max_cx;
     data.cell_coord_min_y = bounds.min_cy;
@@ -2105,7 +2195,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
     // The merge only targets sparse grids; dense sets keep the full-sort
     // path and must not pay to capture merge state they will never use.
     if (max_cell_points <= 1) {
-      reset_incremental_state(data, x, y, z, inv_radius);
+      reset_incremental_state(data, x, y, z, inv_radius, interleaved);
     } else {
       data.incremental_valid = false;
     }
@@ -3841,7 +3931,7 @@ static void build_cross_neighbor_search_data_inplace(
                  data.sorted_y, data.sorted_z, data.original_index,
                  data.cell_starts, data.cell_ends, data.scratch_point_keys,
                  data.scratch_point_keys_alt, data.scratch_unique_keys,
-                 signed_order, nullptr);
+                 signed_order, nullptr, nullptr);
   auto const &unique_keys = data.scratch_unique_keys;
 
   data.num_cells = static_cast<int>(data.cell_starts.size());
@@ -4314,6 +4404,7 @@ void write_cross_neighbors_target_major_parallel(
           }
         }
       });
+
 
 }
 

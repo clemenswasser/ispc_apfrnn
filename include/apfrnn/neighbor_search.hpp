@@ -173,10 +173,13 @@ private:
   struct GpuState;
 
   bool valid_set(int set) const;
+  // True when this run skipped a position copy for a large moving source; the
+  // per-frame block-layout scan assumes a static scene and must not run.
+  bool skipped_position_sync_ = false;
   float build_radius() const { return radius_ + skin_; }
   int add_source(const void *xyz, bool is_double, int n, bool is_static);
   void resize_source(int set, const void *xyz, bool is_double, int n);
-  float sync_source(int set);
+  float sync_source(int set, bool skip_positions = false);
   void invalidate_pairs_for_set(int set);
   static void clear_pair(Pair &pair);
 
