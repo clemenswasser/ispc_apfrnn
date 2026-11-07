@@ -76,7 +76,8 @@ TEST_CASE("cross plan picks target-major for sparse dense targets") {
   const auto plan = apfrnn::plan::cross_set(source, 64, dense_target, 0, kBudget);
   CHECK(plan.writer == apfrnn::plan::CrossWriter::PairDense);
   CHECK_FALSE(plan.build_ranges);
-  CHECK(plan.first_capacity == 32);
+  // Cross row strides are line-aligned: 32 + row_slack() rounds to 48 ints.
+  CHECK(plan.first_capacity == 40);
 }
 
 TEST_CASE("cross plan pairs a low-density source with a dense target") {
@@ -94,7 +95,9 @@ TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
   const auto plan = apfrnn::plan::cross_set(source, 0, target, 9000, kBudget);
   CHECK(plan.build_ranges);
   CHECK(plan.writer == apfrnn::plan::CrossWriter::Active2);
-  CHECK(plan.first_capacity == 4096);  // clamped to the cross maximum
+  // Clamped to the cross maximum, then rounded up so the row stride
+  // (capacity + row_slack()) is a whole number of 64-byte lines.
+  CHECK(plan.first_capacity == 4104);
 }
 
 TEST_CASE("fitted capacities keep a margin for degree changes") {
@@ -102,8 +105,8 @@ TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 80);
   CHECK(apfrnn::plan::same_fitted_capacity(8000, 16384) ==
         apfrnn::round_up_to_row_align(8500));
-  CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) == 80);
-  CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == 64);
+  CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) == 88);
+  CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == 72);
 }
 
 TEST_CASE("grown capacities respect limits and budget") {

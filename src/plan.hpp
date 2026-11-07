@@ -102,6 +102,16 @@ inline int moving_row_capacity(int count) {
   return round_up_to_row_align(count + std::max(8, count / 8));
 }
 
+// Row starts are capacity + row_slack() ints apart. Round the capacity up so
+// that stride is a whole number of 64-byte cache lines: every row's stores
+// then stay line-aligned, which removes the partial-line RFOs the row buffer
+// pays when the stride alternates between 0 and 32 bytes off a line.
+inline int line_aligned_capacity(int capacity) {
+  const int stride = capacity + row_slack();
+  const int aligned = ((stride + 15) / 16) * 16;
+  return std::max(capacity, aligned - row_slack());
+}
+
 // Row slots of per-point rows sized by moving_row_capacity(), including the
 // per-row offset and capacity.
 int64_t same_moving_slots(const IntBuffer &counts);

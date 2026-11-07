@@ -121,6 +121,7 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
   int first =
       pair_last_capacity > 0 ? pair_last_capacity : kCrossInitialCapacity;
   first = std::clamp(first, kCrossInitialCapacity, kCrossMaxCapacity);
+  first = line_aligned_capacity(first);
   if (row_bytes(source.num_points, first) > memory_budget) {
     first = kCrossInitialCapacity;
   }
@@ -279,8 +280,9 @@ bool prefer_block_rows(int64_t fixed_slots, int64_t block_slots) {
 
 int cross_fitted_capacity(int max_count, int capacity) {
   const int margin = std::max(8, max_count / 16);
-  return std::min(capacity,
-                  std::max(32, round_up_to_row_align(max_count + margin)));
+  return line_aligned_capacity(
+      std::min(capacity,
+               std::max(32, round_up_to_row_align(max_count + margin))));
 }
 
 bool same_set_isolated(const NeighborSearchData &data) {
