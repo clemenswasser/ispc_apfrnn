@@ -43,6 +43,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
 
 namespace {
 
@@ -206,6 +207,26 @@ void attach_rss(benchmark::State &state) {
   }
 }
 
+// Switches perf counters on and off around the timed frames. perf runs with
+// -D -1 and --control=fifo:CTL,ACK; APFRNN_PERF_CTL and APFRNN_PERF_ACK name the
+// same FIFOs. Does nothing outside scripts/perf_evidence.sh.
+void perf_region(const char *command) {
+  static const char *ctl_path = std::getenv("APFRNN_PERF_CTL");
+  static const char *ack_path = std::getenv("APFRNN_PERF_ACK");
+  if (ctl_path == nullptr || ack_path == nullptr) {
+    return;
+  }
+  static const int ctl = open(ctl_path, O_WRONLY);
+  static const int ack = open(ack_path, O_RDONLY);
+  if (ctl < 0 || ack < 0) {
+    return;
+  }
+  if (write(ctl, command, std::strlen(command)) > 0) {
+    char reply[8];
+    (void)!read(ack, reply, sizeof(reply));
+  }
+}
+
 void advance_scene(SceneData &scene, Backend &backend, int step) {
   scene.advance(step);
   if (scene.growing) {
@@ -266,10 +287,12 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   }
 
   int step = 2;
+  perf_region("enable\n");
   for (auto _ : state) {
     advance_scene(scene, *backend, step++);
     backend->run();
   }
+  perf_region("disable\n");
 
   const int fluid_points = scene.points(0);
   state.SetItemsProcessed(state.iterations() * fluid_points);
