@@ -973,12 +973,15 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
     split_a[static_cast<std::size_t>(worker)] = lo;
     split_b[static_cast<std::size_t>(worker)] = rank - lo;
   }
+  std::vector<uint8_t> worker_duplicate(static_cast<std::size_t>(workers), 0);
   tbb::parallel_for(0, workers, [&](int worker) {
     int ia = split_a[static_cast<std::size_t>(worker)];
     int ib = split_b[static_cast<std::size_t>(worker)];
     const int end_a = split_a[static_cast<std::size_t>(worker) + 1];
     const int end_b = split_b[static_cast<std::size_t>(worker) + 1];
     int write = ia + ib;
+    const int worker_start = write;
+    uint8_t duplicate = 0;
     while (ia < end_a && ib < end_b) {
       const bool take_a = a_less(ia, b[ib]);
       int idx;
@@ -991,23 +994,35 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
         key = b[ib].key;
         idx = b[ib++].index;
       }
-out_keys[write] = key;
+      out_keys[write] = key;
+      if (write > worker_start && key == out_keys[write - 1]) {
+        duplicate = 1;
+      }
       out_order[write] = idx;
       ++write;
     }
     for (; ia < end_a; ++ia) {
       const int position = unchanged_at[ia];
       const int idx = previous_order[position];
-out_keys[write] = previous_sorted[position];
+      const uint64_t key = previous_sorted[position];
+      out_keys[write] = key;
+      if (write > worker_start && key == out_keys[write - 1]) {
+        duplicate = 1;
+      }
       out_order[write] = idx;
       ++write;
     }
     for (; ib < end_b; ++ib) {
       const int idx = b[ib].index;
-out_keys[write] = b[ib].key;
+      const uint64_t key = b[ib].key;
+      out_keys[write] = key;
+      if (write > worker_start && key == out_keys[write - 1]) {
+        duplicate = 1;
+      }
       out_order[write] = idx;
       ++write;
     }
+    worker_duplicate[static_cast<std::size_t>(worker)] = duplicate;
   });
 
   // Independent random reads, eight or more in flight per thread; inside
@@ -1041,22 +1056,21 @@ out_keys[write] = b[ib].key;
   // One point per cell is the common sparse case: starts/ends are the index
   // sequence and the merged key buffer doubles as the unique-key array (and
   // as next frame's per-position order).
-  std::vector<uint8_t> chunk_duplicate(static_cast<std::size_t>(chunks), 0);
-  tbb::parallel_for(0, chunks, [&](int chunk) {
-    const int begin = chunk * kRangeGrain;
-    const int end = std::min(num_points, begin + kRangeGrain);
-    uint8_t duplicate = 0;
-    for (int i = begin + 1; i < end; ++i) {
-      duplicate |= out_keys[i] == out_keys[i - 1] ? 1 : 0;
-    }
-    if (begin > 0) {
-      duplicate |= out_keys[begin] == out_keys[begin - 1] ? 1 : 0;
-    }
-    chunk_duplicate[static_cast<std::size_t>(chunk)] = duplicate;
-  });
+  // Duplicates were tracked inside the merge workers; only the worker
+  // boundaries remain to check.
   bool all_unique = true;
-  for (uint8_t duplicate : chunk_duplicate) {
+  for (uint8_t duplicate : worker_duplicate) {
     all_unique &= duplicate == 0;
+  }
+  if (all_unique) {
+    for (int worker = 1; worker < workers; ++worker) {
+      const int at = split_a[static_cast<std::size_t>(worker)] +
+                     split_b[static_cast<std::size_t>(worker)];
+      if (at > 0 && at < num_points && out_keys[at] == out_keys[at - 1]) {
+        all_unique = false;
+        break;
+      }
+    }
   }
   if (all_unique) {
     data.incremental_starts.clear();
