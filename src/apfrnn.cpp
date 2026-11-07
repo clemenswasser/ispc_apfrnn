@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <atomic>
 #include <climits>
@@ -4544,14 +4545,47 @@ void write_cross_neighbors_target_major_csr_parallel(
   row_ptr.resize(static_cast<std::size_t>(num_source) + 1);
   zero_counts();
   constexpr int kTargetBlock = 64;
-  // Pass 0: exact hits per source row.
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_target, kTargetBlock),
-      [&](const tbb::blocked_range<int> &range) {
-        ispc::target_major_csr(range.begin(), range.end(), &targets, &grid,
-                               &cells, &candidates, inv_radius, r2, 0,
-                               counts.data(), row_ptr.data(), col_idx.data());
-      });
+  // A target's hit count changes slowly between frames, so the previous
+  // frame's counts size compact recorded-hit slots: pass 0 records the hit
+  // rows there and the fill pass walks them instead of rescanning every
+  // candidate. A target that outgrew its slot is rescanned in the fill pass.
+  IntBuffer &slots = query_data.csr_slots;
+  IntBuffer &slot_offset = query_data.csr_slot_offset;
+  IntBuffer &slot_capacity = query_data.csr_slot_capacity;
+  IntBuffer &slot_counts = query_data.csr_slot_counts;
+  IntBuffer &hit_totals = query_data.csr_hit_totals;
+  IntBuffer &prev_hits = query_data.csr_prev_hits;
+  {
+    const bool have_prev =
+        query_data.csr_slots_valid &&
+        prev_hits.size() == static_cast<std::size_t>(num_target);
+    slot_offset.resize(static_cast<std::size_t>(num_target));
+    slot_capacity.resize(static_cast<std::size_t>(num_target));
+    slot_counts.resize(static_cast<std::size_t>(num_target));
+    hit_totals.resize(static_cast<std::size_t>(num_target));
+    // Offsets are serial over targets (tens of thousands of entries).
+    int64_t total_slots = 0;
+    for (int t = 0; t < num_target; ++t) {
+      slot_offset[static_cast<std::size_t>(t)] =
+          static_cast<int>(total_slots);
+      // First frame: a guess that covers the emitter's ~33 hits per target;
+      // targets above it simply rescan in the fill pass.
+      const int capacity =
+          have_prev ? prev_hits[static_cast<std::size_t>(t)] + 8 : 64;
+      slot_capacity[static_cast<std::size_t>(t)] = capacity;
+      total_slots += capacity;
+    }
+    slots.resize(static_cast<std::size_t>(total_slots));
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_target, kTargetBlock),
+        [&](const tbb::blocked_range<int> &range) {
+          ispc::target_major_csr_record(
+              range.begin(), range.end(), &targets, &grid, &cells,
+              &candidates, inv_radius, r2, counts.data(), slot_offset.data(),
+              slot_capacity.data(), slot_counts.data(), hit_totals.data(),
+              slots.data(), neighbor_permutation_table());
+        });
+  }
   const int total = tbb::parallel_scan(
       tbb::blocked_range<int>(0, num_source), 0,
       [&](const tbb::blocked_range<int> &range, int sum, bool final_scan) {
@@ -4570,13 +4604,22 @@ void write_cross_neighbors_target_major_csr_parallel(
   // Pass 1: reuse counts as the per-row fill cursor; it ends at the exact row
   // counts, which the pair keeps for its statistics and skin filtering.
   zero_counts();
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_target, kTargetBlock),
-      [&](const tbb::blocked_range<int> &range) {
-        ispc::target_major_csr(range.begin(), range.end(), &targets, &grid,
-                               &cells, &candidates, inv_radius, r2, 1,
-                               counts.data(), row_ptr.data(), col_idx.data());
-      });
+  {
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_target, kTargetBlock),
+        [&](const tbb::blocked_range<int> &range) {
+          ispc::target_major_csr_fill(
+              range.begin(), range.end(), &targets, &grid, &cells,
+              &candidates, inv_radius, r2, counts.data(), row_ptr.data(),
+              col_idx.data(), slot_offset.data(), slots.data(),
+              slot_counts.data());
+        });
+    // The next frame's slot capacities come from this frame's exact counts.
+    prev_hits.resize(static_cast<std::size_t>(num_target));
+    std::memcpy(prev_hits.data(), hit_totals.data(),
+                static_cast<std::size_t>(num_target) * sizeof(int));
+    query_data.csr_slots_valid = true;
+  }
   query_data.num_points = num_source;
 }
 

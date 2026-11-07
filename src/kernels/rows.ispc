@@ -543,22 +543,26 @@ static inline uniform float axis_gap(uniform float q, uniform float lo,
 // target id at row_ptr[row] + cursor[row]. The entries of a 2M-point emitter
 // pair then occupy a few MB instead of touching one fresh 64 B line per entry
 // (the fixed-row layout's RFO floor).
-export void target_major_csr(
+// Pass 0 of the recorded-hit CSR writer: count every source row's hits and
+// record the hit candidate rows in this target's compact slot when they fit.
+// An overflowed target is marked -1 and rescanned by the fill pass.
+export void target_major_csr_record(
     uniform int begin, uniform int end,
     const uniform Points *uniform tpts_in,
     const uniform DenseGrid *uniform grid_in,
     const uniform Cells *uniform src_in,
     const uniform Points *uniform spts_in, uniform float inv_radius,
-    uniform float r2, uniform int pass, uniform int *uniform counts,
-    uniform const int row_ptr[], uniform int col_idx[]) {
+    uniform float r2, uniform int *uniform counts,
+    uniform const int slot_offset[], uniform const int slot_capacity[],
+    uniform int *uniform slot_counts, uniform int *uniform hit_totals,
+    uniform int *uniform slots, uniform const int *uniform perm_in) {
   const uniform Points tpts = *tpts_in;
   const uniform DenseGrid grid = *grid_in;
   const uniform Cells src = *src_in;
   const uniform Points spts = *spts_in;
+  const uniform int *uniform perm = perm_in;
   uniform int run_start[9];
   uniform int run_end[9];
-  // Targets arrive in cell order, so consecutive targets usually share the
-  // query cell (the emitter averages ~7 points per cell): reuse its runs.
   uniform int cached_cx = 0x7FFFFFFF;
   uniform int cached_cy = 0;
   uniform int cached_cz = 0;
@@ -575,10 +579,84 @@ export void target_major_csr(
       cached_cy = cy;
       cached_cz = cz;
     }
-    const uniform int value = tpts.index[t];
+    const uniform int slot_base = slot_offset[t];
+    const uniform int slot_end = slot_base + slot_capacity[t];
+    uniform int cursor = slot_base;
+    uniform int total = 0;
+    uniform bool overflow = false;
     for (uniform int run = 0; run < num_runs; ++run) {
-      // The candidate index is the gang base plus the lane, so the hit path
-      // needs no per-lane vector extract.
+      uniform int base = run_start[run];
+      foreach (j = run_start[run] ... run_end[run]) {
+        const float<3> pj = point_at(spts, j);
+        const varying bool hit = length_sq(pj - q) <= r2;
+        uniform int mask = packmask(hit);
+        total += popcnt(mask);
+        if (!overflow) {
+          if (cursor + programCount <= slot_end) {
+            cursor += store_compacted(slots + cursor, hit, j, perm);
+          } else {
+            overflow = true;
+          }
+        }
+        while (mask != 0) {
+          const uniform int lane = count_trailing_zeros(mask);
+          atomic_add_global(&counts[base + lane], 1);
+          mask &= mask - 1;
+        }
+        base += programCount;
+      }
+    }
+    hit_totals[t] = total;
+    slot_counts[t] = overflow ? -1 : (cursor - slot_base);
+  }
+}
+
+// Fill pass: append each target id from its recorded slot, or rescan the
+// target when its slot overflowed.
+export void target_major_csr_fill(
+    uniform int begin, uniform int end,
+    const uniform Points *uniform tpts_in,
+    const uniform DenseGrid *uniform grid_in,
+    const uniform Cells *uniform src_in,
+    const uniform Points *uniform spts_in, uniform float inv_radius,
+    uniform float r2, uniform int *uniform counts,
+    uniform const int row_ptr[], uniform int col_idx[],
+    uniform const int slot_offset[], uniform const int slots[],
+    uniform const int slot_counts[]) {
+  const uniform Points tpts = *tpts_in;
+  const uniform DenseGrid grid = *grid_in;
+  const uniform Cells src = *src_in;
+  const uniform Points spts = *spts_in;
+  uniform int run_start[9];
+  uniform int run_end[9];
+  uniform int cached_cx = 0x7FFFFFFF;
+  uniform int cached_cy = 0;
+  uniform int cached_cz = 0;
+  uniform int num_runs = 0;
+  for (uniform int t = begin; t < end; ++t) {
+    const uniform int value = tpts.index[t];
+    const uniform int recorded = slot_counts[t];
+    if (recorded >= 0) {
+      const uniform int base = slot_offset[t];
+      for (uniform int k = 0; k < recorded; ++k) {
+        const uniform int jj = slots[base + k];
+        const uniform int position = atomic_add_global(&counts[jj], 1);
+        col_idx[row_ptr[jj] + position] = value;
+      }
+      continue;
+    }
+    const uniform float<3> q = point_at(tpts, t);
+    const uniform int cx = floor_to_cell_uniform(q.x * inv_radius);
+    const uniform int cy = floor_to_cell_uniform(q.y * inv_radius);
+    const uniform int cz = floor_to_cell_uniform(q.z * inv_radius);
+    if (cx != cached_cx || cy != cached_cy || cz != cached_cz) {
+      num_runs = dense_runs(grid, src, make_key_uniform(cx, cy, cz),
+                            run_start, run_end);
+      cached_cx = cx;
+      cached_cy = cy;
+      cached_cz = cz;
+    }
+    for (uniform int run = 0; run < num_runs; ++run) {
       uniform int base = run_start[run];
       foreach (j = run_start[run] ... run_end[run]) {
         const float<3> pj = point_at(spts, j);
@@ -588,9 +666,7 @@ export void target_major_csr(
           const uniform int lane = count_trailing_zeros(mask);
           const uniform int jj = base + lane;
           const uniform int position = atomic_add_global(&counts[jj], 1);
-          if (pass != 0) {
-            col_idx[row_ptr[jj] + position] = value;
-          }
+          col_idx[row_ptr[jj] + position] = value;
           mask &= mask - 1;
         }
         base += programCount;

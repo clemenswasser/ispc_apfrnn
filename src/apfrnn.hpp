@@ -338,6 +338,16 @@ struct CrossNeighborSearchData {
   IntBuffer counts;
   IntBuffer row_ptr;
   IntBuffer col_idx;
+  // Compact recorded-hit slots of the target-major CSR writer: capacities
+  // come from the previous frame's per-target hit counts, so the recording
+  // stores stream instead of striding across a candidate-bounded buffer.
+  IntBuffer csr_slots;
+  IntBuffer csr_slot_offset;
+  IntBuffer csr_slot_capacity;
+  IntBuffer csr_slot_counts;
+  IntBuffer csr_hit_totals;
+  IntBuffer csr_prev_hits;
+  bool csr_slots_valid = false;
   std::vector<SortPointKey> scratch_point_keys;
   std::vector<SortPointKey> scratch_point_keys_alt;
   std::vector<uint64_t> dense_keys;
