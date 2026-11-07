@@ -3272,7 +3272,10 @@ bool occupancy_may_contain(const NeighborSearchData &data, float qx,
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
                                  int capacity, IntBuffer &fixed_neighbors,
-                                 IntBuffer &counts) {
+                                 IntBuffer &counts,
+                                 std::vector<int> &touched_rows,
+                                 bool &touched_overflow,
+                                 int &max_count_out) {
   ensure_cell_x_index(target);
   ensure_cell_ranges(target);
   if (!target.cell_x_valid || target.num_cells <= 0) {
@@ -3280,8 +3283,23 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
   }
   const int num_points = source.num_points;
   const int stride = capacity;
+  const std::size_t counts_before = counts.size();
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(num_points), stride);
+  // The counts buffer uses a default-init allocator. Zero it when it is
+  // (re)allocated; otherwise clear only the rows written by the previous
+  // build and leave the untouched (already zero) rows alone.
+  if (counts_before != counts.size() || touched_overflow) {
+    std::fill(counts.begin(), counts.end(), 0);
+    touched_rows.clear();
+    touched_overflow = false;
+  } else {
+    for (int row : touched_rows) {
+      counts[static_cast<std::size_t>(row)] = 0;
+    }
+    touched_rows.clear();
+  }
+  max_count_out = 0;
   if (num_points == 0) {
     return true;
   }
@@ -3327,16 +3345,20 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
   };
 
   constexpr int kGrain = 2048;
+  constexpr std::size_t kTouchedCap = std::size_t{1} << 20;
+  std::mutex touched_mutex;
   tbb::parallel_for(
       tbb::blocked_range<int>(0, num_points, kGrain),
       [&](const tbb::blocked_range<int> &range) {
+        std::vector<int> task_touched;
+        task_touched.reserve(16);
+        int task_max = 0;
         for (int point = range.begin(); point < range.end(); ++point) {
           const float px = qx[point];
           const float py = qy[point];
           const float pz = qz[point];
           if (target.occupancy_valid &&
               !occupancy_may_contain(target, px, py, pz, radius)) {
-            row_counts[point] = 0;
             continue;
           }
           int cx;
@@ -3409,10 +3431,26 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
               cell = y_end;
             }
           }
-          row_counts[point] = count;
+          if (count != 0) {
+            row_counts[point] = count;
+            task_touched.push_back(point);
+            if (count > task_max) {
+              task_max = count;
+            }
+          }
+        }
+        if (!task_touched.empty() || task_max > 0) {
+          std::lock_guard<std::mutex> lock(touched_mutex);
+          if (touched_rows.size() + task_touched.size() <= kTouchedCap) {
+            touched_rows.insert(touched_rows.end(), task_touched.begin(),
+                                task_touched.end());
+          } else {
+            touched_overflow = true;
+          }
+          max_count_out = std::max(max_count_out, task_max);
         }
       });
-  return max_row_count(counts) <= capacity;
+  return max_count_out <= capacity;
 }
 
 bool write_cross_rows_target_major(NeighborSearchData &source,

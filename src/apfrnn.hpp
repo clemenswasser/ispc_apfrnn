@@ -430,7 +430,10 @@ void ensure_occupancy_cells(NeighborSearchData &data);
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
                                  int capacity, IntBuffer &fixed_neighbors,
-                                 IntBuffer &counts);
+                                 IntBuffer &counts,
+                                 std::vector<int> &touched_rows,
+                                 bool &touched_overflow,
+                                 int &max_count_out);
 
 // Sparse target-major cross writer: iterates the (smaller) target's points
 // and searches the (larger) source's sorted-cell grid, scattering each hit

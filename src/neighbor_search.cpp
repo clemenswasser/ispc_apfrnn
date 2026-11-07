@@ -212,12 +212,15 @@ struct NSearch::PointSet {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Max row count of the fixed rows, known from the writer; -1 forces the
+  // stats pass to rescan (paths that do not track it).
+  int fixed_max_count = -1;
   // Sparse target-major cross rows. The counts buffer is kept across
   // invalidations for pairs that use that writer; only the rows it wrote are
   // cleared before the next build.
-  std::vector<int> target_major_touched;
-  bool target_major_touched_overflow = false;
-  bool target_major_owned = false;
+  std::vector<int> incremental_rows_touched;
+  bool incremental_rows_touched_overflow = false;
+  bool incremental_rows_owned = false;
   // Block-fixed rows: per-block capacities and per-query row offsets.
   bool block_rows = false;
   bool block_caps_valid = false;
@@ -269,12 +272,15 @@ struct NSearch::Pair {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Max row count of the fixed rows, known from the writer; -1 forces the
+  // stats pass to rescan (paths that do not track it).
+  int fixed_max_count = -1;
   // Sparse target-major cross rows. The counts buffer is kept across
   // invalidations for pairs that use that writer; only the rows it wrote are
   // cleared before the next build.
-  std::vector<int> target_major_touched;
-  bool target_major_touched_overflow = false;
-  bool target_major_owned = false;
+  std::vector<int> incremental_rows_touched;
+  bool incremental_rows_touched_overflow = false;
+  bool incremental_rows_owned = false;
   // Per-block cross rows. The block capacities and row offsets depend only
   // on the source/target grids, so they survive a pair invalidation that
   // merely rewrites unchanged rows.
@@ -697,11 +703,12 @@ void NSearch::run() {
           if (!write_cross_rows_target_major(
                   source.data, target.data, radius, capacity,
                   pair.fixed_neighbors, pair.fixed_counts,
-                  pair.target_major_touched,
-                  pair.target_major_touched_overflow, max_count)) {
+                  pair.incremental_rows_touched,
+                  pair.incremental_rows_touched_overflow, max_count)) {
             continue;
           }
-          pair.target_major_owned = true;
+          pair.incremental_rows_owned = true;
+          pair.fixed_max_count = max_count;
           pair.fixed_valid = true;
           pair.fixed_capacity = capacity;
           pair.last_fixed_capacity =
@@ -1158,20 +1165,25 @@ bool NSearch::cell_range_cross_candidate(const PointSet &source,
 void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   PointSet &source = sets_[static_cast<std::size_t>(set_i)];
   PointSet &target = sets_[static_cast<std::size_t>(set_j)];
+  pair.incremental_rows_owned = false;
   pair.fixed_valid = false;
+  pair.fixed_max_count = -1;
   pair.same_set = false;
   pair.valid = true;
 
   if (cell_range_cross_candidate(source, target) &&
       target.data.cell_x_valid) {
     for (int capacity : {1, 2, 4, 8, 16, 32}) {
-      if (!write_cross_rows_cell_range(source.data, target.data,
-                                       build_radius(), capacity,
-                                       pair.fixed_neighbors,
-                                       pair.fixed_counts)) {
+      int max_count = 0;
+      if (!write_cross_rows_cell_range(
+              source.data, target.data, build_radius(), capacity,
+              pair.fixed_neighbors, pair.fixed_counts,
+              pair.incremental_rows_touched,
+              pair.incremental_rows_touched_overflow, max_count)) {
         continue;
       }
-      const int max_count = max_row_count(pair.fixed_counts);
+      pair.incremental_rows_owned = true;
+      pair.fixed_max_count = max_count;
       pair.fixed_valid = true;
       pair.fixed_capacity = capacity;
       pair.last_fixed_capacity =
@@ -1245,6 +1257,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     if (max_count > capacity) {
       return false;
     }
+    pair.fixed_max_count = max_count;
     pair.fixed_valid = true;
     pair.cross_block_active = false;
     pair.skin_lists = skin_ > 0.0f;
@@ -1404,11 +1417,17 @@ void NSearch::collect_memory_stats() {
               source.fixed_counts.capacity() * sizeof(int) +
               source.active_neighbors.capacity() * sizeof(int) +
               source.active_counts.capacity() * sizeof(int);
-          const IntBuffer &counts =
-              (skin_ > 0.0f && source.skin_lists) ? source.active_counts
-                                                  : source.fixed_counts;
-          last_stats_.max_neighbors =
-              std::max(last_stats_.max_neighbors, max_row_count(counts));
+          if (skin_ <= 0.0f || !source.skin_lists) {
+            const int known = source.fixed_max_count;
+            last_stats_.max_neighbors =
+                std::max(last_stats_.max_neighbors,
+                         known >= 0 ? known
+                                    : max_row_count(source.fixed_counts));
+          } else {
+            last_stats_.max_neighbors = std::max(
+                last_stats_.max_neighbors,
+                max_row_count(source.active_counts));
+          }
         } else {
           ++last_stats_.same_csr_pairs;
           last_stats_.neighbor_bytes +=
@@ -1424,11 +1443,16 @@ void NSearch::collect_memory_stats() {
             pair.fixed_counts.capacity() * sizeof(int) +
             pair.active_neighbors.capacity() * sizeof(int) +
             pair.active_counts.capacity() * sizeof(int);
-        const IntBuffer &counts =
-            (skin_ > 0.0f && pair.skin_lists) ? pair.active_counts
-                                              : pair.fixed_counts;
-        last_stats_.max_neighbors =
-            std::max(last_stats_.max_neighbors, max_row_count(counts));
+        if (skin_ <= 0.0f || !pair.skin_lists) {
+          const int known = pair.fixed_max_count;
+          last_stats_.max_neighbors = std::max(
+              last_stats_.max_neighbors,
+              known >= 0 ? known : max_row_count(pair.fixed_counts));
+        } else {
+          last_stats_.max_neighbors = std::max(
+              last_stats_.max_neighbors,
+              max_row_count(pair.active_counts));
+        }
       } else {
         ++last_stats_.cross_csr_pairs;
         last_stats_.neighbor_bytes +=
@@ -1780,6 +1804,7 @@ void NSearch::build_grid_same_lists(int set) {
         continue;
       }
       const int max_count = max_row_count(point_set.fixed_counts);
+      point_set.fixed_max_count = max_count;
       point_set.block_rows = false;
       point_set.fixed_capacity = capacity;
       point_set.last_fixed_capacity =
@@ -1804,6 +1829,7 @@ void NSearch::build_grid_same_lists(int set) {
       if (max_count > capacity) {
         continue;
       }
+      point_set.fixed_max_count = max_count;
       point_set.block_rows = false;
       point_set.fixed_capacity = capacity + row_slack();
       point_set.last_fixed_capacity =
@@ -1906,6 +1932,7 @@ void NSearch::build_grid_same_lists(int set) {
     if (max_count > capacity) {
       return false;
     }
+    point_set.fixed_max_count = max_count;
     point_set.fixed_capacity = capacity + row_slack();
     point_set.last_fixed_capacity =
         plan::same_fitted_capacity(max_count, capacity);
@@ -1938,6 +1965,7 @@ void NSearch::build_grid_same_lists(int set) {
       note_path(kPathSameIsolated);
       point_set.fixed_counts.assign(static_cast<std::size_t>(data.num_points),
                                     0);
+      point_set.fixed_max_count = 0;
       point_set.fixed_capacity = 1;
       point_set.fixed_neighbors.resize(
           static_cast<std::size_t>(data.num_points));
@@ -2684,6 +2712,7 @@ void NSearch::invalidate_pairs_for_set(int set) {
 
   sets_[static_cast<std::size_t>(set)].same_lists_valid = false;
   sets_[static_cast<std::size_t>(set)].fixed_valid = false;
+  sets_[static_cast<std::size_t>(set)].fixed_max_count = -1;
   sets_[static_cast<std::size_t>(set)].skin_lists = false;
   sets_[static_cast<std::size_t>(set)].active_valid = false;
   const int set_count = static_cast<int>(sets_.size());
@@ -2878,10 +2907,10 @@ void NSearch::clear_pair(Pair &pair) {
   pair.gpu_nq = 0;
   pair.cross = CrossNeighborSearchData{};
   pair.fixed_neighbors.clear();
-  if (!pair.target_major_owned || !pair.active) {
+  if (!pair.incremental_rows_owned || !pair.active) {
     pair.fixed_counts.clear();
-    pair.target_major_touched.clear();
-    pair.target_major_touched_overflow = false;
+    pair.incremental_rows_touched.clear();
+    pair.incremental_rows_touched_overflow = false;
   }
   pair.active_neighbors.clear();
   pair.active_counts.clear();
