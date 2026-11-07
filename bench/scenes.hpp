@@ -4,6 +4,7 @@
 // moves between frames. Backends only see SceneData.
 
 #include "scene.hpp"
+#include "trace.hpp"
 #include "vtk_points.hpp"
 
 #include <algorithm>
@@ -11,8 +12,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
@@ -35,6 +39,15 @@ struct SceneData {
   // the sorted order changes between frames.
   float jitter = 0.0f;
   std::vector<float> jitter_base;
+  // When > 0, set 0 follows a smooth divergence-free flow and moves at most
+  // flow * radius per frame. Points keep drifting, so memory order decays and
+  // particles keep changing cells, as they do in a simulation.
+  float flow = 0.0f;
+  float flow_wavenumber = 1.0f;
+  // When set, every set follows this captured trace instead of the fields above.
+  std::shared_ptr<const Trace> trace;
+  // Sets whose point count or storage changed in the last advance().
+  std::vector<int> resized;
   // Fountain-like growth: set 0 gains grow_per_frame points per frame until
   // it reaches grow_limit. The points are sampled uniformly in the axis-
   // aligned box stored in grow_min/grow_extent. The harness calls
@@ -76,7 +89,53 @@ struct SceneData {
     }
   }
 
+  void replay(int step) {
+    resized.clear();
+    for (std::size_t set = 0; set < xyz.size(); ++set) {
+      const Trace::Points points = trace->points(static_cast<int>(set), step);
+      std::vector<float> &target = xyz[set];
+      const std::size_t values = static_cast<std::size_t>(points.count) * 3;
+      if (values != target.size()) {
+        resized.push_back(static_cast<int>(set));
+      }
+      if (is_static[set] && values == target.size()) {
+        continue;
+      }
+      const float *before = target.data();
+      target.resize(values);
+      if (target.data() != before &&
+          (resized.empty() || resized.back() != static_cast<int>(set))) {
+        resized.push_back(static_cast<int>(set));
+      }
+      if (values != 0) {
+        std::memcpy(target.data(), points.xyz, values * sizeof(float));
+      }
+    }
+  }
+
+  void advance_flow() {
+    std::vector<float> &fluid = xyz[0];
+    const float amplitude = flow * radius;
+    const float k = flow_wavenumber;
+    for (std::size_t i = 0; i + 2 < fluid.size(); i += 3) {
+      const float x = fluid[i + 0];
+      const float y = fluid[i + 1];
+      const float z = fluid[i + 2];
+      fluid[i + 0] = x + amplitude * std::sin(k * y);
+      fluid[i + 1] = y + amplitude * std::sin(k * z);
+      fluid[i + 2] = z + amplitude * std::sin(k * x);
+    }
+  }
+
   void advance(int step) {
+    if (trace) {
+      replay(step);
+      return;
+    }
+    if (flow > 0.0f) {
+      advance_flow();
+      return;
+    }
     if (growing) {
       grow(step);
     }
@@ -363,6 +422,54 @@ inline SceneSpec many_set_scene(const std::string &name, int sets,
             }
             return data;
           }};
+}
+
+// One scene per captured trace, named after its file. Playback keeps the order
+// the simulation produced, which decays over time as it does in a real run.
+inline std::vector<SceneSpec> trace_scenes(const std::string &directory) {
+  std::vector<SceneSpec> scenes;
+  for (const std::filesystem::path &path : trace_files(directory)) {
+    std::string name = path.stem().string();
+    for (char &c : name) {
+      if (c == '.') {
+        c = 'p';
+      }
+    }
+    SceneSpec spec{name, [file = path.string()] {
+                     auto trace = std::make_shared<const Trace>(file);
+                     SceneData data;
+                     if (!trace->valid()) {
+                       return data;
+                     }
+                     const Trace::Header &header = trace->header();
+                     data.radius = header.radius;
+                     data.xyz.resize(static_cast<std::size_t>(header.sets));
+                     data.is_static.resize(static_cast<std::size_t>(header.sets));
+                     for (int set = 0; set < header.sets; ++set) {
+                       data.is_static[static_cast<std::size_t>(set)] =
+                           header.is_static[set] != 0;
+                       const Trace::Points points = trace->points(set, 0);
+                       if (points.count > 0) {
+                         data.xyz[static_cast<std::size_t>(set)].assign(
+                             points.xyz, points.xyz + 3 * points.count);
+                       }
+                     }
+                     // A static query set has no moving points to search for.
+                     // learnsph leaves such a pair active although it only reads
+                     // those lists during setup.
+                     for (int pair = 0; pair < header.pair_count; ++pair) {
+                       const int query = header.pairs[pair][0];
+                       if (header.is_static[query] == 0) {
+                         data.pairs.push_back({query, header.pairs[pair][1]});
+                       }
+                     }
+                     data.trace = std::move(trace);
+                     return data;
+                   }};
+    spec.zsorted = false;
+    scenes.push_back(std::move(spec));
+  }
+  return scenes;
 }
 
 inline std::vector<SceneSpec> synthetic_scenes() {

@@ -157,7 +157,7 @@ fi
   cat "${out}/meta.txt"
   echo
   echo "== timing"
-  rg "${regex%%/real_time*}|real_time" "${out}/timing.txt" | cut -c1-200 || true
+  rg "manual_time" "${out}/timing.txt" | cut -c1-200 || true
   for file in topdown_l1 topdown_l2 topdown_memory topdown_core topdown_frontend topdown_bad_speculation; do
     echo
     echo "== ${file}"

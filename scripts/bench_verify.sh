@@ -20,7 +20,13 @@ filter+='clustered_200k|clustered_200k_unsorted|'
 filter+='uniform_200k_dynamic_boundary|slab_200k_dynamic_boundary|'
 filter+='clustered_200k_dynamic_boundary|uniform_200k_growing|'
 filter+='slab_200k_growing|clustered_200k_growing|'
-filter+='uniform_200k|uniform_1m|clustered_200k)(/[0-9]+)?/real_time$'
+filter+='uniform_200k|uniform_1m|clustered_200k)(/[0-9]+)?/manual_time$'
+
+# Replays check the lists against the reference over the whole trace.
+taskset -c "${cpus}" "${build_dir}/bench/ispc_apfrnn_bench" \
+  --benchmark_filter="${APFRNN_VERIFY_FILTER:-^Verify/(apfrnn_cpu|tree)/}" \
+  --traces="${APFRNN_TRACES:-traces}" \
+  --threads="${threads}"
 
 exec taskset -c "${cpus}" "${build_dir}/bench/ispc_apfrnn_bench" \
   --benchmark_filter="${filter}" \

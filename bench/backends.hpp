@@ -8,7 +8,10 @@
 #include "apfrnn/neighbor_search.hpp"
 
 #include <benchmark/benchmark.h>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_reduce.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -23,6 +26,38 @@
 
 namespace apfrnn::bench {
 
+// One density-style pass over all lists: each neighbor's position is fetched
+// and a kernel evaluated, so list layout and order affect the cost. `row(query,
+// target, point, visit)` calls visit(neighbor) for every neighbor.
+template <typename Row>
+inline double density_pass(const SceneData &scene, const Row &row) {
+  const float h2 = scene.radius * scene.radius;
+  double total = 0.0;
+  for (const auto &[query, target] : scene.pairs) {
+    const float *q_xyz = scene.xyz[static_cast<std::size_t>(query)].data();
+    const float *t_xyz = scene.xyz[static_cast<std::size_t>(target)].data();
+    total += tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, scene.points(query), 1024), 0.0,
+        [&, query = query, target = target](const tbb::blocked_range<int> &range,
+                                            double sum) {
+          for (int point = range.begin(); point != range.end(); ++point) {
+            const float *q = q_xyz + 3 * static_cast<std::size_t>(point);
+            float density = 0.0f;
+            row(query, target, point, [&](uint32_t neighbor) {
+              const float *t = t_xyz + 3 * static_cast<std::size_t>(neighbor);
+              const float dx = t[0] - q[0], dy = t[1] - q[1], dz = t[2] - q[2];
+              const float w = std::max(0.0f, h2 - dx * dx - dy * dy - dz * dz);
+              density += w * w * w;
+            });
+            sum += density;
+          }
+          return sum;
+        },
+        std::plus<double>());
+  }
+  return total;
+}
+
 class Backend {
 public:
   virtual ~Backend() = default;
@@ -36,6 +71,8 @@ public:
   // Neighbors of `point` of set `query` in set `target`, in any order.
   virtual void neighbors(int query, int target, int point,
                          std::vector<uint32_t> &out) const = 0;
+  // Reads every neighbor list the way a density pass does and returns the sum.
+  virtual double read_lists(const SceneData &scene) const = 0;
   // Backend-specific counters, recorded after the timed frames.
   virtual void add_counters(benchmark::State &) const {}
 };
@@ -59,11 +96,15 @@ inline int64_t &benchmark_memory_budget_mb() {
 
 class ApfrnnBackend final : public Backend {
 public:
-  explicit ApfrnnBackend(SearchBackend backend) : backend_(backend) {}
+  explicit ApfrnnBackend(SearchBackend backend, float skin = 0.0f)
+      : backend_(backend), skin_(skin) {}
 
   void setup(const SceneData &scene) override {
     search_ = std::make_unique<NSearch>(scene.radius);
     search_->set_search_backend(backend_);
+    if (skin_ > 0.0f) {
+      search_->set_skin(skin_ * scene.radius);
+    }
     if (benchmark_memory_budget_mb() > 0) {
       search_->set_memory_budget(benchmark_memory_budget_mb() << 20);
     }
@@ -88,6 +129,15 @@ public:
                  std::vector<uint32_t> &out) const override {
     const NeighborList list = search_->get_neighbors(query, target, point);
     out.assign(list.begin(), list.end());
+  }
+
+  double read_lists(const SceneData &scene) const override {
+    return density_pass(scene, [this](int query, int target, int point,
+                                      auto &&visit) {
+      for (uint32_t neighbor : search_->get_neighbors(query, target, point)) {
+        visit(neighbor);
+      }
+    });
   }
 
   void add_counters(benchmark::State &state) const override {
@@ -126,6 +176,7 @@ public:
 
 private:
   SearchBackend backend_;
+  float skin_;
   std::unique_ptr<NSearch> search_;
 };
 
@@ -160,6 +211,17 @@ public:
     for (int k = 0; k < list.size(); ++k) {
       out[static_cast<std::size_t>(k)] = static_cast<uint32_t>(list[k]);
     }
+  }
+
+  double read_lists(const SceneData &scene) const override {
+    return density_pass(scene, [this](int query, int target, int point,
+                                      auto &&visit) {
+      const tns::NeighborList list =
+          search_->get_neighborlist(query, target, point);
+      for (int k = 0; k < list.size(); ++k) {
+        visit(static_cast<uint32_t>(list[k]));
+      }
+    });
   }
 
 private:
@@ -205,11 +267,30 @@ public:
     }
   }
 
+  double read_lists(const SceneData &scene) const override {
+    return density_pass(scene, [this](int query, int target, int point,
+                                      auto &&visit) {
+      const auto &set = search_->point_set(static_cast<unsigned int>(query));
+      const auto p = static_cast<unsigned int>(point);
+      const auto t = static_cast<unsigned int>(target);
+      const unsigned int count = set.n_neighbors(t, p);
+      for (unsigned int k = 0; k < count; ++k) {
+        visit(set.neighbor(t, p, k));
+      }
+    });
+  }
+
 private:
   std::unique_ptr<CompactNSearch::NeighborhoodSearch> search_;
 };
 
 #endif
+
+// Set by --skin=F: adds an apfrnn_skin backend with a skin of F * radius.
+inline float &benchmark_skin() {
+  static float skin = 0.0f;
+  return skin;
+}
 
 // Backends usable in this build and on this machine: GPU variants only with
 // the SYCL backend and a GPU, the baselines only with APFRNN_BUILD_BASELINES.
@@ -219,6 +300,12 @@ inline std::vector<BackendSpec> available_backends() {
   };
   std::vector<BackendSpec> backends = {
       {"apfrnn_cpu", apfrnn(SearchBackend::CpuExact)}};
+  if (benchmark_skin() > 0.0f) {
+    backends.push_back({"apfrnn_skin", [skin = benchmark_skin()] {
+                          return std::make_unique<ApfrnnBackend>(
+                              SearchBackend::CpuExact, skin);
+                        }});
+  }
   if (NSearch(1.0f).gpu_available()) {
     backends.push_back(
         {"apfrnn_gpu", apfrnn(SearchBackend::GpuExact), false});

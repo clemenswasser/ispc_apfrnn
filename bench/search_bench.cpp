@@ -1,6 +1,12 @@
 // Frame-time benchmark of every neighbor-search backend on the headline and
 // stress scenes, plus the NSearch-API scenarios (Api/...).
 //
+// Replay/<backend>/<trace> is the headline family: it replays searches captured
+// from a simulation, one forward and backward pass per run. Verify/ runs the
+// same frames untimed and checks the lists against an independent reference.
+// All timed families measure run() plus one density pass over the lists. Scene
+// updates are not timed.
+//
 // Benchmarks are named Frame/<backend>/<scene>, Stress/<backend>/<scene>,
 // Threads/<backend>/<scene>/<threads>, Cold/<backend>/<scene> and
 // Api/<scenario>/<scene>, so --benchmark_filter selects by family, backend or
@@ -15,6 +21,8 @@
 //   --learnsph_res=DIR       learnsph/res with the saved frames (default
 //                            ../learnsph/res); scenes whose files are missing
 //                            are skipped.
+//   --traces=DIR             captured traces (default traces)
+//   --skin=F                 add an apfrnn_skin backend with skin F * radius
 //   --memory_budget_mb=N     cap on one fixed-row allocation (library default
 //                            when omitted); useful to compare CSR fallback.
 
@@ -28,10 +36,12 @@
 #ifdef APFRNN_BENCH_BASELINES
 #include <omp.h>
 #endif
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -43,7 +53,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <fcntl.h>
 
 namespace {
 
@@ -71,9 +80,17 @@ const SceneData &cached_scene(const SceneSpec &spec) {
     }
     // Every benchmark scene moves every frame. Static benchmarks are not a
     // representation of an SPH simulation and are intentionally impossible.
-    if (!data.growing && data.motion == apfrnn::bench::Motion::Static &&
-        data.jitter == 0.0f) {
-      data.jitter = 0.1f;
+    if (!data.trace && !data.growing &&
+        data.motion == apfrnn::bench::Motion::Static && data.jitter == 0.0f) {
+      data.flow = 0.02f;
+      float low = std::numeric_limits<float>::max();
+      float high = std::numeric_limits<float>::lowest();
+      for (std::size_t i = 0; i < data.xyz[0].size(); i += 3) {
+        low = std::min(low, data.xyz[0][i]);
+        high = std::max(high, data.xyz[0][i]);
+      }
+      data.flow_wavenumber =
+          high > low ? 6.2831853f / (high - low) : 1.0f;
     }
     name = spec.name;
   }
@@ -189,6 +206,11 @@ Validation validate(const Backend &backend, const SceneData &scene) {
   return result;
 }
 
+int &verify_failures() {
+  static int failures = 0;
+  return failures;
+}
+
 void attach_rss(benchmark::State &state) {
   rusage usage{};
   if (getrusage(RUSAGE_SELF, &usage) == 0) {
@@ -204,6 +226,19 @@ void attach_rss(benchmark::State &state) {
       state.counters["RSSMB"] = static_cast<double>(resident_pages) * page_mb;
     }
     std::fclose(statm);
+  }
+  // Excludes the mapped trace files, which would otherwise dominate replays.
+  std::FILE *status = std::fopen("/proc/self/status", "r");
+  if (status != nullptr) {
+    char line[128];
+    long kilobytes = 0;
+    while (std::fgets(line, sizeof(line), status) != nullptr) {
+      if (std::sscanf(line, "RssAnon: %ld", &kilobytes) == 1) {
+        state.counters["AnonMB"] = static_cast<double>(kilobytes) / 1024.0;
+        break;
+      }
+    }
+    std::fclose(status);
   }
 }
 
@@ -231,6 +266,10 @@ void advance_scene(SceneData &scene, Backend &backend, int step) {
   scene.advance(step);
   if (scene.growing) {
     backend.resize(0, scene.xyz[0].data(), scene.points(0));
+  }
+  for (const int set : scene.resized) {
+    backend.resize(set, scene.xyz[static_cast<std::size_t>(set)].data(),
+                   scene.points(set));
   }
 }
 
@@ -287,15 +326,32 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   }
 
   int step = 2;
-  perf_region("enable\n");
+  double run_seconds = 0.0;
+  double read_seconds = 0.0;
+  double read_sum = 0.0;
   for (auto _ : state) {
     advance_scene(scene, *backend, step++);
+    perf_region("enable\n");
+    const auto start = std::chrono::steady_clock::now();
     backend->run();
+    const auto built = std::chrono::steady_clock::now();
+    read_sum += backend->read_lists(scene);
+    const auto done = std::chrono::steady_clock::now();
+    perf_region("disable\n");
+    const double run_time = std::chrono::duration<double>(built - start).count();
+    const double read_time = std::chrono::duration<double>(done - built).count();
+    run_seconds += run_time;
+    read_seconds += read_time;
+    state.SetIterationTime(run_time + read_time);
   }
-  perf_region("disable\n");
+  benchmark::DoNotOptimize(read_sum);
+  const double frame_count = std::max<double>(1.0, state.iterations());
+  state.counters["RunMs"] = 1000.0 * run_seconds / frame_count;
+  state.counters["ReadMs"] = 1000.0 * read_seconds / frame_count;
 
   const int fluid_points = scene.points(0);
   state.SetItemsProcessed(state.iterations() * fluid_points);
+  state.counters["Points"] = fluid_points;
   state.counters["CpuThreads"] = thread_count;
   state.counters["Neighbors"] = static_cast<double>(validation.neighbors);
   state.counters["FalsePositives"] =
@@ -315,6 +371,51 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   state.SetLabel(label);
   backend->add_counters(state);
   attach_rss(state);
+}
+
+// Runs every frame of a trace and checks the lists after each checked frame
+// against the reference. Large scenes check a subset of frames, but every frame
+// still runs, so state built up over the trace is what gets checked.
+void verify_frames(benchmark::State &state, const SceneSpec &spec,
+                   const BackendSpec &backend_spec) {
+  SceneData scene = cached_scene(spec);
+  const ThreadLimit limit(static_cast<int>(benchmark_threads()));
+  std::unique_ptr<Backend> backend = backend_spec.make();
+  backend->setup(scene);
+  backend->run();
+  const int total = scene.trace->cycle() + 1;
+  const int stride = std::max(1, scene.trace->max_points() / 100000);
+  int checked = 0;
+  for (auto _ : state) {
+    for (int step = 1; step <= total; ++step) {
+      advance_scene(scene, *backend, step);
+      backend->run();
+      if (step % stride != 0 && step != total) {
+        continue;
+      }
+      const Validation validation = validate(*backend, scene);
+      const ReferenceSummary expected = apfrnn::bench::reference_summary(scene);
+      ++checked;
+      if (validation.false_positives != 0 ||
+          (expected.complete &&
+           (validation.checksum != expected.checksum ||
+            validation.neighbors < expected.exact_pairs ||
+            validation.neighbors >
+                expected.exact_pairs + expected.band_pairs))) {
+        std::fprintf(stderr,
+                     "VERIFY FAILURE scene=%s backend=%s step=%d "
+                     "false_positives=%lld neighbors=%lld exact=%lld band=%lld\n",
+                     spec.name.c_str(), backend_spec.name.c_str(), step,
+                     static_cast<long long>(validation.false_positives),
+                     static_cast<long long>(validation.neighbors),
+                     static_cast<long long>(expected.exact_pairs),
+                     static_cast<long long>(expected.band_pairs));
+        verify_failures() += 1;
+        break;
+      }
+    }
+  }
+  state.counters["CheckedFrames"] = checked;
 }
 
 // Setup plus the first run() on a fresh backend: row capacities start from
@@ -337,7 +438,7 @@ void cold_frame(benchmark::State &state, const SceneSpec &spec,
 }
 
 bool verify_all() {
-  bool ok = true;
+  bool ok = verify_failures() == 0;
   int scenes = 0;
   int results = 0;
   for (const auto &[scene_name, entries] : verified_results()) {
@@ -390,12 +491,19 @@ bool verify_all() {
 
 int main(int argc, char **argv) {
   std::string learnsph_res = "../learnsph/res";
+  std::string traces = "traces";
   std::vector<char *> args;
   for (int i = 0; i < argc; ++i) {
     constexpr const char *kRes = "--learnsph_res=";
     constexpr const char *kBudget = "--memory_budget_mb=";
     constexpr const char *kThreads = "--threads=";
-    if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
+    constexpr const char *kTraces = "--traces=";
+    constexpr const char *kSkin = "--skin=";
+    if (std::strncmp(argv[i], kTraces, std::strlen(kTraces)) == 0) {
+      traces = argv[i] + std::strlen(kTraces);
+    } else if (std::strncmp(argv[i], kSkin, std::strlen(kSkin)) == 0) {
+      apfrnn::bench::benchmark_skin() = std::stof(argv[i] + std::strlen(kSkin));
+    } else if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
       learnsph_res = argv[i] + std::strlen(kRes);
     } else if (std::strncmp(argv[i], kBudget, std::strlen(kBudget)) == 0) {
       apfrnn::bench::benchmark_memory_budget_mb() =
@@ -434,10 +542,34 @@ int main(int argc, char **argv) {
             std::string(family) + "/" + backend.name + "/" + scene.name, frames,
             scene, backend, 0)
             ->Unit(benchmark::kMillisecond)
-            ->UseRealTime();
+            ->UseManualTime();
       }
     }
   };
+  // Replay measures exactly one forward and backward pass, so every backend
+  // times the same searches.
+  for (const SceneSpec &scene : apfrnn::bench::trace_scenes(traces)) {
+    const SceneData &data = cached_scene(scene);
+    if (!data.trace) {
+      continue;
+    }
+    const int frames_per_run = data.trace->cycle();
+    const bool resizes = data.trace->resizes();
+    for (const BackendSpec &backend : backends) {
+      if (resizes && !backend.supports_growing) {
+        continue;
+      }
+      benchmark::RegisterBenchmark("Replay/" + backend.name + "/" + scene.name,
+                                   frames, scene, backend, 0)
+          ->Unit(benchmark::kMillisecond)
+          ->UseManualTime()
+          ->Iterations(frames_per_run);
+      benchmark::RegisterBenchmark("Verify/" + backend.name + "/" + scene.name,
+                                   verify_frames, scene, backend)
+          ->Unit(benchmark::kMillisecond)
+          ->Iterations(1);
+    }
+  }
   register_family("Frame", scenes);
   register_family("Stress", apfrnn::bench::stress_scenes());
   register_family("Order", apfrnn::bench::order_scenes());
@@ -506,7 +638,7 @@ int main(int argc, char **argv) {
                                          std::to_string(threads),
                                      frames, scaling_scene, backend, threads)
             ->Unit(benchmark::kMillisecond)
-            ->UseRealTime();
+            ->UseManualTime();
       }
     }
   }

@@ -4,3 +4,4 @@ compile_commands.json
 .clangd
 perf.data*
 .perf-log/
+traces/
