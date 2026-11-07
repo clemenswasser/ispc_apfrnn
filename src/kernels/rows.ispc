@@ -325,8 +325,14 @@ static inline uniform int floor_to_cell_uniform(uniform float value) {
   return (uniform int)floor(value);
 }
 
-// Collects the 27 neighbor cells of cell (cx, cy, cz) as at most 9 runs of
-// contiguous target points (adjacent cells along z are contiguous).
+// Most runs dense_runs() can return: one per neighbor cell.
+#define DENSE_MAX_RUNS 27
+
+// Collects the 27 neighbor cells of cell (cx, cy, cz) as runs of contiguous
+// target points. Adjacent cells along z merge into one run when the cells are
+// sorted by signed coordinate, giving 9 runs. Radix-sorted keys order a
+// negative z after every positive one, so a column crossing z = 0 splits and
+// up to DENSE_MAX_RUNS runs are returned.
 static inline uniform int dense_runs(const uniform DenseGrid &grid,
                                      const uniform Cells &targets,
                                      uniform uint64 key,
@@ -504,8 +510,8 @@ export void write_fixed_rows_dense(
   const uniform Points qpts = *qpts_in;
   const uniform Points tpts = *tpts_in;
   const uniform FixedRows rows = *rows_in;
-  uniform int run_start[9];
-  uniform int run_end[9];
+  uniform int run_start[DENSE_MAX_RUNS];
+  uniform int run_end[DENSE_MAX_RUNS];
   for (uniform int cell = start_cell; cell < end_cell; ++cell) {
     const uniform int num_runs =
         dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
@@ -561,8 +567,8 @@ export void target_major_csr_record(
   const uniform Cells src = *src_in;
   const uniform Points spts = *spts_in;
   const uniform int *uniform perm = perm_in;
-  uniform int run_start[9];
-  uniform int run_end[9];
+  uniform int run_start[DENSE_MAX_RUNS];
+  uniform int run_end[DENSE_MAX_RUNS];
   uniform int cached_cx = 0x7FFFFFFF;
   uniform int cached_cy = 0;
   uniform int cached_cz = 0;
@@ -627,8 +633,8 @@ export void target_major_csr_fill(
   const uniform DenseGrid grid = *grid_in;
   const uniform Cells src = *src_in;
   const uniform Points spts = *spts_in;
-  uniform int run_start[9];
-  uniform int run_end[9];
+  uniform int run_start[DENSE_MAX_RUNS];
+  uniform int run_end[DENSE_MAX_RUNS];
   uniform int cached_cx = 0x7FFFFFFF;
   uniform int cached_cy = 0;
   uniform int cached_cz = 0;
