@@ -2754,6 +2754,16 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
   const int y_max = target.cell_range_max_y;
   const int z_min = target.cell_range_min_z;
   const int z_max = target.cell_range_max_z;
+  // A one-point-per-cell source already carries its cell key. When the target
+  // uses the same cell edge, reuse the key instead of recomputing the cell
+  // coordinates from the float position for every query.
+  const bool source_cell_keys =
+      source.max_cell_points <= 1 && source.num_cells == num_points &&
+      source.scratch_unique_keys.size() ==
+          static_cast<std::size_t>(num_points) &&
+      source.cell_radius == target.cell_radius;
+  const uint64_t *query_keys =
+      source_cell_keys ? source.scratch_unique_keys.data() : nullptr;
   int *row_counts = counts.data();
   int *row_values = fixed_neighbors.data();
 
@@ -2770,9 +2780,20 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
           const float px = qx[point];
           const float py = qy[point];
           const float pz = qz[point];
-          const int cx = floor_to_cell(px * inv_cell);
-          const int cy = floor_to_cell(py * inv_cell);
-          const int cz = floor_to_cell(pz * inv_cell);
+          int cx;
+          int cy;
+          int cz;
+          if (query_keys != nullptr) {
+            const uint64_t key =
+                query_keys[static_cast<std::size_t>(point)];
+            cx = unpack_coord(key, 42);
+            cy = unpack_coord(key, 21);
+            cz = unpack_coord(key, 0);
+          } else {
+            cx = floor_to_cell(px * inv_cell);
+            cy = floor_to_cell(py * inv_cell);
+            cz = floor_to_cell(pz * inv_cell);
+          }
           int count = 0;
           int x0 = std::max(cx - stencil, x_min);
           int x1 = std::min(cx + stencil, x_min + x_span - 1);
