@@ -1852,8 +1852,9 @@ void build_point_grid_inplace(NeighborSearchData &data,
   const int stencil_width = 2 * data.cell_stencil + 1;
   data.max_neighbor_cells = stencil_width * stencil_width * stencil_width;
 
-  // The cell-x slab index describes the previous sorted order.
+  // The cell-x slab index and occupancy describe the previous sorted order.
   data.cell_x_valid = false;
+  data.occupancy_valid = false;
   // Blocks and their cell bounds describe the previous sorted order.
   data.blocks_valid = false;
   data.block_begin.clear();
@@ -2716,6 +2717,152 @@ void ensure_cell_x_index(NeighborSearchData &data) {
   data.cell_x_valid = true;
 }
 
+// Builds a coarse occupancy bitmap for a target set. Each bit covers a cube
+// of edge >= 2*radius, so a query only needs the 2x2x2 blocks its sphere can
+// touch. The bitmap is capped near 16 MiB; wide sparse domains are exactly
+// where it pays off.
+void ensure_occupancy(NeighborSearchData &data) {
+  if (data.occupancy_valid) {
+    return;
+  }
+  const int num_points = data.num_points;
+  if (num_points <= 0 || !(data.cell_radius > 0.0f) ||
+      data.sorted_x.size() != static_cast<std::size_t>(num_points)) {
+    return;
+  }
+  const float *x = data.sorted_x.data();
+  const float *y = data.sorted_y.data();
+  const float *z = data.sorted_z.data();
+  struct Box {
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float min_z = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float max_y = std::numeric_limits<float>::lowest();
+    float max_z = std::numeric_limits<float>::lowest();
+  };
+  const Box box = tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, num_points, 65536), Box{},
+      [&](const tbb::blocked_range<int> &range, Box acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t at = static_cast<std::size_t>(i);
+          acc.min_x = std::min(acc.min_x, x[at]);
+          acc.min_y = std::min(acc.min_y, y[at]);
+          acc.min_z = std::min(acc.min_z, z[at]);
+          acc.max_x = std::max(acc.max_x, x[at]);
+          acc.max_y = std::max(acc.max_y, y[at]);
+          acc.max_z = std::max(acc.max_z, z[at]);
+        }
+        return acc;
+      },
+      [](Box a, const Box &b) {
+        a.min_x = std::min(a.min_x, b.min_x);
+        a.min_y = std::min(a.min_y, b.min_y);
+        a.min_z = std::min(a.min_z, b.min_z);
+        a.max_x = std::max(a.max_x, b.max_x);
+        a.max_y = std::max(a.max_y, b.max_y);
+        a.max_z = std::max(a.max_z, b.max_z);
+        return a;
+      });
+  const float extent_x = box.max_x - box.min_x;
+  const float extent_y = box.max_y - box.min_y;
+  const float extent_z = box.max_z - box.min_z;
+  const float longest = std::max(extent_x, std::max(extent_y, extent_z));
+  constexpr float kMaxBlocksPerAxis = 500.0f;
+  float block = std::max(2.0f * data.cell_radius, longest / kMaxBlocksPerAxis);
+  if (!(block > 0.0f) || !std::isfinite(block)) {
+    return;
+  }
+  auto axis_blocks = [&](float extent) {
+    return std::max(1, static_cast<int>(extent / block) + 1);
+  };
+  const int nx = axis_blocks(extent_x);
+  const int ny = axis_blocks(extent_y);
+  const int nz = axis_blocks(extent_z);
+  const std::size_t total = static_cast<std::size_t>(nx) * ny * nz;
+  if (total == 0 || total > (std::size_t{1} << 27)) {
+    return;
+  }
+  data.occupancy_block = block;
+  data.occupancy_min_x = box.min_x;
+  data.occupancy_min_y = box.min_y;
+  data.occupancy_min_z = box.min_z;
+  data.occupancy_nx = nx;
+  data.occupancy_ny = ny;
+  data.occupancy_nz = nz;
+  data.occupancy_bits.assign((total + 7) / 8, 0);
+  const float inv_block = 1.0f / block;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, 16384),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t at = static_cast<std::size_t>(i);
+          const int bx = std::min(
+              nx - 1,
+              std::max(0, static_cast<int>((x[at] - box.min_x) * inv_block)));
+          const int by = std::min(
+              ny - 1,
+              std::max(0, static_cast<int>((y[at] - box.min_y) * inv_block)));
+          const int bz = std::min(
+              nz - 1,
+              std::max(0, static_cast<int>((z[at] - box.min_z) * inv_block)));
+          const std::size_t index =
+              (static_cast<std::size_t>(bz) * ny + by) * nx + bx;
+          __atomic_fetch_or(&data.occupancy_bits[index >> 3],
+                            static_cast<uint8_t>(1u << (index & 7)),
+                            __ATOMIC_RELAXED);
+        }
+      });
+  data.occupancy_valid = true;
+}
+
+bool occupancy_may_contain(const NeighborSearchData &data, float qx,
+                           float qy, float qz, float radius) {
+  if (!data.occupancy_valid) {
+    return true;
+  }
+  if (2.0f * radius > data.occupancy_block) {
+    return true;
+  }
+  const float upper_x =
+      data.occupancy_min_x + data.occupancy_nx * data.occupancy_block;
+  const float upper_y =
+      data.occupancy_min_y + data.occupancy_ny * data.occupancy_block;
+  const float upper_z =
+      data.occupancy_min_z + data.occupancy_nz * data.occupancy_block;
+  if (qx + radius < data.occupancy_min_x ||
+      qy + radius < data.occupancy_min_y ||
+      qz + radius < data.occupancy_min_z || qx - radius >= upper_x ||
+      qy - radius >= upper_y || qz - radius >= upper_z) {
+    return false;
+  }
+  const float inv_block = 1.0f / data.occupancy_block;
+  auto range = [&](float q, float min_value, int n, int &first, int &last) {
+    first = static_cast<int>((q - radius - min_value) * inv_block);
+    last = static_cast<int>((q + radius - min_value) * inv_block);
+    first = std::min(n - 1, std::max(0, first));
+    last = std::min(n - 1, std::max(0, last));
+  };
+  int x0, x1, y0, y1, z0, z1;
+  range(qx, data.occupancy_min_x, data.occupancy_nx, x0, x1);
+  range(qy, data.occupancy_min_y, data.occupancy_ny, y0, y1);
+  range(qz, data.occupancy_min_z, data.occupancy_nz, z0, z1);
+  for (int bz = z0; bz <= z1; ++bz) {
+    for (int by = y0; by <= y1; ++by) {
+      for (int bx = x0; bx <= x1; ++bx) {
+        const std::size_t index =
+            (static_cast<std::size_t>(bz) * data.occupancy_ny + by) *
+                data.occupancy_nx +
+            bx;
+        if ((data.occupancy_bits[index >> 3] >> (index & 7)) & 1u) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
                                  int capacity, IntBuffer &fixed_neighbors,
@@ -2780,6 +2927,11 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
           const float px = qx[point];
           const float py = qy[point];
           const float pz = qz[point];
+          if (target.occupancy_valid &&
+              !occupancy_may_contain(target, px, py, pz, radius)) {
+            row_counts[point] = 0;
+            continue;
+          }
           int cx;
           int cy;
           int cz;

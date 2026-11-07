@@ -216,6 +216,18 @@ struct NeighborSearchData {
   int cell_coord_min_z = 0;
   int cell_coord_max_z = 0;
   bool cell_coord_valid = false;
+  // Coarse occupancy bitmap of the set's points, used to prove that a cross
+  // query's search can be skipped. Built lazily and invalidated by a grid
+  // rebuild.
+  std::vector<uint8_t> occupancy_bits;
+  float occupancy_block = 0.0f;
+  float occupancy_min_x = 0.0f;
+  float occupancy_min_y = 0.0f;
+  float occupancy_min_z = 0.0f;
+  int occupancy_nx = 0;
+  int occupancy_ny = 0;
+  int occupancy_nz = 0;
+  bool occupancy_valid = false;
   // True when scratch_unique_keys is also the per-sorted-position key array
   // (one point per cell), so the next merge can use it directly.
   bool incremental_keys_are_unique = false;
@@ -395,6 +407,7 @@ void ensure_hash_table(NeighborSearchData &data);
 // index (x slab -> y range -> z range) instead of scanning an x-window or
 // probing a hash. Returns false when a row exceeded `capacity`.
 void ensure_cell_x_index(NeighborSearchData &data);
+void ensure_occupancy(NeighborSearchData &data);
 
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
