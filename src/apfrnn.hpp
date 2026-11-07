@@ -176,6 +176,9 @@ struct NeighborSearchData {
   bool hash_valid = false;
   std::vector<SortPointKey> scratch_point_keys;
   std::vector<SortPointKey> scratch_point_keys_alt;
+  // Compact 64-bit cell keys for the dense counting-sort path (the original
+  // index is the array position, so the per-point index field is not stored).
+  std::vector<uint64_t> dense_keys;
   std::vector<uint64_t> scratch_unique_keys;
   // True when cell_starts/cell_ends/scratch_unique_keys are ordered by signed
   // cell coordinates (the comparison/counting sorts); false for the radix
@@ -337,6 +340,7 @@ struct CrossNeighborSearchData {
   IntBuffer col_idx;
   std::vector<SortPointKey> scratch_point_keys;
   std::vector<SortPointKey> scratch_point_keys_alt;
+  std::vector<uint64_t> dense_keys;
   std::vector<uint64_t> scratch_unique_keys;
   IntBuffer scratch_cached_neighbor_cells;
   IntBuffer scratch_cached_neighbor_counts;
@@ -351,13 +355,16 @@ void ensure_point_blocks(NeighborSearchData &data);
 // `interleaved` (optional) points at the caller's packed xyz array; when set,
 // the build reads positions directly from it instead of the SoA x/y/z copies,
 // and `world_bounds` receives the exact float AABB computed in the key pass.
-void build_point_grid_inplace(NeighborSearchData &data,
+// Returns true when `inverse_out` (original point -> sorted position) was
+// filled by the build; the caller can then skip a separate inversion pass.
+bool build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &x,
                               const std::vector<float> &y,
                               const std::vector<float> &z, float radius,
                               float cell_radius = 0.0f,
                               const float *interleaved = nullptr,
-                              Bounds *world_bounds = nullptr);
+                              Bounds *world_bounds = nullptr,
+                              IntBuffer *inverse_out = nullptr);
 
 // Builds the same-set neighbor-cell ranges using the grid produced by
 // build_point_grid_inplace().

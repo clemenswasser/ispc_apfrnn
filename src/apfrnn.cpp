@@ -268,17 +268,18 @@ struct CellBounds {
   Bounds world;
 };
 
-inline void sort_point_set(
+inline bool sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
     const std::vector<float> &z, float inv_radius, std::vector<float> &sorted_x,
     std::vector<float> &sorted_y, std::vector<float> &sorted_z,
     IntBuffer &original_index, IntBuffer &cell_starts, IntBuffer &cell_ends,
     std::vector<SortPointKey> &point_keys,
     std::vector<SortPointKey> &point_keys_alt,
-    std::vector<uint64_t> &unique_keys, bool &signed_order,
-    CellBounds *bounds_out, const float *interleaved) {
+    std::vector<uint64_t> &dense_keys, std::vector<uint64_t> &unique_keys,
+    bool &signed_order, CellBounds *bounds_out, const float *interleaved,
+    IntBuffer *inverse_out) {
   int const num_points = static_cast<int>(x.size());
-  point_keys.resize(num_points);
+  dense_keys.resize(num_points);
   const CellBounds bounds = tbb::parallel_reduce(
       tbb::blocked_range<int>(0, num_points, 2048), CellBounds{},
       [&](const tbb::blocked_range<int> &range, CellBounds acc) {
@@ -300,8 +301,7 @@ inline void sort_point_set(
           const int cx = floor_to_cell(gx * inv_radius);
           const int cy = floor_to_cell(gy * inv_radius);
           const int cz = floor_to_cell(gz * inv_radius);
-          point_keys[at].key = make_key(cx, cy, cz);
-          point_keys[at].index = i;
+          dense_keys[at] = make_key(cx, cy, cz);
           acc.min_cx = std::min(acc.min_cx, cx);
           acc.min_cy = std::min(acc.min_cy, cy);
           acc.min_cz = std::min(acc.min_cz, cz);
@@ -350,6 +350,10 @@ inline void sort_point_set(
       nx * ny <= kCountingCellLimit && total_cells <= kCountingCellLimit &&
       total_cells <= 4LL * num_points;
   if (dense_domain) {
+    if (inverse_out != nullptr) {
+      inverse_out->resize(static_cast<std::size_t>(num_points));
+    }
+    int *inverse = inverse_out != nullptr ? inverse_out->data() : nullptr;
     constexpr int64_t kCellGrain = 4096;
     std::vector<std::atomic<int>> counts(
         static_cast<std::size_t>(total_cells));
@@ -366,7 +370,7 @@ inline void sort_point_set(
         tbb::blocked_range<int>(0, num_points, 2048),
         [&](const tbb::blocked_range<int> &range) {
           for (int i = range.begin(); i < range.end(); ++i) {
-            const uint64_t key = point_keys[static_cast<std::size_t>(i)].key;
+            const uint64_t key = dense_keys[static_cast<std::size_t>(i)];
             const int lx = unpack_coord(key, 42) - min_cx;
             const int ly = unpack_coord(key, 21) - min_cy;
             const int lz = unpack_coord(key, 0) - min_cz;
@@ -459,7 +463,7 @@ inline void sort_point_set(
         tbb::blocked_range<int>(0, num_points, 2048),
         [&](const tbb::blocked_range<int> &range) {
           for (int i = range.begin(); i < range.end(); ++i) {
-            const uint64_t key = point_keys[static_cast<std::size_t>(i)].key;
+            const uint64_t key = dense_keys[static_cast<std::size_t>(i)];
             const int lx = unpack_coord(key, 42) - min_cx;
             const int ly = unpack_coord(key, 21) - min_cy;
             const int lz = unpack_coord(key, 0) - min_cz;
@@ -497,6 +501,10 @@ inline void sort_point_set(
             const int end = cell_ends[static_cast<std::size_t>(cell)];
             const int count = end - begin;
             if (count < 2) {
+              if (inverse != nullptr) {
+                inverse[static_cast<std::size_t>(
+                    original_index[static_cast<std::size_t>(begin)])] = begin;
+              }
               continue;
             }
             if (count <= 32) {
@@ -543,11 +551,23 @@ inline void sort_point_set(
                     points[static_cast<std::size_t>(i)].index;
               }
             }
+            if (inverse != nullptr) {
+              for (int i = begin; i < end; ++i) {
+                inverse[static_cast<std::size_t>(
+                    original_index[static_cast<std::size_t>(i)])] = i;
+              }
+            }
           }
         });
-    return;
+    return inverse != nullptr;
   }
 
+  // The full-sort paths need the original index next to each key.
+  point_keys.resize(num_points);
+  tbb::parallel_for(0, num_points, [&](int i) {
+    point_keys[static_cast<std::size_t>(i)] =
+        SortPointKey{dense_keys[static_cast<std::size_t>(i)], i};
+  });
   signed_order = radix_sort_point_keys(point_keys, point_keys_alt);
 
   sorted_x.resize(num_points);
@@ -587,6 +607,7 @@ inline void sort_point_set(
     }
   }
   cell_ends.push_back(num_points);
+  return false;
 }
 
 // Chunked stable compaction: writes the emitting indices in ascending order.
@@ -2018,12 +2039,12 @@ static void build_point_blocks_inplace(NeighborSearchData &data) {
 
 inline void build_dense_range_cache(NeighborSearchData &data);
 
-void build_point_grid_inplace(NeighborSearchData &data,
+bool build_point_grid_inplace(NeighborSearchData &data,
                               const std::vector<float> &x,
                               const std::vector<float> &y,
                               const std::vector<float> &z, float radius,
                               float cell_radius, const float *interleaved,
-                              Bounds *world_bounds) {
+                              Bounds *world_bounds, IntBuffer *inverse_out) {
   data.num_points = static_cast<int>(x.size());
   data.radius = radius;
   data.cell_radius = cell_radius > 0.0f ? cell_radius : radius;
@@ -2112,19 +2133,21 @@ void build_point_grid_inplace(NeighborSearchData &data,
     data.dense_stencil_cell_ends.clear();
     data.dense_stencil_total = -1;
     data.dense_stencil_cache_valid = false;
-    return;
+    return false;
   }
 
   float inv_radius = 1.0f / data.cell_radius;
   const bool incremental = try_incremental_sort_point_set(
       data, x, y, z, inv_radius, interleaved, world_bounds);
+  bool inverse_written = false;
   if (!incremental) {
     CellBounds bounds;
-    sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
-                   data.sorted_z, data.original_index, data.cell_starts,
-                   data.cell_ends, data.scratch_point_keys,
-                   data.scratch_point_keys_alt, data.scratch_unique_keys,
-                   data.cell_keys_signed_order, &bounds, interleaved);
+    inverse_written = sort_point_set(
+        x, y, z, inv_radius, data.sorted_x, data.sorted_y, data.sorted_z,
+        data.original_index, data.cell_starts, data.cell_ends,
+        data.scratch_point_keys, data.scratch_point_keys_alt, data.dense_keys,
+        data.scratch_unique_keys, data.cell_keys_signed_order, &bounds,
+        interleaved, inverse_out);
     if (world_bounds != nullptr) {
       *world_bounds = bounds.world;
     }
@@ -2191,6 +2214,11 @@ void build_point_grid_inplace(NeighborSearchData &data,
     }
   }
   data.max_cell_points = max_cell_points;
+  // Dense blocks reorder points inside cells; the inverse written during the
+  // in-cell sort would be stale, so let the caller rebuild it in that case.
+  if (inverse_written && max_cell_points > 32) {
+    inverse_written = false;
+  }
   if (!incremental) {
     // The merge only targets sparse grids; dense sets keep the full-sort
     // path and must not pay to capture merge state they will never use.
@@ -2217,6 +2245,7 @@ void build_point_grid_inplace(NeighborSearchData &data,
     build_point_blocks_inplace(data);
   }
   build_dense_range_cache(data);
+  return inverse_written;
 }
 
 void ensure_point_blocks(NeighborSearchData &data) {
@@ -3930,8 +3959,9 @@ static void build_cross_neighbor_search_data_inplace(
   sort_point_set(query_x, query_y, query_z, inv_radius, data.sorted_x,
                  data.sorted_y, data.sorted_z, data.original_index,
                  data.cell_starts, data.cell_ends, data.scratch_point_keys,
-                 data.scratch_point_keys_alt, data.scratch_unique_keys,
-                 signed_order, nullptr, nullptr);
+                 data.scratch_point_keys_alt, data.dense_keys,
+                 data.scratch_unique_keys, signed_order, nullptr, nullptr,
+                 nullptr);
   auto const &unique_keys = data.scratch_unique_keys;
 
   data.num_cells = static_cast<int>(data.cell_starts.size());

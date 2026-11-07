@@ -1709,13 +1709,15 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
           ? static_cast<const float *>(point_set.source)
           : nullptr;
   Bounds world;
-  build_point_grid_inplace(point_set.data, point_set.x, point_set.y,
-                           point_set.z, grid_radius, cell_radius, interleaved,
-                           &world);
+  const bool inverse_written = build_point_grid_inplace(
+      point_set.data, point_set.x, point_set.y, point_set.z, grid_radius,
+      cell_radius, interleaved, &world, &point_set.original_to_sorted);
   if (!world.empty()) {
     point_set.bounds = world;
   }
-  update_sorted_mapping(point_set.data, point_set.original_to_sorted);
+  if (!inverse_written) {
+    update_sorted_mapping(point_set.data, point_set.original_to_sorted);
+  }
   point_set.valid = true;
   point_set.same_lists_valid = false;
   point_set.fixed_valid = false;
@@ -1787,13 +1789,15 @@ void NSearch::build_point_grid(int set) {
           ? static_cast<const float *>(point_set.source)
           : nullptr;
   Bounds world;
-  build_point_grid_inplace(point_set.data, point_set.x, point_set.y,
-                           point_set.z, grid_radius, cell_radius, interleaved,
-                           &world);
+  const bool inverse_written = build_point_grid_inplace(
+      point_set.data, point_set.x, point_set.y, point_set.z, grid_radius,
+      cell_radius, interleaved, &world, &point_set.original_to_sorted);
   if (!world.empty()) {
     point_set.bounds = world;
   }
-  update_sorted_mapping(point_set.data, point_set.original_to_sorted);
+  if (!inverse_written) {
+    update_sorted_mapping(point_set.data, point_set.original_to_sorted);
+  }
   point_set.valid = true;
   ++point_set.grid_generation;
 }
