@@ -595,9 +595,7 @@ void NSearch::run() {
         bool cell_range = cell_range_cross_candidate(source, target);
         if (cell_range) {
           ensure_cell_x_index(target.data);
-          // The coarse bitmap pays off only when the target's cell index
-          // exceeds the cache; small targets are cheaper to search directly.
-          if (target.data.num_points >= 1000000) {
+          if (target.data.num_points >= 100000) {
             ensure_occupancy(target.data);
           }
           cell_range = target.data.cell_x_valid;

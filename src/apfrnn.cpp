@@ -2779,19 +2779,34 @@ void ensure_occupancy(NeighborSearchData &data) {
   const float extent_y = box.max_y - box.min_y;
   const float extent_z = box.max_z - box.min_z;
   const float longest = std::max(extent_x, std::max(extent_y, extent_z));
-  constexpr float kMaxBlocksPerAxis = 500.0f;
-  float block = std::max(2.0f * data.cell_radius, longest / kMaxBlocksPerAxis);
+  // Size the bitmap to the target (~8 bits per point, capped at 16 MiB), not
+  // to a fixed 500^3 grid. A 2M-target boundary gets a 2 MiB bitmap and a
+  // 200k emitter gets ~200 KiB, so both culling lookups stay in cache.
+  constexpr std::size_t kMaxBits = std::size_t{1} << 27;
+  const std::size_t target_bits = std::min(
+      kMaxBits, std::max<std::size_t>(1024, 8 * static_cast<std::size_t>(num_points)));
+  int axis = std::max(
+      1, static_cast<int>(std::cbrt(static_cast<double>(target_bits))));
+  float block = std::max(2.0f * data.cell_radius, longest / axis);
   if (!(block > 0.0f) || !std::isfinite(block)) {
     return;
   }
   auto axis_blocks = [&](float extent) {
     return std::max(1, static_cast<int>(extent / block) + 1);
   };
-  const int nx = axis_blocks(extent_x);
-  const int ny = axis_blocks(extent_y);
-  const int nz = axis_blocks(extent_z);
-  const std::size_t total = static_cast<std::size_t>(nx) * ny * nz;
-  if (total == 0 || total > (std::size_t{1} << 27)) {
+  int nx = axis_blocks(extent_x);
+  int ny = axis_blocks(extent_y);
+  int nz = axis_blocks(extent_z);
+  std::size_t total = static_cast<std::size_t>(nx) * ny * nz;
+  // Long/thin boxes can exceed the cap even with the derived edge.
+  while (total > kMaxBits) {
+    block *= 1.25f;
+    nx = axis_blocks(extent_x);
+    ny = axis_blocks(extent_y);
+    nz = axis_blocks(extent_z);
+    total = static_cast<std::size_t>(nx) * ny * nz;
+  }
+  if (total == 0) {
     return;
   }
   data.occupancy_block = block;
