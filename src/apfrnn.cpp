@@ -620,8 +620,6 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
   if (data.max_cell_points > 1) {
     return false;
   }
-  auto &current = data.scratch_point_keys;
-  current.resize(static_cast<std::size_t>(num_points));
   auto &changed = data.incremental_changed;
   changed.resize(static_cast<std::size_t>(num_points));
   uint64_t *previous_keys = data.incremental_keys.data();
@@ -638,7 +636,6 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
           const int cy = floor_to_cell(y[at] * inv_radius);
           const int cz = floor_to_cell(z[at] * inv_radius);
           const uint64_t key = make_key(cx, cy, cz);
-          current[at] = SortPointKey{key, i};
           const bool differs = key != previous_keys[at];
           changed[at] = differs ? 1 : 0;
           acc.changed += differs ? 1 : 0;
@@ -709,7 +706,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
       num_points, 16384, [&](int i) { return changed[static_cast<std::size_t>(i)] != 0; },
       [&](int write, int i) {
         changed_keys[static_cast<std::size_t>(write)] =
-            current[static_cast<std::size_t>(i)];
+            SortPointKey{data.incremental_keys[static_cast<std::size_t>(i)], i};
       });
   tbb::parallel_sort(changed_keys.begin(), changed_keys.end(), less);
 
