@@ -2522,14 +2522,31 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
 // appended symmetrically with atomic increments, which is cheapest for the
 // sparse sets this path targets (their rows are almost always empty).
 bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
-                            IntBuffer &fixed_neighbors, IntBuffer &counts) {
+                            IntBuffer &fixed_neighbors, IntBuffer &counts,
+                            std::vector<int> &touched_rows,
+                            bool &touched_overflow, bool reuse_rows,
+                            int &max_count_out) {
   const int stride = capacity;
+  const std::size_t counts_before = counts.size();
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(data.num_points), stride);
+  // Counts use a default-init allocator. Zero the whole buffer when it was
+  // reallocated or another writer touched it; otherwise only the rows this
+  // writer incremented last time need clearing.
+  if (!reuse_rows || counts_before != counts.size() || touched_overflow) {
+    std::fill(counts.begin(), counts.end(), 0);
+    touched_rows.clear();
+    touched_overflow = false;
+  } else {
+    for (int row : touched_rows) {
+      counts[static_cast<std::size_t>(row)] = 0;
+    }
+    touched_rows.clear();
+  }
+  max_count_out = 0;
   if (data.num_points == 0) {
     return true;
   }
-  std::fill(counts.begin(), counts.end(), 0);
   const int num_cells = data.num_cells;
   const bool implicit_cells = data.cell_ranges_implicit;
   const uint64_t *keys = data.scratch_unique_keys.data();
@@ -2561,9 +2578,19 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
                          }) -
         keys);
   };
+  constexpr std::size_t kTouchedCap = std::size_t{1} << 20;
+  std::mutex touched_mutex;
   auto append = [&](int row, int value) {
     const int slot =
         __atomic_fetch_add(&row_counts[row], 1, __ATOMIC_RELAXED);
+    if (slot == 0) {
+      std::lock_guard<std::mutex> lock(touched_mutex);
+      if (touched_rows.size() < kTouchedCap) {
+        touched_rows.push_back(row);
+      } else {
+        touched_overflow = true;
+      }
+    }
     if (slot < capacity) {
       row_values[static_cast<std::size_t>(row) * stride + slot] = value;
     }
@@ -2739,7 +2766,16 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
           }
         }
       });
-  return max_row_count(counts) <= capacity;
+  // Only rows with at least one neighbor are non-zero, so the max comes from
+  // the touched list; a full scan is the fallback when the list overflowed.
+  if (touched_overflow) {
+    max_count_out = max_row_count(counts);
+  } else {
+    for (int row : touched_rows) {
+      max_count_out = std::max(max_count_out, counts[row]);
+    }
+  }
+  return max_count_out <= capacity;
 }
 
 // Builds the cell-x slab index and the cell y/z bounds. The cell keys must be

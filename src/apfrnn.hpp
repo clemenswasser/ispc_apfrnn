@@ -407,7 +407,10 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
 // avoiding per-cell hash probes and per-cell range tables. Returns false when
 // a row exceeded `capacity` (the caller retries with a larger capacity).
 bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
-                            IntBuffer &fixed_neighbors, IntBuffer &counts);
+                            IntBuffer &fixed_neighbors, IntBuffer &counts,
+                            std::vector<int> &touched_rows,
+                            bool &touched_overflow, bool reuse_rows,
+                            int &max_count_out);
 
 // Builds the hashed cell lookup if the grid does not have a dense one and the
 // hash has not been built yet. Sparse grids defer it: the merged-key same-set

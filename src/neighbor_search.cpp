@@ -1759,6 +1759,10 @@ void NSearch::build_same_lists(int set) {
     return;
   }
   if (point_set.use_sweep) {
+    // Sweep rows own the counts buffer; the sparse grid writer must not
+    // reuse its touched-row state after this path.
+    point_set.incremental_rows_owned = false;
+    point_set.fixed_max_count = -1;
     if (build_sweep_same_lists(set)) {
       // Sweep rows use the plain fixed layout; get_neighbors would read them
       // through the block-row offsets of an earlier frame otherwise.
@@ -1782,6 +1786,11 @@ void NSearch::build_grid_same_lists(int set) {
   // (radius + skin) that fixed and skin rows are written with.
   data.radius = build_radius();
   point_set.fixed_valid = false;
+  point_set.fixed_max_count = -1;
+  // Whether the counts buffer still holds only this writer's rows from the
+  // previous frame; every other layout leaves it false.
+  const bool sparse_rows_reuse = point_set.incremental_rows_owned;
+  point_set.incremental_rows_owned = false;
   // A moving set is re-sorted on every grid rebuild, so cached per-row block
   // capacities no longer match their rows and nearly every frame overflows
   // and rewrites all rows; it uses fixed rows instead. The first build is
@@ -1798,12 +1807,18 @@ void NSearch::build_grid_same_lists(int set) {
   // point and materializing per-cell run tables.
   if (grid_rebuilt && data.cell_stencil == 1 && data.max_cell_points <= 1 &&
       data.num_cells == data.num_points && data.num_cells > 0) {
+    bool reuse_rows = sparse_rows_reuse;
     for (int capacity : {1, 2, 4, 8, 16, 32}) {
-      if (!write_sparse_same_rows(data, capacity, point_set.fixed_neighbors,
-                                  point_set.fixed_counts)) {
+      int max_count = 0;
+      if (!write_sparse_same_rows(
+              data, capacity, point_set.fixed_neighbors,
+              point_set.fixed_counts, point_set.incremental_rows_touched,
+              point_set.incremental_rows_touched_overflow, reuse_rows,
+              max_count)) {
+        reuse_rows = true;
         continue;
       }
-      const int max_count = max_row_count(point_set.fixed_counts);
+      point_set.incremental_rows_owned = true;
       point_set.fixed_max_count = max_count;
       point_set.block_rows = false;
       point_set.fixed_capacity = capacity;
