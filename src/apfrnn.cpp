@@ -602,6 +602,93 @@ int parallel_compact(int count, int grain, Pred &&pred, Emit &&emit) {
 // comparator, and a parallel merge path splits the output into one range per
 // worker. Returns false when a full sort is needed (first build, radius or
 // point count change, or too many changed cells).
+// Size-adaptive sort for the changed cell keys. When the changed list is
+// small relative to its x-cell span, a counting sort by the x field followed
+// by a per-bucket comparison sort beats the general comparison sort: the
+// buckets hold only a handful of keys. At larger changed counts (the 8M
+// sparse case) the buckets grow and the histogram/scatter passes stop paying,
+// so the caller keeps the parallel comparison sort (the measured 8M
+// behaviour). The per-bucket sort uses the same (key, index) order as the
+// comparison path, so the result is identical and deterministic.
+template <typename Less>
+bool bucket_sort_changed_keys(std::vector<SortPointKey> &keys,
+                              std::vector<SortPointKey> &scratch,
+                              bool signed_order, int min_x, int max_x,
+                              Less &&less) {
+  const int num_points = static_cast<int>(keys.size());
+  const int span = max_x - min_x + 1;
+  constexpr int kMaxSpan = 1 << 18;
+  constexpr int kMinPoints = 65536;
+  if (num_points < kMinPoints || span <= 0 || span > kMaxSpan ||
+      static_cast<long long>(num_points) >
+          static_cast<long long>(span) * 32) {
+    return false;
+  }
+  const uint64_t mask = signed_order ? SortPointKey::kSignBits : 0;
+  const int offset = signed_order ? 0x100000 : 0;
+  // Keys outside [min_x, max_x] are the masked negative-x cells: raw-key
+  // order places them after every non-negative x, which is exactly the last
+  // bucket, and the per-bucket comparison sorts them behind that bucket's
+  // single non-negative key. Clamping is therefore order-correct.
+  auto bucket_of = [&](uint64_t key) {
+    const int bucket =
+        static_cast<int>(((key ^ mask) >> 42) & 0x1FFFFFULL) - offset - min_x;
+    return std::min(span - 1, std::max(0, bucket));
+  };
+  constexpr int kChunks = 8;
+  std::vector<int> histogram(static_cast<std::size_t>(kChunks) * span, 0);
+  std::vector<int> offsets(static_cast<std::size_t>(kChunks) * span, 0);
+  std::vector<int> bucket_start(static_cast<std::size_t>(span) + 1, 0);
+  tbb::parallel_for(0, kChunks, [&](int chunk) {
+    const int begin = static_cast<int>(
+        static_cast<long long>(chunk) * num_points / kChunks);
+    const int end = static_cast<int>(
+        static_cast<long long>(chunk + 1) * num_points / kChunks);
+    int *row = histogram.data() + static_cast<std::size_t>(chunk) * span;
+    for (int i = begin; i < end; ++i) {
+      ++row[bucket_of(keys[static_cast<std::size_t>(i)].key)];
+    }
+  });
+  int total = 0;
+  for (int bucket = 0; bucket < span; ++bucket) {
+    bucket_start[static_cast<std::size_t>(bucket)] = total;
+    int running = total;
+    for (int chunk = 0; chunk < kChunks; ++chunk) {
+      const std::size_t slot =
+          static_cast<std::size_t>(chunk) * span + bucket;
+      offsets[slot] = running;
+      running += histogram[slot];
+    }
+    total = running;
+  }
+  bucket_start[static_cast<std::size_t>(span)] = total;
+  scratch.resize(keys.size());
+  tbb::parallel_for(0, kChunks, [&](int chunk) {
+    const int begin = static_cast<int>(
+        static_cast<long long>(chunk) * num_points / kChunks);
+    const int end = static_cast<int>(
+        static_cast<long long>(chunk + 1) * num_points / kChunks);
+    int *row = offsets.data() + static_cast<std::size_t>(chunk) * span;
+    for (int i = begin; i < end; ++i) {
+      const SortPointKey value = keys[static_cast<std::size_t>(i)];
+      scratch[static_cast<std::size_t>(row[bucket_of(value.key)]++)] = value;
+    }
+  });
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, span, 64),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int bucket = range.begin(); bucket < range.end(); ++bucket) {
+          const int begin = bucket_start[static_cast<std::size_t>(bucket)];
+          const int end = bucket_start[static_cast<std::size_t>(bucket) + 1];
+          if (end - begin > 1) {
+            std::sort(scratch.begin() + begin, scratch.begin() + end, less);
+          }
+        }
+      });
+  keys.swap(scratch);
+  return true;
+}
+
 bool try_incremental_sort_point_set(NeighborSearchData &data,
                                     const std::vector<float> &x,
                                     const std::vector<float> &y,
@@ -708,7 +795,11 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
         changed_keys[static_cast<std::size_t>(write)] =
             SortPointKey{data.incremental_keys[static_cast<std::size_t>(i)], i};
       });
-  tbb::parallel_sort(changed_keys.begin(), changed_keys.end(), less);
+  if (!bucket_sort_changed_keys(changed_keys, data.scratch_point_keys_alt,
+                                signed_order, data.cell_coord_min_x,
+                                data.cell_coord_max_x, less)) {
+    tbb::parallel_sort(changed_keys.begin(), changed_keys.end(), less);
+  }
 
   const int unchanged_count = num_points - changed_count;
   auto &unchanged_positions = data.incremental_unchanged_positions;
