@@ -3243,15 +3243,33 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
 bool write_cross_rows_target_major(NeighborSearchData &source,
                                    NeighborSearchData &target, float radius,
                                    int capacity, IntBuffer &fixed_neighbors,
-                                   IntBuffer &counts) {
+                                   IntBuffer &counts,
+                                   std::vector<int> &touched_rows,
+                                   bool &touched_overflow,
+                                   int &max_count_out) {
   const int num_source = source.num_points;
   const int num_target = target.num_points;
   const int stride = capacity;
+  const std::size_t counts_before = counts.size();
   // Rows must exist even when one side is empty: the query API reads the
   // fixed counts buffer for every source point.
   prepare_fixed_rows(fixed_neighbors, counts,
                      static_cast<std::size_t>(num_source), stride);
-  std::fill(counts.begin(), counts.end(), 0);
+  // The counts buffer uses a default-init allocator (resize does not zero).
+  // Zero it when it is (re)allocated; otherwise only the rows written by the
+  // previous build need clearing. A capacity retry or a buffer that another
+  // writer filled sets `touched_overflow` and forces a full clear.
+  if (counts_before != counts.size() || touched_overflow) {
+    std::fill(counts.begin(), counts.end(), 0);
+    touched_rows.clear();
+    touched_overflow = false;
+  } else {
+    for (int row : touched_rows) {
+      counts[static_cast<std::size_t>(row)] = 0;
+    }
+    touched_rows.clear();
+  }
+  max_count_out = 0;
   if (num_source == 0 || num_target == 0) {
     return true;
   }
@@ -3306,9 +3324,14 @@ bool write_cross_rows_target_major(NeighborSearchData &source,
   int *row_counts = counts.data();
   int *row_values = fixed_neighbors.data();
   constexpr int kGrain = 2048;
+  constexpr std::size_t kTouchedCap = std::size_t{1} << 20;
+  std::mutex touched_mutex;
   tbb::parallel_for(
       tbb::blocked_range<int>(0, num_target, kGrain),
       [&](const tbb::blocked_range<int> &range) {
+        std::vector<int> task_touched;
+        task_touched.reserve(16);
+        int task_max = 0;
         for (int point = range.begin(); point < range.end(); ++point) {
           const float px = tx[point];
           const float py = ty[point];
@@ -3367,6 +3390,12 @@ bool write_cross_rows_target_major(NeighborSearchData &source,
                       // same layout the query API reads.
                       const int position = __atomic_fetch_add(
                           &row_counts[p], 1, __ATOMIC_RELAXED);
+                      if (position == 0) {
+                        task_touched.push_back(p);
+                      }
+                      if (position >= task_max) {
+                        task_max = position + 1;
+                      }
                       if (position < stride) {
                         row_values[pi * stride + position] = neighbor;
                       }
@@ -3378,8 +3407,18 @@ bool write_cross_rows_target_major(NeighborSearchData &source,
             }
           }
         }
+        if (!task_touched.empty() || task_max > 0) {
+          std::lock_guard<std::mutex> lock(touched_mutex);
+          if (touched_rows.size() + task_touched.size() <= kTouchedCap) {
+            touched_rows.insert(touched_rows.end(), task_touched.begin(),
+                                task_touched.end());
+          } else {
+            touched_overflow = true;
+          }
+          max_count_out = std::max(max_count_out, task_max);
+        }
       });
-  return max_row_count(counts) <= capacity;
+  return max_count_out <= capacity;
 }
 
 void write_neighbors_fixed_query_blocked_parallel(

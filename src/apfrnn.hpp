@@ -437,7 +437,10 @@ bool write_cross_rows_cell_range(NeighborSearchData &source,
 bool write_cross_rows_target_major(NeighborSearchData &source,
                                    NeighborSearchData &target, float radius,
                                    int capacity, IntBuffer &fixed_neighbors,
-                                   IntBuffer &counts);
+                                   IntBuffer &counts,
+                                   std::vector<int> &touched_rows,
+                                   bool &touched_overflow,
+                                   int &max_count_out);
 
 // Block-AABB filtered query-major writer for dense cells.
 void write_neighbors_fixed_query_blocked_parallel(NeighborSearchData &data,

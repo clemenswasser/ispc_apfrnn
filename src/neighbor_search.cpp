@@ -212,6 +212,12 @@ struct NSearch::PointSet {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Sparse target-major cross rows. The counts buffer is kept across
+  // invalidations for pairs that use that writer; only the rows it wrote are
+  // cleared before the next build.
+  std::vector<int> target_major_touched;
+  bool target_major_touched_overflow = false;
+  bool target_major_owned = false;
   // Block-fixed rows: per-block capacities and per-query row offsets.
   bool block_rows = false;
   bool block_caps_valid = false;
@@ -263,6 +269,12 @@ struct NSearch::Pair {
   IntBuffer fixed_counts;
   IntBuffer active_neighbors;
   IntBuffer active_counts;
+  // Sparse target-major cross rows. The counts buffer is kept across
+  // invalidations for pairs that use that writer; only the rows it wrote are
+  // cleared before the next build.
+  std::vector<int> target_major_touched;
+  bool target_major_touched_overflow = false;
+  bool target_major_owned = false;
   // Per-block cross rows. The block capacities and row offsets depend only
   // on the source/target grids, so they survive a pair invalidation that
   // merely rewrites unchanged rows.
@@ -681,12 +693,15 @@ void NSearch::run() {
         }
         const float radius = build_radius();
         for (int capacity : {1, 2, 4, 8, 16, 32}) {
-          if (!write_cross_rows_target_major(source.data, target.data, radius,
-                                             capacity, pair.fixed_neighbors,
-                                             pair.fixed_counts)) {
+          int max_count = 0;
+          if (!write_cross_rows_target_major(
+                  source.data, target.data, radius, capacity,
+                  pair.fixed_neighbors, pair.fixed_counts,
+                  pair.target_major_touched,
+                  pair.target_major_touched_overflow, max_count)) {
             continue;
           }
-          const int max_count = max_row_count(pair.fixed_counts);
+          pair.target_major_owned = true;
           pair.fixed_valid = true;
           pair.fixed_capacity = capacity;
           pair.last_fixed_capacity =
@@ -2863,7 +2878,11 @@ void NSearch::clear_pair(Pair &pair) {
   pair.gpu_nq = 0;
   pair.cross = CrossNeighborSearchData{};
   pair.fixed_neighbors.clear();
-  pair.fixed_counts.clear();
+  if (!pair.target_major_owned || !pair.active) {
+    pair.fixed_counts.clear();
+    pair.target_major_touched.clear();
+    pair.target_major_touched_overflow = false;
+  }
   pair.active_neighbors.clear();
   pair.active_counts.clear();
 }
