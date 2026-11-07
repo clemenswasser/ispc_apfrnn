@@ -190,6 +190,7 @@ struct NeighborSearchData {
   std::vector<uint8_t> incremental_changed;
   std::vector<SortPointKey> incremental_changed_keys;
   std::vector<SortPointKey> incremental_unchanged_keys;
+  IntBuffer incremental_unchanged_positions;
   std::vector<float> incremental_x;
   std::vector<float> incremental_y;
   std::vector<float> incremental_z;

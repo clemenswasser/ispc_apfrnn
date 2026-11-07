@@ -714,8 +714,8 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
   tbb::parallel_sort(changed_keys.begin(), changed_keys.end(), less);
 
   const int unchanged_count = num_points - changed_count;
-  auto &unchanged = data.incremental_unchanged_keys;
-  unchanged.resize(static_cast<std::size_t>(unchanged_count));
+  auto &unchanged_positions = data.incremental_unchanged_positions;
+  unchanged_positions.resize(static_cast<std::size_t>(unchanged_count));
   const int *previous_order = data.original_index.data();
   const uint64_t *previous_sorted = data.incremental_keys_are_unique
                                         ? data.scratch_unique_keys.data()
@@ -727,9 +727,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
                    previous_order[i])] == 0;
       },
       [&](int write, int i) {
-        const int idx = previous_order[i];
-        unchanged[static_cast<std::size_t>(write)] =
-            SortPointKey{previous_sorted[static_cast<std::size_t>(i)], idx};
+        unchanged_positions[static_cast<std::size_t>(write)] = i;
       });
 
   data.incremental_x.resize(static_cast<std::size_t>(num_points));
@@ -745,8 +743,17 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
 
   const int num_a = unchanged_count;
   const int num_b = changed_count;
-  const SortPointKey *a = unchanged.data();
+  const int *unchanged_at = unchanged_positions.data();
   const SortPointKey *b = changed_keys.data();
+  // The unchanged stream is a subsequence of the previous order; read its
+  // keys and indices from the already-sorted arrays instead of materializing
+  // 16-byte pairs.
+  auto a_less = [&](int ia, const SortPointKey &other) {
+    const int position = unchanged_at[ia];
+    const uint64_t ka = ordered_key(previous_sorted[position]);
+    const uint64_t kb = ordered_key(other.key);
+    return ka != kb ? ka < kb : previous_order[position] < other.index;
+  };
   const int workers =
       std::max(1, static_cast<int>(tbb::this_task_arena::max_concurrency()));
   std::vector<int> split_a(static_cast<std::size_t>(workers) + 1, 0);
@@ -759,7 +766,7 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
     while (lo < hi) {
       const int mid = (lo + hi) / 2;
       const int other = rank - mid;
-      if (less(a[mid], b[other - 1])) {
+      if (a_less(mid, b[other - 1])) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -775,15 +782,18 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
     const int end_b = split_b[static_cast<std::size_t>(worker) + 1];
     int write = ia + ib;
     while (ia < end_a && ib < end_b) {
-      const bool take_a = less(a[ia], b[ib]);
-      const SortPointKey &source = take_a ? a[ia] : b[ib];
+      const bool take_a = a_less(ia, b[ib]);
+      int idx;
+      uint64_t key;
       if (take_a) {
-        ++ia;
+        const int position = unchanged_at[ia++];
+        key = previous_sorted[position];
+        idx = previous_order[position];
       } else {
-        ++ib;
+        key = b[ib].key;
+        idx = b[ib++].index;
       }
-      const int idx = source.index;
-      out_keys[write] = source.key;
+      out_keys[write] = key;
       out_x[write] = x[static_cast<std::size_t>(idx)];
       out_y[write] = y[static_cast<std::size_t>(idx)];
       out_z[write] = z[static_cast<std::size_t>(idx)];
@@ -791,8 +801,9 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
       ++write;
     }
     for (; ia < end_a; ++ia) {
-      const int idx = a[ia].index;
-      out_keys[write] = a[ia].key;
+      const int position = unchanged_at[ia];
+      const int idx = previous_order[position];
+      out_keys[write] = previous_sorted[position];
       out_x[write] = x[static_cast<std::size_t>(idx)];
       out_y[write] = y[static_cast<std::size_t>(idx)];
       out_z[write] = z[static_cast<std::size_t>(idx)];
