@@ -484,7 +484,13 @@ export void write_fixed_rows_dense(
         dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
     const uniform int q_start = queries.starts[cell];
     const uniform int q_end = queries.ends[cell];
-    if (group == 4 && same_set) {
+    if (group == 8 && same_set) {
+      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+               true, r2, rows);
+    } else if (group == 8) {
+      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+               false, r2, rows);
+    } else if (group == 4 && same_set) {
       rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
                 true, r2, rows);
     } else if (group == 4) {

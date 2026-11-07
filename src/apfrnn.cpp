@@ -4495,11 +4495,14 @@ void write_neighbors_fixed_query_pair_dense_parallel(
   const ispc::DenseGrid grid = dense_of(data);
   const ispc::Points pts = points_of(data);
   const float r2 = data.radius * data.radius;
+  // Dense cells hold ~7 points, so an eight-query group covers a whole cell
+  // per candidate pass instead of splitting it into two quads.
+  constexpr int kSameGroup = 8;
   write_rows_parallel(
       data.num_cells, cell_grain(data.num_cells), capacity, false, counts,
       fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
-        ispc::write_fixed_rows_dense(begin, end, 4, &cells, &grid, &cells,
-                                     &pts, &pts, true, r2, &rows);
+        ispc::write_fixed_rows_dense(begin, end, kSameGroup, &cells, &grid,
+                                     &cells, &pts, &pts, true, r2, &rows);
       });
 }
 
@@ -4521,7 +4524,9 @@ void write_cross_neighbors_fixed_query_pair_dense_parallel(
       target_data.max_cell_points > 0 && target_data.max_cell_points <= 64 &&
       static_cast<int64_t>(target_data.num_points) <
           4 * static_cast<int64_t>(target_data.num_cells);
-  const int group = sparse_target ? 4 : 2;
+  // Sparse targets leave enough work per candidate load to share it between
+  // eight queries (one cell); denser targets keep pairs.
+  const int group = sparse_target ? 8 : 2;
   const ispc::Cells queries = cells_of(source_data);
   const ispc::DenseGrid grid = dense_of(target_data);
   const ispc::Cells targets = cells_of(target_data);
