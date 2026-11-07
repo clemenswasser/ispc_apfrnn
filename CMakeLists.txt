@@ -21,31 +21,40 @@ option(APFRNN_ENABLE_SYCL "Build the optional static SYCL GPU backend (requires 
 
 find_package(TBB CONFIG REQUIRED)
 
+# The ISPC kernels are a separate object library because CMake exports
+# ISPC_HEADER_DIRECTORY as a relative include path to anything that links the
+# target, which breaks consuming this project with add_subdirectory. The
+# property is resolved against the top-level binary directory.
+file(RELATIVE_PATH APFRNN_ISPC_HEADERS "${CMAKE_BINARY_DIR}"
+  "${CMAKE_CURRENT_BINARY_DIR}/ispc")
+add_library(apfrnn_ispc_objects OBJECT
+  src/kernels/cells.ispc
+  src/kernels/rows.ispc
+  src/kernels/csr.ispc
+  src/kernels/sync.ispc)
+# src/kernels_ispc.h includes each component's generated header.
+set_target_properties(apfrnn_ispc_objects PROPERTIES
+  ISPC_HEADER_DIRECTORY "${APFRNN_ISPC_HEADERS}")
+target_compile_options(apfrnn_ispc_objects PRIVATE
+  $<$<NOT:$<CONFIG:Debug>>:-O3>
+  $<$<NOT:$<CONFIG:Release>>:-g>
+  --opt=fast-math
+  --addressing=64
+  # store_compacted calls llvm.experimental.vector.compress on AVX-512.
+  --enable-llvm-intrinsics)
+
 add_library(ispc_apfrnn_kernels
   src/apfrnn.cpp
   src/neighbor_search.cpp
   src/plan.cpp
   src/sweep.cpp
-  src/kernels/cells.ispc
-  src/kernels/rows.ispc
-  src/kernels/csr.ispc
-  src/kernels/sync.ispc)
-# Each component's generated header goes to ispc/; src/kernels_ispc.h
-# includes them all.
-set_target_properties(ispc_apfrnn_kernels PROPERTIES
-  ISPC_HEADER_DIRECTORY ispc)
+  $<TARGET_OBJECTS:apfrnn_ispc_objects>)
+add_dependencies(ispc_apfrnn_kernels apfrnn_ispc_objects)
 target_include_directories(ispc_apfrnn_kernels PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/ispc")
 target_sources(ispc_apfrnn_kernels PUBLIC
   FILE_SET HEADERS BASE_DIRS include FILES include/apfrnn/neighbor_search.hpp)
 target_compile_features(ispc_apfrnn_kernels PUBLIC cxx_std_17)
-target_compile_options(ispc_apfrnn_kernels PRIVATE
-  $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Debug>>:-O3>>
-  $<$<COMPILE_LANGUAGE:ISPC>:$<$<NOT:$<CONFIG:Release>>:-g>>
-  $<$<COMPILE_LANGUAGE:ISPC>:--opt=fast-math>
-  $<$<COMPILE_LANGUAGE:ISPC>:--addressing=64>
-  # store_compacted calls llvm.experimental.vector.compress on AVX-512.
-  $<$<COMPILE_LANGUAGE:ISPC>:--enable-llvm-intrinsics>)
 target_link_libraries(ispc_apfrnn_kernels PUBLIC
   TBB::tbb TBB::tbbmalloc $<TARGET_NAME_IF_EXISTS:TBB::tbbmalloc_proxy>)
 
