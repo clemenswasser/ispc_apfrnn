@@ -484,6 +484,7 @@ const char *NSearch::path_name(uint64_t path) {
   case kPathSameActive2: return "same_active2";
   case kPathSameGrown: return "same_grown";
   case kPathSameCsr: return "same_csr";
+  case kPathSameSparseKeys: return "same_sparse_keys";
   case kPathCrossSweep: return "cross_sweep";
   case kPathCrossNoCandidates: return "cross_no_candidates";
   case kPathCrossTargetMajor: return "cross_target_major";
@@ -493,6 +494,7 @@ const char *NSearch::path_name(uint64_t path) {
   case kPathCrossActive2: return "cross_active2";
   case kPathCrossGrown: return "cross_grown";
   case kPathCrossCsr: return "cross_csr";
+  case kPathCrossCellRange: return "cross_cell_range";
   case kPathGpu: return "gpu";
   }
   return "unknown";
@@ -558,6 +560,78 @@ void NSearch::run() {
   const auto build_start = std::chrono::steady_clock::now();
   build_point_sets(is_source, needs_same_set);
   last_stats_.sync_build_ms = elapsed_ms(build_start);
+
+  // Cross-sweep pairs benefit from an x-sorted source. Build that index once,
+  // serially, before the pair loop: pairs are built in parallel and two pairs
+  // sharing a source would otherwise race on the index.
+  {
+    std::vector<char> needs_source_index(static_cast<std::size_t>(set_count),
+                                         0);
+    std::vector<char> needs_target_index(static_cast<std::size_t>(set_count),
+                                         0);
+    for (int set_i = 0; set_i < set_count; ++set_i) {
+      for (int set_j = 0; set_j < set_count; ++set_j) {
+        if (set_i == set_j) {
+          continue;
+        }
+        const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                                 [static_cast<std::size_t>(set_j)];
+        if (!pair.active || pair.valid) {
+          continue;
+        }
+        PointSet &source = sets_[static_cast<std::size_t>(set_i)];
+        PointSet &target = sets_[static_cast<std::size_t>(set_j)];
+        if (!source.use_sweep && target.use_sweep &&
+            target.x.size() <= 1000000 && target.bounds.min_x >= 0.0f &&
+            target.bounds.min_y >= 0.0f && target.bounds.min_z >= 0.0f) {
+          ensure_grid(target);
+        }
+        const bool sparse_target =
+            target.data.num_points > 0 && !target.data.dense_valid;
+        const bool short_window =
+            sparse_target &&
+            sweep::estimated_window(target.bounds, target.data.num_points,
+                                    build_radius()) <= 256.0;
+        bool cell_range = cell_range_cross_candidate(source, target);
+        if (cell_range) {
+          ensure_cell_x_index(target.data);
+          cell_range = target.data.cell_x_valid;
+        }
+        if (!cell_range && (target.use_sweep || short_window)) {
+          needs_source_index[static_cast<std::size_t>(set_i)] = 1;
+          needs_target_index[static_cast<std::size_t>(set_j)] = 1;
+        }
+      }
+    }
+    for (int set = 0; set < set_count; ++set) {
+      PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+      const bool source =
+          needs_source_index[static_cast<std::size_t>(set)] != 0;
+      const bool target =
+          needs_target_index[static_cast<std::size_t>(set)] != 0;
+      if ((source || target) && !point_set.use_sweep) {
+        if (!point_set.sweep.valid && point_set.valid &&
+            (point_set.data.cell_keys_signed_order ||
+             point_set.bounds.min_x >= 0.0f) &&
+            point_set.data.num_points > 0 &&
+            point_set.data.num_cells == point_set.data.num_points &&
+            point_set.data.sorted_x.size() ==
+                static_cast<std::size_t>(point_set.data.num_points)) {
+          // One point per cell means the cell-key order is strictly x-sorted;
+          // the cross sweep can reuse the grid order instead of sorting the
+          // moving set by x again.
+          sweep::adopt_sorted_order(point_set.sweep, point_set.data.sorted_x,
+                                    point_set.data.sorted_y,
+                                    point_set.data.sorted_z,
+                                    point_set.data.original_index,
+                                    point_set.data.scratch_unique_keys);
+        } else {
+          sweep::ensure_index(point_set.sweep, point_set.x, point_set.y,
+                              point_set.z);
+        }
+      }
+    }
+  }
 
   auto build_cpu_pair = [&](Pair &pair, int set_i, int set_j) {
     if (set_i == set_j) {
@@ -969,6 +1043,31 @@ void NSearch::build_same_pair(Pair &pair, int set) {
   pair.valid = true;
 }
 
+// True when the exact sorted-cell range writer can replace the x-window
+// sweep for this pair: a grid source and a sparse, non-negative grid target.
+bool NSearch::cell_range_cross_candidate(const PointSet &source,
+                                         const PointSet &target) {
+  if (source.use_sweep || !source.valid || target.x.empty()) {
+    return false;
+  }
+  if (target.bounds.min_x < 0.0f || target.bounds.min_y < 0.0f ||
+      target.bounds.min_z < 0.0f) {
+    return false;
+  }
+  if (target.use_sweep || !target.valid ||
+      target.data.cell_stencil != 1 || target.data.max_cell_points > 1 ||
+      target.data.num_cells <= 0 ||
+      target.data.scratch_unique_keys.size() !=
+          static_cast<std::size_t>(target.data.num_cells)) {
+    return false;
+  }
+  const uint64_t *keys = target.data.scratch_unique_keys.data();
+  const int span = static_cast<int>(
+                       (keys[target.data.num_cells - 1] >> 42) & 0x1FFFFF) -
+                   static_cast<int>((keys[0] >> 42) & 0x1FFFFF) + 1;
+  return span > 0 && span <= 4 * target.data.num_cells + 65536;
+}
+
 void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   PointSet &source = sets_[static_cast<std::size_t>(set_i)];
   PointSet &target = sets_[static_cast<std::size_t>(set_j)];
@@ -976,7 +1075,35 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   pair.same_set = false;
   pair.valid = true;
 
-  if (source.use_sweep || target.use_sweep) {
+  if (cell_range_cross_candidate(source, target) &&
+      target.data.cell_x_valid) {
+    for (int capacity : {1, 2, 4, 8, 16, 32}) {
+      if (!write_cross_rows_cell_range(source.data, target.data,
+                                       build_radius(), capacity,
+                                       pair.fixed_neighbors,
+                                       pair.fixed_counts)) {
+        continue;
+      }
+      const int max_count = max_row_count(pair.fixed_counts);
+      pair.fixed_valid = true;
+      pair.fixed_capacity = capacity;
+      pair.last_fixed_capacity =
+          plan::cross_fitted_capacity(max_count, capacity);
+      pair.skin_lists = skin_ > 0.0f;
+      pair.active_valid = false;
+      pair.cross_block_active = false;
+      note_path(kPathCrossCellRange);
+      return;
+    }
+  }
+
+  const bool sparse_target =
+      target.data.num_points > 0 && !target.data.dense_valid;
+  const bool short_target_window =
+      sparse_target &&
+      sweep::estimated_window(target.bounds, target.data.num_points,
+                              build_radius()) <= 256.0;
+  if (source.use_sweep || target.use_sweep || short_target_window) {
     if (build_sweep_cross_lists(pair, source, target)) {
       note_path(kPathCrossSweep);
       return;
@@ -1434,6 +1561,9 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   }
   point_set.use_sweep = false;
   point_set.sweep.clear();
+  // The sweep path replaced original_index with the identity, so any keys
+  // saved by an earlier grid build no longer describe this order.
+  point_set.data.incremental_valid = false;
   const float grid_radius = build_radius();
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;
   build_point_grid_inplace(point_set.data, point_set.x, point_set.y,
@@ -1485,12 +1615,15 @@ void NSearch::build_point_grid(int set) {
     data.hash_keys.clear();
     data.scratch_unique_keys.clear();
     data.hash_mask = 0;
+    data.hash_valid = false;
     data.dense_valid = false;
     data.row_ptr.push_back(0);
     data.original_index.resize(static_cast<std::size_t>(num_points));
     std::iota(data.original_index.begin(), data.original_index.end(), 0);
+    data.incremental_valid = false;
     point_set.original_to_sorted = data.original_index;
-    sweep::ensure_index(point_set.sweep, point_set.x);
+    sweep::ensure_index(point_set.sweep, point_set.x, point_set.y,
+                        point_set.z);
     point_set.use_sweep = true;
     point_set.valid = true;
     ++point_set.grid_generation;
@@ -1547,6 +1680,54 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.lists_grid_generation != point_set.grid_generation;
   point_set.lists_grid_generation = point_set.grid_generation;
   const bool block_rows_ok = skin_ <= 0.0f && (first_lists || !grid_rebuilt);
+  // Every occupied cell holds at most one point, so there are no intra-cell
+  // pairs and the sorted cell-key order already indexes the 3x3x3 stencil.
+  // Merge the key array with itself instead of probing a hash 27 times per
+  // point and materializing per-cell run tables.
+  if (grid_rebuilt && data.cell_stencil == 1 && data.max_cell_points <= 1 &&
+      data.num_cells == data.num_points && data.num_cells > 0) {
+    for (int capacity : {1, 2, 4, 8, 16, 32}) {
+      if (!write_sparse_same_rows(data, capacity, point_set.fixed_neighbors,
+                                  point_set.fixed_counts)) {
+        continue;
+      }
+      const int max_count = max_row_count(point_set.fixed_counts);
+      point_set.block_rows = false;
+      point_set.fixed_capacity = capacity;
+      point_set.last_fixed_capacity =
+          plan::same_fitted_capacity(max_count, capacity);
+      point_set.fixed_valid = true;
+      point_set.skin_lists = skin_ > 0.0f;
+      point_set.active_valid = false;
+      point_set.same_lists_valid = true;
+      note_path(kPathSameSparseKeys);
+      return;
+    }
+  }
+  // Sparse moving sets have almost no neighbors. Try a direct fixed row at a
+  // tiny capacity before laying out per-block rows; the block layout rewrites
+  // all 8M rows every frame even when every row is empty or singleton.
+  if (grid_rebuilt && data.max_cell_points <= 1 && data.num_points > 4000000) {
+    build_same_set_cell_ranges_inplace(data);
+    for (int capacity : {1, 2, 4}) {
+      write_neighbors_fixed_query_oct_parallel(
+          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
+      const int max_count = max_row_count(point_set.fixed_counts);
+      if (max_count > capacity) {
+        continue;
+      }
+      point_set.block_rows = false;
+      point_set.fixed_capacity = capacity + row_slack();
+      point_set.last_fixed_capacity =
+          plan::same_fitted_capacity(max_count, capacity);
+      point_set.fixed_valid = true;
+      point_set.skin_lists = skin_ > 0.0f;
+      point_set.active_valid = false;
+      point_set.same_lists_valid = true;
+      note_path(kPathSameQueryOct);
+      return;
+    }
+  }
   if (point_set.block_rows) {
     if (block_rows_ok && build_same_block_rows(set)) {
       note_path(kPathSameBlockRows);
@@ -1560,6 +1741,18 @@ void NSearch::build_grid_same_lists(int set) {
     if (build_moving_block_rows(set)) {
       note_path(kPathSameBlockRows);
       return;
+    }
+    // A resize invalidates every per-row capacity. Rebuilding a fixed table
+    // at the old capacity is expensive for high-degree sets (the growing
+    // Fountain/clustered case), so try compact block rows from fresh exact
+    // counts before falling back to fixed rows.
+    if (point_set.fixed_counts.size() !=
+        static_cast<std::size_t>(data.num_points)) {
+      if (build_same_block_rows(set, /*min_block=*/0,
+                                /*counts_ready=*/false)) {
+        note_path(kPathSameBlockRows);
+        return;
+      }
     }
   } else {
     point_set.moving_caps_valid = false;
@@ -2241,7 +2434,8 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
 
 bool NSearch::build_sweep_same_lists(int set) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
-  sweep::ensure_index(point_set.sweep, point_set.x);
+  sweep::ensure_index(point_set.sweep, point_set.x, point_set.y,
+                      point_set.z);
   const sweep::Cloud cloud{point_set.x, point_set.y, point_set.z,
                            &point_set.sweep};
   int row_stride = 0;
@@ -2262,7 +2456,7 @@ bool NSearch::build_sweep_same_lists(int set) {
 
 bool NSearch::build_sweep_cross_lists(Pair &pair, PointSet &source,
                                       PointSet &target) {
-  sweep::ensure_index(target.sweep, target.x);
+  sweep::ensure_index(target.sweep, target.x, target.y, target.z);
   const sweep::Cloud query{source.x, source.y, source.z, &source.sweep};
   const sweep::Cloud cloud{target.x, target.y, target.z, &target.sweep};
   int row_stride = 0;

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <climits>
 #include <cmath>
@@ -160,12 +162,16 @@ constexpr int kRadixMinPoints = 16384;
 // tie-break is preserved. For the sparse droplets domain the comparison sort
 // spends ~42% of the branch misses; this sort moves that work into a
 // branch-free histogram/scatter.
-void radix_sort_point_keys(std::vector<SortPointKey> &keys,
+bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
                            std::vector<SortPointKey> &scratch) {
   const int num_points = static_cast<int>(keys.size());
-  if (num_points < kRadixMinPoints) {
+  if (num_points < kRadixMinPoints || num_points >= 8000000) {
+    // Very large sparse domains: comparison sort is faster than the
+    // multi-pass radix histogram on the 8M path (measured 347 vs 375 ms).
+    // It compares sign-flipped keys, so the result is signed-coordinate
+    // order, not raw key order.
     tbb::parallel_sort(keys.begin(), keys.end());
-    return;
+    return true;
   }
 
   scratch.resize(keys.size());
@@ -249,7 +255,17 @@ void radix_sort_point_keys(std::vector<SortPointKey> &keys,
   if (src != keys.data()) {
     std::copy(src, src + num_points, keys.data());
   }
+  return false;
 }
+
+struct CellBounds {
+  int min_cx = INT_MAX;
+  int min_cy = INT_MAX;
+  int min_cz = INT_MAX;
+  int max_cx = INT_MIN;
+  int max_cy = INT_MIN;
+  int max_cz = INT_MIN;
+};
 
 inline void sort_point_set(
     const std::vector<float> &x, const std::vector<float> &y,
@@ -258,18 +274,10 @@ inline void sort_point_set(
     IntBuffer &original_index, IntBuffer &cell_starts, IntBuffer &cell_ends,
     std::vector<SortPointKey> &point_keys,
     std::vector<SortPointKey> &point_keys_alt,
-    std::vector<uint64_t> &unique_keys) {
+    std::vector<uint64_t> &unique_keys, bool &signed_order,
+    CellBounds *bounds_out) {
   int const num_points = static_cast<int>(x.size());
   point_keys.resize(num_points);
-
-  struct CellBounds {
-    int min_cx = INT_MAX;
-    int min_cy = INT_MAX;
-    int min_cz = INT_MAX;
-    int max_cx = INT_MIN;
-    int max_cy = INT_MIN;
-    int max_cz = INT_MIN;
-  };
   const CellBounds bounds = tbb::parallel_reduce(
       tbb::blocked_range<int>(0, num_points, 2048), CellBounds{},
       [&](const tbb::blocked_range<int> &range, CellBounds acc) {
@@ -301,6 +309,9 @@ inline void sort_point_set(
         a.max_cz = std::max(a.max_cz, b.max_cz);
         return a;
       });
+  if (bounds_out != nullptr) {
+    *bounds_out = bounds;
+  }
 
   // For bounded domains, a dense counting sort by cell is O(N + cells) and
   // avoids the comparison sort. Fall back to parallel_sort for large/sparse
@@ -454,6 +465,7 @@ inline void sort_point_set(
           }
         });
 
+    signed_order = true;
     // The atomic scatter orders points inside a cell by thread timing. Sort
     // each cell by original index so the packed order (and any block layout
     // derived from it) is deterministic across frames.
@@ -516,7 +528,7 @@ inline void sort_point_set(
     return;
   }
 
-  radix_sort_point_keys(point_keys, point_keys_alt);
+  signed_order = radix_sort_point_keys(point_keys, point_keys_alt);
 
   sorted_x.resize(num_points);
   sorted_y.resize(num_points);
@@ -550,9 +562,395 @@ inline void sort_point_set(
   cell_ends.push_back(num_points);
 }
 
+// Chunked stable compaction: writes the emitting indices in ascending order.
+template <typename Pred, typename Emit>
+int parallel_compact(int count, int grain, Pred &&pred, Emit &&emit) {
+  const int chunks = (count + grain - 1) / grain;
+  std::vector<int> offsets(static_cast<std::size_t>(chunks) + 1, 0);
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * grain;
+    const int end = std::min(count, begin + grain);
+    int local = 0;
+    for (int i = begin; i < end; ++i) {
+      local += pred(i) ? 1 : 0;
+    }
+    offsets[static_cast<std::size_t>(chunk)] = local;
+  });
+  int total = 0;
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int value = offsets[static_cast<std::size_t>(chunk)];
+    offsets[static_cast<std::size_t>(chunk)] = total;
+    total += value;
+  }
+  offsets[static_cast<std::size_t>(chunks)] = total;
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * grain;
+    const int end = std::min(count, begin + grain);
+    int write = offsets[static_cast<std::size_t>(chunk)];
+    for (int i = begin; i < end; ++i) {
+      if (pred(i)) {
+        emit(write++, i);
+      }
+    }
+  });
+  return total;
+}
+
+// Reuses the previous cell order and merges only the points whose cell key
+// changed. The unchanged stream is the previous sorted order with changed
+// points removed; both streams are sorted with the previous frame's
+// comparator, and a parallel merge path splits the output into one range per
+// worker. Returns false when a full sort is needed (first build, radius or
+// point count change, or too many changed cells).
+bool try_incremental_sort_point_set(NeighborSearchData &data,
+                                    const std::vector<float> &x,
+                                    const std::vector<float> &y,
+                                    const std::vector<float> &z,
+                                    float inv_radius) {
+  const int num_points = static_cast<int>(x.size());
+  if (!data.incremental_valid || num_points == 0 ||
+      data.incremental_points != num_points ||
+      data.incremental_inv_radius != inv_radius) {
+    return false;
+  }
+  // The merge wins when the grid is sparse: few cells change and the full
+  // sort dominates. Dense SPH grids change a large fraction of cells and the
+  // merge plus change detection loses to the radix/comparison sort, so keep
+  // those sets on the full path.
+  if (data.max_cell_points > 1) {
+    return false;
+  }
+  auto &current = data.scratch_point_keys;
+  current.resize(static_cast<std::size_t>(num_points));
+  auto &changed = data.incremental_changed;
+  changed.resize(static_cast<std::size_t>(num_points));
+  uint64_t *previous_keys = data.incremental_keys.data();
+  struct KeyPass {
+    CellBounds bounds;
+    int changed = 0;
+  };
+  const KeyPass pass = tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, num_points, 2048), KeyPass{},
+      [&](const tbb::blocked_range<int> &range, KeyPass acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t at = static_cast<std::size_t>(i);
+          const int cx = floor_to_cell(x[at] * inv_radius);
+          const int cy = floor_to_cell(y[at] * inv_radius);
+          const int cz = floor_to_cell(z[at] * inv_radius);
+          const uint64_t key = make_key(cx, cy, cz);
+          current[at] = SortPointKey{key, i};
+          const bool differs = key != previous_keys[at];
+          changed[at] = differs ? 1 : 0;
+          acc.changed += differs ? 1 : 0;
+          previous_keys[at] = key;
+          acc.bounds.min_cx = std::min(acc.bounds.min_cx, cx);
+          acc.bounds.min_cy = std::min(acc.bounds.min_cy, cy);
+          acc.bounds.min_cz = std::min(acc.bounds.min_cz, cz);
+          acc.bounds.max_cx = std::max(acc.bounds.max_cx, cx);
+          acc.bounds.max_cy = std::max(acc.bounds.max_cy, cy);
+          acc.bounds.max_cz = std::max(acc.bounds.max_cz, cz);
+        }
+        return acc;
+      },
+      [](KeyPass a, const KeyPass &b) {
+        a.changed += b.changed;
+        a.bounds.min_cx = std::min(a.bounds.min_cx, b.bounds.min_cx);
+        a.bounds.min_cy = std::min(a.bounds.min_cy, b.bounds.min_cy);
+        a.bounds.min_cz = std::min(a.bounds.min_cz, b.bounds.min_cz);
+        a.bounds.max_cx = std::max(a.bounds.max_cx, b.bounds.max_cx);
+        a.bounds.max_cy = std::max(a.bounds.max_cy, b.bounds.max_cy);
+        a.bounds.max_cz = std::max(a.bounds.max_cz, b.bounds.max_cz);
+        return a;
+      });
+  const int changed_count = pass.changed;
+  data.cell_coord_min_x = pass.bounds.min_cx;
+  data.cell_coord_max_x = pass.bounds.max_cx;
+  data.cell_coord_min_y = pass.bounds.min_cy;
+  data.cell_coord_max_y = pass.bounds.max_cy;
+  data.cell_coord_min_z = pass.bounds.min_cz;
+  data.cell_coord_max_z = pass.bounds.max_cz;
+  data.cell_coord_valid = true;
+
+  if (changed_count == 0) {
+    // Same cells, new coordinates: refresh the packed coordinate arrays and
+    // keep the order and cell ranges.
+    const int *order = data.original_index.data();
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 2048),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const std::size_t at = static_cast<std::size_t>(i);
+            const std::size_t idx = static_cast<std::size_t>(order[at]);
+            data.sorted_x[at] = x[idx];
+            data.sorted_y[at] = y[idx];
+            data.sorted_z[at] = z[idx];
+          }
+        });
+    return true;
+  }
+  if (2 * changed_count > num_points) {
+    return false;
+  }
+
+  const bool signed_order = data.cell_keys_signed_order;
+  const uint64_t sign_bits = SortPointKey::kSignBits;
+  auto ordered_key = [&](uint64_t key) {
+    return signed_order ? (key ^ sign_bits) : key;
+  };
+  auto less = [&](const SortPointKey &a, const SortPointKey &b) {
+    const uint64_t ka = ordered_key(a.key);
+    const uint64_t kb = ordered_key(b.key);
+    return ka != kb ? ka < kb : a.index < b.index;
+  };
+
+  auto &changed_keys = data.incremental_changed_keys;
+  changed_keys.resize(static_cast<std::size_t>(changed_count));
+  parallel_compact(
+      num_points, 16384, [&](int i) { return changed[static_cast<std::size_t>(i)] != 0; },
+      [&](int write, int i) {
+        changed_keys[static_cast<std::size_t>(write)] =
+            current[static_cast<std::size_t>(i)];
+      });
+  tbb::parallel_sort(changed_keys.begin(), changed_keys.end(), less);
+
+  const int unchanged_count = num_points - changed_count;
+  auto &unchanged = data.incremental_unchanged_keys;
+  unchanged.resize(static_cast<std::size_t>(unchanged_count));
+  const int *previous_order = data.original_index.data();
+  const uint64_t *previous_sorted = data.incremental_keys_are_unique
+                                        ? data.scratch_unique_keys.data()
+                                        : data.incremental_sorted_keys.data();
+  parallel_compact(
+      num_points, 16384,
+      [&](int i) {
+        return changed[static_cast<std::size_t>(
+                   previous_order[i])] == 0;
+      },
+      [&](int write, int i) {
+        const int idx = previous_order[i];
+        unchanged[static_cast<std::size_t>(write)] =
+            SortPointKey{previous_sorted[static_cast<std::size_t>(i)], idx};
+      });
+
+  data.incremental_x.resize(static_cast<std::size_t>(num_points));
+  data.incremental_y.resize(static_cast<std::size_t>(num_points));
+  data.incremental_z.resize(static_cast<std::size_t>(num_points));
+  data.incremental_order.resize(static_cast<std::size_t>(num_points));
+  data.incremental_merge_keys.resize(static_cast<std::size_t>(num_points));
+  float *out_x = data.incremental_x.data();
+  float *out_y = data.incremental_y.data();
+  float *out_z = data.incremental_z.data();
+  int *out_order = data.incremental_order.data();
+  uint64_t *out_keys = data.incremental_merge_keys.data();
+
+  const int num_a = unchanged_count;
+  const int num_b = changed_count;
+  const SortPointKey *a = unchanged.data();
+  const SortPointKey *b = changed_keys.data();
+  const int workers =
+      std::max(1, static_cast<int>(tbb::this_task_arena::max_concurrency()));
+  std::vector<int> split_a(static_cast<std::size_t>(workers) + 1, 0);
+  std::vector<int> split_b(static_cast<std::size_t>(workers) + 1, 0);
+  for (int worker = 0; worker <= workers; ++worker) {
+    const int rank = static_cast<int>(
+        static_cast<long long>(worker) * (num_a + num_b) / workers);
+    int lo = std::max(0, rank - num_b);
+    int hi = std::min(rank, num_a);
+    while (lo < hi) {
+      const int mid = (lo + hi) / 2;
+      const int other = rank - mid;
+      if (less(a[mid], b[other - 1])) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    split_a[static_cast<std::size_t>(worker)] = lo;
+    split_b[static_cast<std::size_t>(worker)] = rank - lo;
+  }
+  tbb::parallel_for(0, workers, [&](int worker) {
+    int ia = split_a[static_cast<std::size_t>(worker)];
+    int ib = split_b[static_cast<std::size_t>(worker)];
+    const int end_a = split_a[static_cast<std::size_t>(worker) + 1];
+    const int end_b = split_b[static_cast<std::size_t>(worker) + 1];
+    int write = ia + ib;
+    while (ia < end_a && ib < end_b) {
+      const bool take_a = less(a[ia], b[ib]);
+      const SortPointKey &source = take_a ? a[ia] : b[ib];
+      if (take_a) {
+        ++ia;
+      } else {
+        ++ib;
+      }
+      const int idx = source.index;
+      out_keys[write] = source.key;
+      out_x[write] = x[static_cast<std::size_t>(idx)];
+      out_y[write] = y[static_cast<std::size_t>(idx)];
+      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_order[write] = idx;
+      ++write;
+    }
+    for (; ia < end_a; ++ia) {
+      const int idx = a[ia].index;
+      out_keys[write] = a[ia].key;
+      out_x[write] = x[static_cast<std::size_t>(idx)];
+      out_y[write] = y[static_cast<std::size_t>(idx)];
+      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_order[write] = idx;
+      ++write;
+    }
+    for (; ib < end_b; ++ib) {
+      const int idx = b[ib].index;
+      out_keys[write] = b[ib].key;
+      out_x[write] = x[static_cast<std::size_t>(idx)];
+      out_y[write] = y[static_cast<std::size_t>(idx)];
+      out_z[write] = z[static_cast<std::size_t>(idx)];
+      out_order[write] = idx;
+      ++write;
+    }
+  });
+
+  // Cell ranges from the merged key order. Position 0 and every key change
+  // starts a cell; chunks count locally, a short prefix assigns cell ids.
+  constexpr int kRangeGrain = 16384;
+  const int chunks = (num_points + kRangeGrain - 1) / kRangeGrain;
+  // One point per cell is the common sparse case: starts/ends are the index
+  // sequence and the merged key buffer doubles as the unique-key array (and
+  // as next frame's per-position order).
+  std::vector<uint8_t> chunk_duplicate(static_cast<std::size_t>(chunks), 0);
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * kRangeGrain;
+    const int end = std::min(num_points, begin + kRangeGrain);
+    uint8_t duplicate = 0;
+    for (int i = begin + 1; i < end; ++i) {
+      duplicate |= out_keys[i] == out_keys[i - 1] ? 1 : 0;
+    }
+    if (begin > 0) {
+      duplicate |= out_keys[begin] == out_keys[begin - 1] ? 1 : 0;
+    }
+    chunk_duplicate[static_cast<std::size_t>(chunk)] = duplicate;
+  });
+  bool all_unique = true;
+  for (uint8_t duplicate : chunk_duplicate) {
+    all_unique &= duplicate == 0;
+  }
+  if (all_unique) {
+    data.incremental_starts.resize(static_cast<std::size_t>(num_points));
+    data.incremental_ends.resize(static_cast<std::size_t>(num_points));
+    int *starts = data.incremental_starts.data();
+    int *ends = data.incremental_ends.data();
+    tbb::parallel_for(0, chunks, [&](int chunk) {
+      const int begin = chunk * kRangeGrain;
+      const int end = std::min(num_points, begin + kRangeGrain);
+      for (int i = begin; i < end; ++i) {
+        starts[i] = i;
+        ends[i] = i + 1;
+      }
+    });
+    data.sorted_x.swap(data.incremental_x);
+    data.sorted_y.swap(data.incremental_y);
+    data.sorted_z.swap(data.incremental_z);
+    data.original_index.swap(data.incremental_order);
+    data.cell_starts.swap(data.incremental_starts);
+    data.cell_ends.swap(data.incremental_ends);
+    data.scratch_unique_keys.swap(data.incremental_merge_keys);
+    data.incremental_keys_are_unique = true;
+    data.cell_keys_signed_order = signed_order;
+    return true;
+  }
+  data.incremental_keys_are_unique = false;
+  std::vector<int> chunk_cells(static_cast<std::size_t>(chunks) + 1, 0);
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * kRangeGrain;
+    const int end = std::min(num_points, begin + kRangeGrain);
+    int cells = 0;
+    for (int i = begin; i < end; ++i) {
+      if (i == 0 || out_keys[i] != out_keys[i - 1]) {
+        ++cells;
+      }
+    }
+    chunk_cells[static_cast<std::size_t>(chunk)] = cells;
+  });
+  int num_cells = 0;
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int cells = chunk_cells[static_cast<std::size_t>(chunk)];
+    chunk_cells[static_cast<std::size_t>(chunk)] = num_cells;
+    num_cells += cells;
+  }
+  data.incremental_starts.resize(static_cast<std::size_t>(num_cells));
+  data.incremental_ends.resize(static_cast<std::size_t>(num_cells));
+  data.incremental_unique_keys.resize(static_cast<std::size_t>(num_cells));
+  int *starts = data.incremental_starts.data();
+  int *ends = data.incremental_ends.data();
+  uint64_t *unique = data.incremental_unique_keys.data();
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * kRangeGrain;
+    const int end = std::min(num_points, begin + kRangeGrain);
+    int cell = chunk_cells[static_cast<std::size_t>(chunk)];
+    for (int i = begin; i < end; ++i) {
+      if (i == 0 || out_keys[i] != out_keys[i - 1]) {
+        if (cell > 0) {
+          ends[cell - 1] = i;
+        }
+        starts[cell] = i;
+        unique[cell] = out_keys[i];
+        ++cell;
+      }
+    }
+  });
+  ends[num_cells - 1] = num_points;
+
+  data.sorted_x.swap(data.incremental_x);
+  data.sorted_y.swap(data.incremental_y);
+  data.sorted_z.swap(data.incremental_z);
+  data.original_index.swap(data.incremental_order);
+  data.cell_starts.swap(data.incremental_starts);
+  data.cell_ends.swap(data.incremental_ends);
+  data.scratch_unique_keys.swap(data.incremental_unique_keys);
+  data.incremental_sorted_keys.swap(data.incremental_merge_keys);
+  data.cell_keys_signed_order = signed_order;
+  return true;
+}
+
+// Captures the state the incremental merge needs after a full sort.
+void reset_incremental_state(NeighborSearchData &data,
+                             const std::vector<float> &x,
+                             const std::vector<float> &y,
+                             const std::vector<float> &z, float inv_radius) {
+  const int num_points = static_cast<int>(x.size());
+  data.incremental_keys.resize(static_cast<std::size_t>(num_points));
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, 2048),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t at = static_cast<std::size_t>(i);
+          data.incremental_keys[at] =
+              make_key(floor_to_cell(x[at] * inv_radius),
+                       floor_to_cell(y[at] * inv_radius),
+                       floor_to_cell(z[at] * inv_radius));
+        }
+      });
+  data.incremental_sorted_keys.resize(static_cast<std::size_t>(num_points));
+  const int *order = data.original_index.data();
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, 2048),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t at = static_cast<std::size_t>(i);
+          data.incremental_sorted_keys[at] =
+              data.incremental_keys[static_cast<std::size_t>(order[at])];
+        }
+      });
+  data.incremental_keys_are_unique = false;
+  data.incremental_points = num_points;
+  data.incremental_inv_radius = inv_radius;
+  data.incremental_valid = true;
+}
+
 inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
                              std::vector<uint64_t> &ht_keys, IntBuffer &ht_vals,
-                             uint64_t empty_key, uint32_t &hash_mask) {
+                             uint64_t empty_key, uint32_t &hash_mask,
+                             std::vector<uint8_t> &control) {
   int hash_capacity = 1;
   while (hash_capacity < static_cast<int>(unique_keys.size()) * 2) {
     hash_capacity <<= 1;
@@ -561,6 +959,7 @@ inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
   hash_mask = static_cast<uint32_t>(hash_capacity - 1);
   ht_keys.assign(hash_capacity, empty_key);
   ht_vals.assign(hash_capacity, -1);
+  control.assign(hash_capacity, 0x80);
 
   for (int cell = 0; cell < static_cast<int>(unique_keys.size()); ++cell) {
     uint64_t key = unique_keys[cell];
@@ -573,6 +972,7 @@ inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
     }
     ht_keys[h] = key;
     ht_vals[h] = cell;
+    control[h] = static_cast<uint8_t>(h64 >> 56) & 0x7f;
   }
 }
 
@@ -595,16 +995,32 @@ inline void build_dense_cell_lookup(NeighborSearchData &data) {
   int max_x = INT_MIN;
   int max_y = INT_MIN;
   int max_z = INT_MIN;
-  for (uint64_t key : data.scratch_unique_keys) {
-    const int cx = unpack_coord(key, 42);
-    const int cy = unpack_coord(key, 21);
-    const int cz = unpack_coord(key, 0);
-    min_x = std::min(min_x, cx);
-    min_y = std::min(min_y, cy);
-    min_z = std::min(min_z, cz);
-    max_x = std::max(max_x, cx);
-    max_y = std::max(max_y, cy);
-    max_z = std::max(max_z, cz);
+  if (data.cell_coord_valid) {
+    min_x = data.cell_coord_min_x;
+    max_x = data.cell_coord_max_x;
+    min_y = data.cell_coord_min_y;
+    max_y = data.cell_coord_max_y;
+    min_z = data.cell_coord_min_z;
+    max_z = data.cell_coord_max_z;
+  } else {
+    for (uint64_t key : data.scratch_unique_keys) {
+      const int cx = unpack_coord(key, 42);
+      const int cy = unpack_coord(key, 21);
+      const int cz = unpack_coord(key, 0);
+      min_x = std::min(min_x, cx);
+      min_y = std::min(min_y, cy);
+      min_z = std::min(min_z, cz);
+      max_x = std::max(max_x, cx);
+      max_y = std::max(max_y, cy);
+      max_z = std::max(max_z, cz);
+    }
+    data.cell_coord_min_x = min_x;
+    data.cell_coord_max_x = max_x;
+    data.cell_coord_min_y = min_y;
+    data.cell_coord_max_y = max_y;
+    data.cell_coord_min_z = min_z;
+    data.cell_coord_max_z = max_z;
+    data.cell_coord_valid = true;
   }
 
   const int64_t nx = static_cast<int64_t>(max_x) - min_x + 1;
@@ -696,7 +1112,7 @@ ispc::DenseGrid dense_of(const NeighborSearchData &data) {
 
 ispc::HashGrid hash_of(const NeighborSearchData &data) {
   return {data.hash_keys.data(), data.hash_vals.data(), data.empty_key,
-          data.hash_mask};
+          data.hash_mask, data.hash_control.data()};
 }
 
 // Ranges written into the data's own buffers; drops any shared cache ranges
@@ -888,6 +1304,7 @@ collect_neighbor_cells_for_target(int num_cells,
     return;
   }
 
+  ensure_hash_table(const_cast<NeighborSearchData &>(target));
   if (target.dense_valid) {
     tbb::parallel_for(
         tbb::blocked_range<int>(0, num_cells, cell_grain(num_cells)),
@@ -988,6 +1405,41 @@ inline void build_merged_dense_cell_ranges(
       });
 }
 
+// One-pass 9-probe stencil runs for a hash-grid target. This is the cross-set
+// analogue of build_hash_stencil_ranges(): the source's sorted cell keys are
+// queried against the target's cell array/hash, and the merged point runs are
+// written directly. It removes the 27-probe collect_neighbor_cells buffer and
+// the following count/scan/merge passes for the common stencil==1 case.
+inline void build_cross_hash_stencil_ranges_impl(
+    CrossNeighborSearchData &data,
+    const std::vector<uint64_t> &source_unique_keys,
+    const NeighborSearchData &target_data) {
+  ensure_hash_table(const_cast<NeighborSearchData &>(target_data));
+  use_own_ranges(data);
+  const int num_cells = data.num_cells;
+  const int slots = ispc::hash_stencil_runs_per_cell_cross();
+  const std::size_t total = static_cast<std::size_t>(num_cells) * slots;
+  data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
+  data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
+  data.cell_neighbor_starts.resize(total);
+  data.cell_neighbor_ends.resize(total);
+  if (num_cells == 0) {
+    return;
+  }
+  parallel_cells(0, num_cells, cell_grain(num_cells),
+                 [&](int begin, int end) {
+                   const ispc::Cells targets = cells_of(target_data);
+                   const ispc::HashGrid hash = hash_of(target_data);
+                   ispc::hash_stencil_ranges_cross(
+                       begin, end, source_unique_keys.data(), &hash, &targets,
+                       target_data.num_cells,
+                       data.cell_neighbor_offset.data(),
+                       data.cell_num_neighbors.data(),
+                       data.cell_neighbor_starts.data(),
+                       data.cell_neighbor_ends.data());
+                 });
+}
+
 inline void build_cross_cell_ranges_from_sorted_impl(
     CrossNeighborSearchData &data,
     const std::vector<uint64_t> &source_unique_keys,
@@ -1028,6 +1480,12 @@ inline void build_cross_cell_ranges_from_sorted_impl(
   }
 
   const int stencil = data.source != nullptr ? data.source->cell_stencil : 1;
+  if (!target_data.dense_valid && stencil == 1 &&
+      target_data.cell_stencil == 1 && target_data.num_points > 0 &&
+      target_data.num_cells > 0 && !target_data.hash_keys.empty()) {
+    build_cross_hash_stencil_ranges_impl(data, source_unique_keys, target_data);
+    return;
+  }
   const int neighbor_stride =
       data.source != nullptr ? data.source->max_neighbor_cells : 27;
   data.scratch_cached_neighbor_cells.resize(
@@ -1121,6 +1579,15 @@ inline void build_cross_neighbor_lists_from_sorted(
 
 } // namespace
 
+void ensure_hash_table(NeighborSearchData &data) {
+  if (data.dense_valid || data.hash_valid || data.num_cells == 0) {
+    return;
+  }
+  build_hash_table(data.scratch_unique_keys, data.hash_keys, data.hash_vals,
+                   data.empty_key, data.hash_mask, data.hash_control);
+  data.hash_valid = true;
+}
+
 namespace {
 
 template <typename T, typename Kernel>
@@ -1181,14 +1648,9 @@ static void build_point_blocks_inplace(NeighborSearchData &data) {
   data.cell_block_start.clear();
   data.cell_block_count.clear();
   data.blocks_valid = false;
-  data.max_cell_points = 0;
 
   const int num_cells = data.num_cells;
   const int num_points = data.num_points;
-  if (num_cells < 8 || num_points == 0) {
-    return;
-  }
-
   int max_cell_points = 0;
   for (int cell = 0; cell < num_cells; ++cell) {
     max_cell_points = std::max(
@@ -1197,7 +1659,8 @@ static void build_point_blocks_inplace(NeighborSearchData &data) {
             data.cell_starts[static_cast<std::size_t>(cell)]);
   }
   data.max_cell_points = max_cell_points;
-  if (max_cell_points <= kBlockThreshold) {
+  if (num_cells < 8 || num_points == 0 ||
+      max_cell_points <= kBlockThreshold) {
     return;
   }
   const int block_size =
@@ -1389,6 +1852,8 @@ void build_point_grid_inplace(NeighborSearchData &data,
   const int stencil_width = 2 * data.cell_stencil + 1;
   data.max_neighbor_cells = stencil_width * stencil_width * stencil_width;
 
+  // The cell-x slab index describes the previous sorted order.
+  data.cell_x_valid = false;
   // Blocks and their cell bounds describe the previous sorted order.
   data.blocks_valid = false;
   data.block_begin.clear();
@@ -1421,7 +1886,10 @@ void build_point_grid_inplace(NeighborSearchData &data,
     data.cell_ends.clear();
     data.hash_keys.clear();
     data.hash_vals.clear();
+    data.hash_control.clear();
     data.hash_mask = 0;
+    data.hash_valid = false;
+    data.cell_keys_signed_order = false;
     data.scratch_unique_keys.clear();
     data.dense_cells.clear();
     data.dense_valid = false;
@@ -1461,10 +1929,23 @@ void build_point_grid_inplace(NeighborSearchData &data,
   }
 
   float inv_radius = 1.0f / data.cell_radius;
-  sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
-                 data.sorted_z, data.original_index, data.cell_starts,
-                 data.cell_ends, data.scratch_point_keys,
-                 data.scratch_point_keys_alt, data.scratch_unique_keys);
+  const bool incremental =
+      try_incremental_sort_point_set(data, x, y, z, inv_radius);
+  if (!incremental) {
+    CellBounds bounds;
+    sort_point_set(x, y, z, inv_radius, data.sorted_x, data.sorted_y,
+                   data.sorted_z, data.original_index, data.cell_starts,
+                   data.cell_ends, data.scratch_point_keys,
+                   data.scratch_point_keys_alt, data.scratch_unique_keys,
+                   data.cell_keys_signed_order, &bounds);
+    data.cell_coord_min_x = bounds.min_cx;
+    data.cell_coord_max_x = bounds.max_cx;
+    data.cell_coord_min_y = bounds.min_cy;
+    data.cell_coord_max_y = bounds.max_cy;
+    data.cell_coord_min_z = bounds.min_cz;
+    data.cell_coord_max_z = bounds.max_cz;
+    data.cell_coord_valid = true;
+  }
   auto const &unique_keys = data.scratch_unique_keys;
 
   const std::size_t num_cells_size = data.cell_starts.size();
@@ -1507,14 +1988,6 @@ void build_point_grid_inplace(NeighborSearchData &data,
   int num_cells = static_cast<int>(data.cell_starts.size());
   data.num_cells = num_cells;
   build_dense_cell_lookup(data);
-  if (!data.dense_valid) {
-    build_hash_table(unique_keys, data.hash_keys, data.hash_vals,
-                     data.empty_key, data.hash_mask);
-  } else {
-    data.hash_keys.clear();
-    data.hash_vals.clear();
-    data.hash_mask = 0;
-  }
   int max_cell_points = 0;
   for (int cell = 0; cell < num_cells; ++cell) {
     max_cell_points = std::max(
@@ -1523,6 +1996,26 @@ void build_point_grid_inplace(NeighborSearchData &data,
             data.cell_starts[static_cast<std::size_t>(cell)]);
   }
   data.max_cell_points = max_cell_points;
+  if (!incremental) {
+    // The merge only targets sparse grids; dense sets keep the full-sort
+    // path and must not pay to capture merge state they will never use.
+    if (max_cell_points <= 1) {
+      reset_incremental_state(data, x, y, z, inv_radius);
+    } else {
+      data.incremental_valid = false;
+    }
+  }
+  if (!data.dense_valid && max_cell_points > 1) {
+    build_hash_table(unique_keys, data.hash_keys, data.hash_vals,
+                     data.empty_key, data.hash_mask, data.hash_control);
+    data.hash_valid = true;
+  } else {
+    data.hash_keys.clear();
+    data.hash_vals.clear();
+    data.hash_control.clear();
+    data.hash_mask = 0;
+    data.hash_valid = false;
+  }
   // Blocks reorder points inside dense cells, so build them before the range
   // cache and neighbor rows are derived from the sorted order.
   if (max_cell_points > 32) {
@@ -1684,6 +2177,7 @@ inline int find_cell_index_cpp(const NeighborSearchData &data,
 // every cell's merged runs into fixed slots, instead of collecting the 27
 // neighbor cells and merging them in a count pass, a scan and a write pass.
 static void build_hash_stencil_ranges(NeighborSearchData &data) {
+  ensure_hash_table(data);
   const int num_cells = data.num_cells;
   const bool reuse =
       data.cached_range_valid && data.cached_range_stencil == -1 &&
@@ -2000,6 +2494,347 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
       });
 }
 
+// Same-set rows for a grid where every cell holds at most one point. The
+// packed cell keys are lexicographic in (x, y, z), so the 13 forward cells of
+// the 3x3x3 stencil can be enumerated by merging the sorted key array with
+// itself at a constant key offset. Each cursor only moves forward as the query
+// cell advances; chunk starts seed it with one binary search. No per-cell hash
+// probe and no per-cell range table is needed. The two rows of every pair are
+// appended symmetrically with atomic increments, which is cheapest for the
+// sparse sets this path targets (their rows are almost always empty).
+bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
+                            IntBuffer &fixed_neighbors, IntBuffer &counts) {
+  const int stride = capacity;
+  prepare_fixed_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(data.num_points), stride);
+  if (data.num_points == 0) {
+    return true;
+  }
+  std::fill(counts.begin(), counts.end(), 0);
+  const int num_cells = data.num_cells;
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const int *cell_starts = data.cell_starts.data();
+  const float *sx = data.sorted_x.data();
+  const float *sy = data.sorted_y.data();
+  const float *sz = data.sorted_z.data();
+  const int *original = data.original_index.data();
+  const float r2 = data.radius * data.radius;
+  int *row_counts = counts.data();
+  int *row_values = fixed_neighbors.data();
+  // The counting and comparison sorts order cells by signed coordinates; the
+  // radix sort orders the raw packed keys. Flip the sign bit of every field
+  // for the former so lower_bound sees the order the array was built with.
+  const bool signed_order = data.cell_keys_signed_order;
+  auto order_key = [&](uint64_t key) {
+    return signed_order ? (key ^ SortPointKey::kSignBits) : key;
+  };
+
+  auto lower_bound_key = [&](uint64_t want) {
+    return static_cast<int>(
+        std::lower_bound(keys, keys + num_cells, want,
+                         [&](uint64_t value, uint64_t target) {
+                           return order_key(value) < target;
+                         }) -
+        keys);
+  };
+  auto append = [&](int row, int value) {
+    const int slot =
+        __atomic_fetch_add(&row_counts[row], 1, __ATOMIC_RELAXED);
+    if (slot < capacity) {
+      row_values[static_cast<std::size_t>(row) * stride + slot] = value;
+    }
+  };
+  auto test_cell = [&](int query, int other_cell) {
+    const int other = cell_starts[other_cell];
+    if (other == query) {
+      return;
+    }
+    const float dx = sx[other] - sx[query];
+    const float dy = sy[other] - sy[query];
+    const float dz = sz[other] - sz[query];
+    if (dx * dx + dy * dy + dz * dz <= r2) {
+      append(query, original[other]);
+      append(other, original[query]);
+    }
+  };
+
+  constexpr int kGrain = 1 << 16;
+  struct Group {
+    int dx;
+    int dy;
+  };
+  // (0,0,+1) is the immediately following key. Each remaining direction is
+  // one cursor; its three z offsets are adjacent keys around the cursor.
+  static constexpr Group kGroups[4] = {
+      {0, 1}, {1, -1}, {1, 0}, {1, 1}};
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_cells, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        const int begin = range.begin();
+        const int end = range.end();
+        int cursor[4];
+        uint64_t last[4];
+        for (int k = 0; k < 4; ++k) {
+          const uint64_t key = keys[begin];
+          last[k] = order_key(make_key(unpack_coord(key, 42) + kGroups[k].dx,
+                                       unpack_coord(key, 21) + kGroups[k].dy,
+                                       unpack_coord(key, 0)));
+          cursor[k] = lower_bound_key(last[k]);
+        }
+        for (int cell = begin; cell < end; ++cell) {
+          const int query = cell_starts[cell];
+          const uint64_t key = keys[cell];
+          const int cx = unpack_coord(key, 42);
+          const int cy = unpack_coord(key, 21);
+          const int cz = unpack_coord(key, 0);
+          // Same (x, y), next z: the next occupied position when the key is
+          // exactly one greater.
+          if (signed_order || (cz >= 0 && cz < 0xFFFFF)) {
+            const uint64_t want =
+                order_key(make_key(cx, cy, cz + 1));
+            const int next = cell + 1;
+            if (next < num_cells && order_key(keys[next]) == want) {
+              test_cell(query, next);
+            }
+          } else if (cz < 0) {
+            const uint64_t want =
+                order_key(make_key(cx, cy, cz + 1));
+            const int found = lower_bound_key(want);
+            if (found < num_cells && order_key(keys[found]) == want) {
+              test_cell(query, found);
+            }
+          }
+          for (int k = 0; k < 4; ++k) {
+            const uint64_t want = order_key(
+                make_key(cx + kGroups[k].dx, cy + kGroups[k].dy, cz));
+            int &position = cursor[k];
+            if (want < last[k]) {
+              position = lower_bound_key(want);
+            } else {
+              while (position < num_cells &&
+                     order_key(keys[position]) < want) {
+                ++position;
+              }
+            }
+            last[k] = want;
+            const uint64_t key_neg = order_key(
+                make_key(cx + kGroups[k].dx, cy + kGroups[k].dy, cz - 1));
+            const uint64_t key_pos = order_key(
+                make_key(cx + kGroups[k].dx, cy + kGroups[k].dy, cz + 1));
+            const bool adjacent = (signed_order ||
+                                   (cz > 0 && cz < 0xFFFFF)) &&
+                                  key_neg == want - 1 && key_pos == want + 1;
+            if (adjacent) {
+              if (position < num_cells &&
+                  order_key(keys[position]) == want) {
+                test_cell(query, position);
+                if (position > 0 &&
+                    order_key(keys[position - 1]) == want - 1) {
+                  test_cell(query, position - 1);
+                }
+                if (position + 1 < num_cells &&
+                    order_key(keys[position + 1]) == want + 1) {
+                  test_cell(query, position + 1);
+                }
+              } else {
+                if (position > 0 &&
+                    order_key(keys[position - 1]) == want - 1) {
+                  test_cell(query, position - 1);
+                }
+                if (position < num_cells &&
+                    order_key(keys[position]) == want + 1) {
+                  test_cell(query, position);
+                }
+              }
+            } else {
+              for (int dz = -1; dz <= 1; ++dz) {
+                const int z = cz + dz;
+                if (z < -0x100000 || z > 0xFFFFF) {
+                  continue;
+                }
+                const uint64_t exact = order_key(
+                    make_key(cx + kGroups[k].dx, cy + kGroups[k].dy, z));
+                const int found = lower_bound_key(exact);
+                if (found < num_cells &&
+                    order_key(keys[found]) == exact) {
+                  test_cell(query, found);
+                }
+              }
+            }
+          }
+        }
+      });
+  return max_row_count(counts) <= capacity;
+}
+
+// Builds the cell-x slab index and the cell y/z bounds. The cell keys must be
+// in lexicographic (x, y, z) order with non-negative coordinates; callers gate
+// on that, so raw key order is also coordinate order.
+void ensure_cell_x_index(NeighborSearchData &data) {
+  if (data.cell_x_valid) {
+    return;
+  }
+  const int num_cells = data.num_cells;
+  if (num_cells <= 0) {
+    data.cell_x_start.clear();
+    return;
+  }
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const int min_x = unpack_coord(keys[0], 42);
+  const int max_x = unpack_coord(keys[num_cells - 1], 42);
+  const int span = max_x - min_x + 1;
+  if (span <= 0 || span > 4 * num_cells + 65536) {
+    return;
+  }
+  data.cell_x_min = min_x;
+  data.cell_x_start.resize(static_cast<std::size_t>(span) + 1);
+  int cell = 0;
+  for (int i = 0; i < span; ++i) {
+    const int x = min_x + i;
+    while (cell < num_cells && unpack_coord(keys[cell], 42) < x) {
+      ++cell;
+    }
+    data.cell_x_start[static_cast<std::size_t>(i)] = cell;
+  }
+  data.cell_x_start[static_cast<std::size_t>(span)] = num_cells;
+  int min_y = INT_MAX;
+  int max_y = INT_MIN;
+  int min_z = INT_MAX;
+  int max_z = INT_MIN;
+  for (int i = 0; i < num_cells; ++i) {
+    const int y = unpack_coord(keys[i], 21);
+    const int z = unpack_coord(keys[i], 0);
+    min_y = std::min(min_y, y);
+    max_y = std::max(max_y, y);
+    min_z = std::min(min_z, z);
+    max_z = std::max(max_z, z);
+  }
+  data.cell_range_min_y = min_y;
+  data.cell_range_max_y = max_y;
+  data.cell_range_min_z = min_z;
+  data.cell_range_max_z = max_z;
+  data.cell_x_valid = true;
+}
+
+bool write_cross_rows_cell_range(NeighborSearchData &source,
+                                 NeighborSearchData &target, float radius,
+                                 int capacity, IntBuffer &fixed_neighbors,
+                                 IntBuffer &counts) {
+  ensure_cell_x_index(target);
+  if (!target.cell_x_valid || target.num_cells <= 0) {
+    return false;
+  }
+  const int num_points = source.num_points;
+  const int stride = capacity;
+  prepare_fixed_rows(fixed_neighbors, counts,
+                     static_cast<std::size_t>(num_points), stride);
+  if (num_points == 0) {
+    return true;
+  }
+  const float r2 = radius * radius;
+  const float inv_cell =
+      target.cell_radius > 0.0f ? 1.0f / target.cell_radius : 1.0f;
+  const int stencil =
+      std::max(1, static_cast<int>(std::ceil(radius * inv_cell - 1.0e-6f)));
+  const int num_cells = target.num_cells;
+  const uint64_t *keys = target.scratch_unique_keys.data();
+  const int *cell_starts = target.cell_starts.data();
+  const int *cell_ends = target.cell_ends.data();
+  const float *tx = target.sorted_x.data();
+  const float *ty = target.sorted_y.data();
+  const float *tz = target.sorted_z.data();
+  const int *target_index = target.original_index.data();
+  const float *qx = source.sorted_x.data();
+  const float *qy = source.sorted_y.data();
+  const float *qz = source.sorted_z.data();
+  const int *cell_x_start = target.cell_x_start.data();
+  const int x_min = target.cell_x_min;
+  const int x_span = static_cast<int>(target.cell_x_start.size()) - 1;
+  const int y_min = target.cell_range_min_y;
+  const int y_max = target.cell_range_max_y;
+  const int z_min = target.cell_range_min_z;
+  const int z_max = target.cell_range_max_z;
+  int *row_counts = counts.data();
+  int *row_values = fixed_neighbors.data();
+
+  auto lower = [&](int begin, int end, uint64_t want) {
+    return static_cast<int>(std::lower_bound(keys + begin, keys + end, want) -
+                            keys);
+  };
+
+  constexpr int kGrain = 2048;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int point = range.begin(); point < range.end(); ++point) {
+          const float px = qx[point];
+          const float py = qy[point];
+          const float pz = qz[point];
+          const int cx = floor_to_cell(px * inv_cell);
+          const int cy = floor_to_cell(py * inv_cell);
+          const int cz = floor_to_cell(pz * inv_cell);
+          int count = 0;
+          int x0 = std::max(cx - stencil, x_min);
+          int x1 = std::min(cx + stencil, x_min + x_span - 1);
+          for (int tcx = x0; tcx <= x1; ++tcx) {
+            const int xb = cell_x_start[tcx - x_min];
+            const int xe = cell_x_start[tcx - x_min + 1];
+            if (xb >= xe) {
+              continue;
+            }
+            const int y0 = std::max(cy - stencil, y_min);
+            const int y1 = std::min(cy + stencil, y_max);
+            if (y0 > y1) {
+              continue;
+            }
+            const uint64_t y_low = make_key(tcx, y0, 0);
+            const int yb = lower(xb, xe, y_low);
+            const int ye = y1 == 0xFFFFF
+                               ? xe
+                               : lower(xb, xe, make_key(tcx, y1 + 1, 0));
+            for (int cell = yb; cell < ye;) {
+              const int y = unpack_coord(keys[cell], 21);
+              if (y > y1) {
+                break;
+              }
+              const int y_end =
+                  y == 0xFFFFF
+                      ? ye
+                      : lower(cell, ye, make_key(tcx, y + 1, 0));
+              const int z0 = std::max(cz - stencil, z_min);
+              const int z1 = std::min(cz + stencil, z_max);
+              if (z0 <= z1) {
+                const int zb = lower(cell, y_end, make_key(tcx, y, z0));
+                const int ze =
+                    z1 == 0xFFFFF
+                        ? y_end
+                        : lower(zb, y_end, make_key(tcx, y, z1 + 1));
+                for (int c = zb; c < ze; ++c) {
+                  const int begin = cell_starts[c];
+                  const int end = cell_ends[c];
+                  for (int p = begin; p < end; ++p) {
+                    const float dx = tx[p] - px;
+                    const float dy = ty[p] - py;
+                    const float dz = tz[p] - pz;
+                    if (dx * dx + dy * dy + dz * dz <= r2) {
+                      if (count < capacity) {
+                        row_values[static_cast<std::size_t>(point) * stride +
+                                   count] = target_index[p];
+                      }
+                      ++count;
+                    }
+                  }
+                }
+              }
+              cell = y_end;
+            }
+          }
+          row_counts[point] = count;
+        }
+      });
+  return max_row_count(counts) <= capacity;
+}
+
 void write_neighbors_fixed_query_blocked_parallel(
     NeighborSearchData &data, int capacity, IntBuffer &fixed_neighbors,
     IntBuffer &counts) {
@@ -2075,10 +2910,12 @@ static void build_cross_neighbor_search_data_inplace(
   }
 
   float inv_radius = 1.0f / radius;
+  bool signed_order = false;
   sort_point_set(query_x, query_y, query_z, inv_radius, data.sorted_x,
                  data.sorted_y, data.sorted_z, data.original_index,
                  data.cell_starts, data.cell_ends, data.scratch_point_keys,
-                 data.scratch_point_keys_alt, data.scratch_unique_keys);
+                 data.scratch_point_keys_alt, data.scratch_unique_keys,
+                 signed_order, nullptr);
   auto const &unique_keys = data.scratch_unique_keys;
 
   data.num_cells = static_cast<int>(data.cell_starts.size());

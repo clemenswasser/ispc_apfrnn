@@ -226,7 +226,11 @@ static inline void append_run(varying int start, varying int end,
 // also across columns. 9 probes per cell in the common case instead of the
 // 27 of collect_neighbor_cells, and no count/scan/merge passes.
 #define HASH_STENCIL_RUNS 18
+#define HASH_STENCIL_RUNS_CROSS 32
 export uniform int hash_stencil_runs_per_cell() { return HASH_STENCIL_RUNS; }
+export uniform int hash_stencil_runs_per_cell_cross() {
+  return HASH_STENCIL_RUNS_CROSS;
+}
 
 export void hash_stencil_ranges(
     uniform int start_cell, uniform int end_cell,
@@ -268,6 +272,75 @@ export void hash_stencil_ranges(
           if (found >= 0) {
             if (first >= 0 && found != last + 1) {
               // Only across z = -1 -> 0 in raw key order: not adjacent.
+              append_run(targets.starts[first], targets.ends[last], base,
+                         runs, run_start, run_end, out_starts, out_ends);
+              first = found;
+            } else if (first < 0) {
+              first = found;
+            }
+            last = found;
+          }
+        }
+        if (first >= 0) {
+          append_run(targets.starts[first], targets.ends[last], base, runs,
+                     run_start, run_end, out_starts, out_ends);
+        }
+      }
+    }
+    if (run_start >= 0) {
+      out_starts[base + runs] = run_start;
+      out_ends[base + runs] = run_end;
+      ++runs;
+    }
+    out_offsets[cell] = base;
+    out_counts[cell] = runs;
+  }
+}
+
+// Cross-set variant of hash_stencil_ranges: query keys come from the source
+// grid and target cells/hash from a different point set. Same 9-probe,
+// one-pass run construction; avoids collect_neighbor_cells' 27 probes plus the
+// count/scan/merge passes for hash-grid cross pairs.
+export void hash_stencil_ranges_cross(
+    uniform int start_cell, uniform int end_cell,
+    const uniform uint64 *uniform query_keys,
+    const uniform HashGrid *uniform hash_in,
+    const uniform Cells *uniform targets_in, uniform int num_target_cells,
+    uniform int out_offsets[], uniform int out_counts[],
+    uniform int out_starts[], uniform int out_ends[]) {
+  const uniform HashGrid hash = *hash_in;
+  const uniform Cells targets = *targets_in;
+  foreach (cell = start_cell... end_cell) {
+    const varying uint64 key = query_keys[cell];
+    const varying int cx = unpack_coord(key, 42);
+    const varying int cy = unpack_coord(key, 21);
+    const varying int cz = unpack_coord(key, 0);
+    const varying int base = cell * HASH_STENCIL_RUNS_CROSS;
+    varying int runs = 0;
+    varying int run_start = -1;
+    varying int run_end = -1;
+    for (uniform int dx = -1; dx <= 1; ++dx) {
+      for (uniform int dy = -1; dy <= 1; ++dy) {
+        varying int first = -1;
+        varying int last = -1;
+        for (uniform int dz = -1; dz <= 1; ++dz) {
+          const varying int z = cz + dz;
+          const varying uint64 want = make_key(cx + dx, cy + dy, z);
+          varying int found = -1;
+          if (last >= 0 && z != 0) {
+            const varying int next = last + 1;
+            if (next < num_target_cells && targets.keys[next] == want) {
+              found = next;
+            } else {
+              // The array successor is not always the wanted z (e.g. z=-1
+              // sorts after every non-negative z), so fall back to the hash.
+              found = find_cell_index(hash, want);
+            }
+          } else {
+            found = find_cell_index(hash, want);
+          }
+          if (found >= 0) {
+            if (first >= 0 && found != last + 1) {
               append_run(targets.starts[first], targets.ends[last], base,
                          runs, run_start, run_end, out_starts, out_ends);
               first = found;

@@ -20,6 +20,7 @@
 
 #include "api_bench.hpp"
 #include "backends.hpp"
+#include "reference.hpp"
 #include "scenes.hpp"
 
 #include <benchmark/benchmark.h>
@@ -47,8 +48,15 @@ namespace {
 
 using apfrnn::bench::Backend;
 using apfrnn::bench::BackendSpec;
+using apfrnn::bench::ReferenceSummary;
 using apfrnn::bench::SceneData;
 using apfrnn::bench::SceneSpec;
+
+// Default worker count for Frame/Stress/Cold runs. `--threads=N` overrides it;
+// Threads/ benchmarks always carry their own count. Keeping the default
+// explicit makes TBB and OpenMP run the same number of workers instead of
+// leaving each pool to size itself from the machine.
+int64_t &benchmark_threads();
 
 // The last scene built. Benchmarks are registered scene by scene, so all
 // backends of a scene reuse it; each run copies it because frames move it.
@@ -57,13 +65,30 @@ const SceneData &cached_scene(const SceneSpec &spec) {
   static SceneData data;
   if (name != spec.name) {
     data = spec.make();
+    if (spec.zsorted) {
+      apfrnn::bench::zsort_scene(data);
+    }
+    // Every benchmark scene moves every frame. Static benchmarks are not a
+    // representation of an SPH simulation and are intentionally impossible.
+    if (!data.growing && data.motion == apfrnn::bench::Motion::Static &&
+        data.jitter == 0.0f) {
+      data.jitter = 0.1f;
+    }
     name = spec.name;
   }
   return data;
 }
 
+// Default worker count for Frame/Stress/Cold runs. `--threads=N` overrides it;
+// Threads/ benchmarks always carry their own count. Keeping the default
+// explicit makes TBB and OpenMP run the same number of workers instead of
+// leaving each pool to size itself from the machine.
+int64_t &benchmark_threads() {
+  static int64_t threads = 8;
+  return threads;
+}
+
 // Limits both thread pools: TBB (apfrnn) and OpenMP (the baselines).
-// 0 means all hardware threads.
 class ThreadLimit {
 public:
   explicit ThreadLimit(int threads) {
@@ -94,6 +119,26 @@ struct Validation {
   int64_t false_positives = 0;     // pairs clearly farther than the radius
   uint64_t checksum = 0;           // of the pairs clearly within the radius
 };
+
+// Every validated backend result is recorded by scene and backend. After the
+// run, the harness requires all backends of a scene to agree on the checksum
+// and, when the scene is small enough for the independent reference, to agree
+// with the reference pair set. A backend that returns nothing no longer
+// passes silently. Results are kept per run so a thread-count or family
+// variant cannot silently overwrite a disagreement.
+std::map<std::string,
+         std::vector<std::pair<std::string, Validation>>> &
+verified_results() {
+  static std::map<std::string,
+                  std::vector<std::pair<std::string, Validation>>>
+      results;
+  return results;
+}
+
+std::map<std::string, ReferenceSummary> &reference_cache() {
+  static std::map<std::string, ReferenceSummary> references;
+  return references;
+}
 
 // Backends round the distance test differently, so pairs at almost exactly
 // the radius may or may not be listed. Distances are recomputed in double:
@@ -161,16 +206,25 @@ void attach_rss(benchmark::State &state) {
   }
 }
 
+void advance_scene(SceneData &scene, Backend &backend, int step) {
+  scene.advance(step);
+  if (scene.growing) {
+    backend.resize(0, scene.xyz[0].data(), scene.points(0));
+  }
+}
+
 void frames(benchmark::State &state, const SceneSpec &spec,
             const BackendSpec &backend_spec, int threads) {
   SceneData scene = cached_scene(spec);
-  const ThreadLimit limit(threads);
+  const int thread_count =
+      threads > 0 ? threads : static_cast<int>(benchmark_threads());
+  const ThreadLimit limit(thread_count);
   std::unique_ptr<Backend> backend = backend_spec.make();
   backend->setup(scene);
   // Two warm-up frames. Row capacities and some plans adapt after the first
   // frame, so the second one is the one validated.
   backend->run();
-  scene.advance(1);
+  advance_scene(scene, *backend, 1);
   backend->run();
 
   // Benchmark functions run several times per benchmark; validate once.
@@ -181,20 +235,57 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   }
   const Validation &validation = found->second;
 
+  auto &references = reference_cache();
+  auto reference = references.find(spec.name);
+  if (reference == references.end()) {
+    reference = references.emplace(spec.name, reference_summary(scene)).first;
+  }
+  const ReferenceSummary &reference_summary = reference->second;
+
+  auto &results = verified_results();
+  results[spec.name].push_back({backend_spec.name, validation});
+  if (reference_summary.complete) {
+    const bool checksum_matches =
+        validation.checksum == reference_summary.checksum;
+    const bool count_in_range =
+        validation.neighbors >= reference_summary.exact_pairs &&
+        validation.neighbors <=
+            reference_summary.exact_pairs + reference_summary.band_pairs;
+    if (!checksum_matches || !count_in_range) {
+      std::fprintf(stderr,
+                   "REFERENCE MISMATCH scene=%s backend=%s checksum=%016llx "
+                   "ref=%016llx neighbors=%lld exact=%lld band=%lld\n",
+                   spec.name.c_str(), backend_spec.name.c_str(),
+                   static_cast<unsigned long long>(validation.checksum),
+                   static_cast<unsigned long long>(reference_summary.checksum),
+                   static_cast<long long>(validation.neighbors),
+                   static_cast<long long>(reference_summary.exact_pairs),
+                   static_cast<long long>(reference_summary.band_pairs));
+      std::exit(2);
+    }
+  }
+
   int step = 2;
   for (auto _ : state) {
-    scene.advance(step++);
+    advance_scene(scene, *backend, step++);
     backend->run();
   }
 
   const int fluid_points = scene.points(0);
   state.SetItemsProcessed(state.iterations() * fluid_points);
+  state.counters["CpuThreads"] = thread_count;
   state.counters["Neighbors"] = static_cast<double>(validation.neighbors);
   state.counters["FalsePositives"] =
       static_cast<double>(validation.false_positives);
   state.counters["AvgNeighbors"] =
       static_cast<double>(validation.same_set_neighbors) /
       std::max(1, fluid_points);
+  if (reference_summary.complete) {
+    state.counters["RefPairs"] =
+        static_cast<double>(reference_summary.exact_pairs);
+    state.counters["RefBandPairs"] =
+        static_cast<double>(reference_summary.band_pairs);
+  }
   char label[40];
   std::snprintf(label, sizeof(label), "checksum=%016llx",
                 static_cast<unsigned long long>(validation.checksum));
@@ -208,6 +299,8 @@ void frames(benchmark::State &state, const SceneSpec &spec,
 void cold_frame(benchmark::State &state, const SceneSpec &spec,
                 const BackendSpec &backend_spec) {
   const SceneData &scene = cached_scene(spec);
+  const int thread_count = static_cast<int>(benchmark_threads());
+  const ThreadLimit limit(thread_count);
   for (auto _ : state) {
     std::unique_ptr<Backend> backend = backend_spec.make();
     backend->setup(scene);
@@ -216,7 +309,58 @@ void cold_frame(benchmark::State &state, const SceneSpec &spec,
     backend.reset();
     state.ResumeTiming();
   }
+  state.counters["CpuThreads"] = thread_count;
   attach_rss(state);
+}
+
+bool verify_all() {
+  bool ok = true;
+  int scenes = 0;
+  int results = 0;
+  for (const auto &[scene_name, entries] : verified_results()) {
+    ++scenes;
+    const auto reference = reference_cache().find(scene_name);
+    const bool has_reference =
+        reference != reference_cache().end() && reference->second.complete;
+    uint64_t checksum = 0;
+    bool have_checksum = false;
+    for (const auto &[backend_name, validation] : entries) {
+      ++results;
+      if (validation.false_positives != 0) {
+        std::fprintf(stderr,
+                     "BENCHMARK FAILURE scene=%s backend=%s false_positives=%lld\n",
+                     scene_name.c_str(), backend_name.c_str(),
+                     static_cast<long long>(validation.false_positives));
+        ok = false;
+      }
+      if (has_reference) {
+        const ReferenceSummary &reference_summary = reference->second;
+        if (validation.checksum != reference_summary.checksum ||
+            validation.neighbors < reference_summary.exact_pairs ||
+            validation.neighbors >
+                reference_summary.exact_pairs + reference_summary.band_pairs) {
+          std::fprintf(stderr,
+                       "BENCHMARK FAILURE scene=%s backend=%s reference\n",
+                       scene_name.c_str(), backend_name.c_str());
+          ok = false;
+        }
+      }
+      if (!have_checksum) {
+        checksum = validation.checksum;
+        have_checksum = true;
+      } else if (validation.checksum != checksum) {
+        std::fprintf(stderr,
+                     "BENCHMARK FAILURE scene=%s backend=%s checksum disagrees "
+                     "with another backend\n",
+                     scene_name.c_str(), backend_name.c_str());
+        ok = false;
+      }
+    }
+  }
+  std::fprintf(stderr,
+               "Benchmark verification: %d scenes, %d backend results, %s\n",
+               scenes, results, ok ? "all checksums match" : "FAILED");
+  return ok;
 }
 
 } // namespace
@@ -227,11 +371,17 @@ int main(int argc, char **argv) {
   for (int i = 0; i < argc; ++i) {
     constexpr const char *kRes = "--learnsph_res=";
     constexpr const char *kBudget = "--memory_budget_mb=";
+    constexpr const char *kThreads = "--threads=";
     if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
       learnsph_res = argv[i] + std::strlen(kRes);
     } else if (std::strncmp(argv[i], kBudget, std::strlen(kBudget)) == 0) {
       apfrnn::bench::benchmark_memory_budget_mb() =
           std::stoll(argv[i] + std::strlen(kBudget));
+    } else if (std::strncmp(argv[i], kThreads, std::strlen(kThreads)) == 0) {
+      benchmark_threads() = std::stoll(argv[i] + std::strlen(kThreads));
+
+    } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+      benchmark_threads() = std::stoll(argv[++i]);
     } else {
       args.push_back(argv[i]);
     }
@@ -250,9 +400,13 @@ int main(int argc, char **argv) {
   }
 
   auto register_family = [&](const char *family,
-                             const std::vector<SceneSpec> &family_scenes) {
+                             const std::vector<SceneSpec> &family_scenes,
+                             bool require_growing = false) {
     for (const SceneSpec &scene : family_scenes) {
       for (const BackendSpec &backend : backends) {
+        if (require_growing && !backend.supports_growing) {
+          continue;
+        }
         benchmark::RegisterBenchmark(
             std::string(family) + "/" + backend.name + "/" + scene.name, frames,
             scene, backend, 0)
@@ -263,6 +417,11 @@ int main(int argc, char **argv) {
   };
   register_family("Frame", scenes);
   register_family("Stress", apfrnn::bench::stress_scenes());
+  register_family("Order", apfrnn::bench::order_scenes());
+  register_family("Scale", apfrnn::bench::scale_scenes());
+  register_family("Growing", apfrnn::bench::growing_scenes(),
+                  /*require_growing=*/true);
+  register_family("Dynamic", apfrnn::bench::dynamic_scenes(learnsph_res));
   for (const SceneSpec &scene : apfrnn::bench::cold_scenes()) {
     for (const BackendSpec &backend : backends) {
       benchmark::RegisterBenchmark("Cold/" + backend.name + "/" + scene.name,
@@ -332,6 +491,7 @@ int main(int argc, char **argv) {
   apfrnn::bench::register_api_benchmarks();
 
   benchmark::RunSpecifiedBenchmarks();
+  const bool verified = verify_all();
   benchmark::Shutdown();
-  return 0;
+  return verified ? 0 : 1;
 }

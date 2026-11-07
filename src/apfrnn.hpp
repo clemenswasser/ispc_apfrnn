@@ -172,9 +172,56 @@ struct NeighborSearchData {
   IntBuffer col_idx;
   std::vector<uint64_t> hash_keys;
   IntBuffer hash_vals;
+  std::vector<uint8_t> hash_control;
+  bool hash_valid = false;
   std::vector<SortPointKey> scratch_point_keys;
   std::vector<SortPointKey> scratch_point_keys_alt;
   std::vector<uint64_t> scratch_unique_keys;
+  // True when cell_starts/cell_ends/scratch_unique_keys are ordered by signed
+  // cell coordinates (the comparison/counting sorts); false for the radix
+  // sort, which orders by the raw packed key.
+  bool cell_keys_signed_order = false;
+  // Incremental cell-order state for moving sets. `incremental_keys` is the
+  // previous cell key per original index, `incremental_sorted_keys` the same
+  // keys in the previous sorted order. The remaining vectors are scratch used
+  // by the changed/unchanged merge.
+  std::vector<uint64_t> incremental_keys;
+  std::vector<uint64_t> incremental_sorted_keys;
+  std::vector<uint8_t> incremental_changed;
+  std::vector<SortPointKey> incremental_changed_keys;
+  std::vector<SortPointKey> incremental_unchanged_keys;
+  std::vector<float> incremental_x;
+  std::vector<float> incremental_y;
+  std::vector<float> incremental_z;
+  IntBuffer incremental_order;
+  IntBuffer incremental_starts;
+  IntBuffer incremental_ends;
+  std::vector<uint64_t> incremental_unique_keys;
+  std::vector<uint64_t> incremental_merge_keys;
+  // Cell-x slab index for the log-time cross range search: position of the
+  // first cell with x = cell_x_min + i.
+  IntBuffer cell_x_start;
+  int cell_x_min = 0;
+  int cell_range_min_y = 0;
+  int cell_range_max_y = 0;
+  int cell_range_min_z = 0;
+  int cell_range_max_z = 0;
+  bool cell_x_valid = false;
+  // Occupied-cell coordinate bounds from the last key pass; avoids rescanning
+  // every unique key in build_dense_cell_lookup.
+  int cell_coord_min_x = 0;
+  int cell_coord_max_x = 0;
+  int cell_coord_min_y = 0;
+  int cell_coord_max_y = 0;
+  int cell_coord_min_z = 0;
+  int cell_coord_max_z = 0;
+  bool cell_coord_valid = false;
+  // True when scratch_unique_keys is also the per-sorted-position key array
+  // (one point per cell), so the next merge can use it directly.
+  bool incremental_keys_are_unique = false;
+  int incremental_points = 0;
+  float incremental_inv_radius = 0.0f;
+  bool incremental_valid = false;
   IntBuffer scratch_cached_neighbor_cells;
   IntBuffer scratch_cached_neighbor_counts;
   std::vector<uint64_t> cached_neighbor_keys;
@@ -330,6 +377,29 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
                                               int capacity,
                                               IntBuffer &fixed_neighbors,
                                               IntBuffer &counts);
+
+// Same-set rows for a grid with at most one point per cell. Enumerates the
+// 3x3x3 cell stencil by merging the sorted cell keys at constant key offsets,
+// avoiding per-cell hash probes and per-cell range tables. Returns false when
+// a row exceeded `capacity` (the caller retries with a larger capacity).
+bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
+                            IntBuffer &fixed_neighbors, IntBuffer &counts);
+
+// Builds the hashed cell lookup if the grid does not have a dense one and the
+// hash has not been built yet. Sparse grids defer it: the merged-key same-set
+// path and the sweep cross path never read it.
+void ensure_hash_table(NeighborSearchData &data);
+
+// Exact cross-set rows for a sparse target with non-negative cell
+// coordinates. The target's sorted cell keys are searched as a log-time range
+// index (x slab -> y range -> z range) instead of scanning an x-window or
+// probing a hash. Returns false when a row exceeded `capacity`.
+void ensure_cell_x_index(NeighborSearchData &data);
+
+bool write_cross_rows_cell_range(NeighborSearchData &source,
+                                 NeighborSearchData &target, float radius,
+                                 int capacity, IntBuffer &fixed_neighbors,
+                                 IntBuffer &counts);
 
 // Block-AABB filtered query-major writer for dense cells.
 void write_neighbors_fixed_query_blocked_parallel(NeighborSearchData &data,

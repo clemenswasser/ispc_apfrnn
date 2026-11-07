@@ -10,6 +10,7 @@
 #include <benchmark/benchmark.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -29,6 +30,9 @@ public:
   // frames.
   virtual void setup(const SceneData &scene) = 0;
   virtual void run() = 0;
+  // Pointer/count changes for a growing point set. Called between frames when
+  // SceneData::growing is set.
+  virtual void resize(int set, const float *xyz, int n) = 0;
   // Neighbors of `point` of set `query` in set `target`, in any order.
   virtual void neighbors(int query, int target, int point,
                          std::vector<uint32_t> &out) const = 0;
@@ -40,6 +44,11 @@ struct BackendSpec {
   std::string name;
   std::function<std::unique_ptr<Backend>()> make;
   bool uses_cpu_threads = true;
+  // False for baselines whose repeated-resize path is not correct enough to
+  // publish a growing-scene comparison. CompactNSearch currently drops a few
+  // pairs after many growth steps (verified against brute force), so it is
+  // excluded from Growing/ rather than silently compared.
+  bool supports_growing = true;
 };
 
 // Set by --memory_budget_mb=N; 0 keeps the library default.
@@ -71,6 +80,10 @@ public:
 
   void run() override { search_->run(); }
 
+  void resize(int set, const float *xyz, int n) override {
+    search_->resize_point_set(set, xyz, n);
+  }
+
   void neighbors(int query, int target, int point,
                  std::vector<uint32_t> &out) const override {
     const NeighborList list = search_->get_neighbors(query, target, point);
@@ -80,11 +93,33 @@ public:
   void add_counters(benchmark::State &state) const override {
     const NSearch::RunStats stats = search_->last_stats();
     state.counters["BuildMs"] = stats.sync_build_ms;
+    state.counters["GridMs"] = stats.grid_ms;
+    state.counters["SameBuildMs"] = stats.same_build_ms;
+    state.counters["SameMs"] = stats.same_set_ms;
     state.counters["CrossMs"] = stats.cross_set_ms;
+    state.counters["FilterMs"] = stats.filter_ms;
+    const int set_count = search_->n_sets();
+    for (int query = 0; query < set_count; ++query) {
+      for (int target = 0; target < set_count; ++target) {
+        const std::size_t index =
+            static_cast<std::size_t>(query) * set_count + target;
+        if (index < stats.pair_ms.size() && stats.pair_ms[index] > 0.0) {
+          char name[32];
+          std::snprintf(name, sizeof(name), "PairMs%d_%d", query, target);
+          state.counters[name] = stats.pair_ms[index];
+        }
+      }
+    }
     state.counters["NeighborMB"] =
         static_cast<double>(stats.neighbor_bytes) / (1024.0 * 1024.0);
     state.counters["FixedOverflows"] = stats.fixed_overflows;
     state.counters["MaxNeighbors"] = stats.max_neighbors;
+    // Path bits are diagnostics, not a stable API.
+    for (uint64_t bit = 1; bit != 0; bit <<= 1) {
+      if ((stats.paths & bit) != 0) {
+        state.counters[std::string("Path") + NSearch::path_name(bit)] = 1;
+      }
+    }
     // A GPU run that fell back to the CPU would otherwise look like GPU time.
     state.counters["Fallback"] = search_->search_backend() != backend_;
   }
@@ -112,6 +147,10 @@ public:
   }
 
   void run() override { search_->run(); }
+
+  void resize(int set, const float *xyz, int n) override {
+    search_->resize_point_set(set, xyz, n);
+  }
 
   void neighbors(int query, int target, int point,
                  std::vector<uint32_t> &out) const override {
@@ -148,6 +187,13 @@ public:
 
   void run() override { search_->find_neighbors(); }
 
+  void resize(int set, const float *xyz, int n) override {
+    search_->resize_point_set(
+        static_cast<unsigned int>(set),
+        reinterpret_cast<const CompactNSearch::Real *>(xyz),
+        static_cast<std::size_t>(n));
+  }
+
   void neighbors(int query, int target, int point,
                  std::vector<uint32_t> &out) const override {
     const auto &set = search_->point_set(static_cast<unsigned int>(query));
@@ -181,7 +227,8 @@ inline std::vector<BackendSpec> available_backends() {
 #ifdef APFRNN_BENCH_BASELINES
   backends.push_back({"tree", [] { return std::make_unique<TreeBackend>(); }});
   backends.push_back(
-      {"compact", [] { return std::make_unique<CompactBackend>(); }});
+      {"compact", [] { return std::make_unique<CompactBackend>(); }, true,
+       /*supports_growing=*/false});
 #endif
   return backends;
 }

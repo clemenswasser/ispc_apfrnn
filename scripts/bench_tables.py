@@ -15,8 +15,14 @@ To verify that README is already current without running the benchmarks:
     scripts/bench_tables.py --json-dir build/bench-tables --check
 
 --json-dir expects headline.json, stress.json, learnsph.json, motion.json,
-droplets_motion.json and memory.json in that directory. Pass a SYCL
-benchmark JSON with --gpu-json to regenerate the separate GPU table.
+droplets_motion.json, order.json, dynamic.json, scale.json, growing.json,
+threads.json and memory.json in that directory. Pass a SYCL benchmark JSON
+with --gpu-json to regenerate the separate GPU table.
+
+Runs use a Morton-sorted scene order by default (TreeNSearch's documented
+fast path), 8 worker threads for both TBB and OpenMP, and verify every backend
+against an independent reference checksum. --threads changes the shared
+worker count; --no-scale skips the 175k..8M dense/sparse run.
 """
 
 from __future__ import annotations
@@ -76,6 +82,52 @@ MOTION = [
     ("droplets 200k", "Stress", "droplets_200k", "droplets_200k_jitter"),
 ]
 
+ORDER = [
+    ("uniform 200k", "uniform_200k", "uniform_200k_unsorted"),
+    ("slab 200k", "slab_200k", "slab_200k_unsorted"),
+    ("clustered 200k", "clustered_200k", "clustered_200k_unsorted"),
+]
+
+DYNAMIC = [
+    ("uniform 200k", "uniform_200k", "uniform_200k_dynamic_boundary"),
+    ("slab 200k", "slab_200k", "slab_200k_dynamic_boundary"),
+    ("clustered 200k", "clustered_200k",
+     "clustered_200k_dynamic_boundary"),
+    ("learnsph funnel", "learnsph_funnel",
+     "learnsph_funnel_dynamic_boundary"),
+    ("learnsph sink", "learnsph_sink", "learnsph_sink_dynamic_boundary"),
+    ("learnsph bowl", "learnsph_bowl", "learnsph_bowl_dynamic_boundary"),
+    ("learnsph wall", "learnsph_wall", "learnsph_wall_dynamic_boundary"),
+]
+
+SCALE = [
+    ("uniform", "uniform_175k"),
+    ("uniform", "uniform_500k"),
+    ("uniform", "uniform_1m"),
+    ("uniform", "uniform_2m"),
+    ("uniform", "uniform_4m"),
+    ("uniform", "uniform_8m"),
+    ("sparse", "huge_domain_175k"),
+    ("sparse", "huge_domain_500k"),
+    ("sparse", "huge_domain_1m"),
+    ("sparse", "huge_domain_2m"),
+    ("sparse", "huge_domain_4m"),
+    ("sparse", "huge_domain_8m"),
+]
+
+GROWING = [
+    ("uniform 200k -> 400k", "uniform_200k_growing"),
+    ("slab 200k -> 400k", "slab_200k_growing"),
+    ("clustered 200k -> 400k", "clustered_200k_growing"),
+]
+
+THREADS = [
+    ("uniform 200k", "uniform_200k", [1, 2, 4, 8, 16]),
+    ("uniform 1M", "uniform_1m", [8, 16]),
+    ("clustered 200k", "clustered_200k", [1, 4, 16]),
+    ("learnsph ramp_split_lv", "learnsph_ramp_split_lv", [1, 4, 16]),
+]
+
 BACKENDS = ["apfrnn_cpu", "tree", "compact"]
 
 
@@ -86,7 +138,8 @@ def scene_names(rows):
 
 
 def run_bench(build: Path, cpus: str, family: str, scenes, backends,
-              out: Path, extra, min_time: str, repetitions: int):
+              out: Path, extra, min_time: str, repetitions: int,
+              threads: int = 8):
     pattern = (rf"^{family}/({'|'.join(backends)})/"
                rf"({'|'.join(re.escape(s) for s in scenes)})/real_time$")
     cmd = [
@@ -98,7 +151,28 @@ def run_bench(build: Path, cpus: str, family: str, scenes, backends,
         "--benchmark_report_aggregates_only=true",
         "--benchmark_format=json",
         f"--benchmark_out={out}",
+        f"--threads={threads}",
         *extra,
+    ]
+    print("+", " ".join(cmd), file=sys.stderr)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+
+def run_threads(build: Path, cpus: str, scenes, backends, out: Path,
+                min_time: str, repetitions: int):
+    pattern = (rf"^Threads/({'|'.join(backends)})/"
+               rf"({'|'.join(re.escape(s) for s in scenes)})/"
+               rf"[0-9]+/real_time$")
+    cmd = [
+        "taskset", "-c", cpus,
+        str(build / "bench" / "ispc_apfrnn_bench"),
+        f"--benchmark_filter={pattern}",
+        f"--benchmark_min_time={min_time}",
+        f"--benchmark_repetitions={repetitions}",
+        "--benchmark_report_aggregates_only=true",
+        "--benchmark_format=json",
+        f"--benchmark_out={out}",
+        "--threads=8",
     ]
     print("+", " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
@@ -107,9 +181,22 @@ def run_bench(build: Path, cpus: str, family: str, scenes, backends,
 def load_medians(path: Path):
     data = json.loads(path.read_text())
     result = {}
+    stddev = {}
     for bench in data["benchmarks"]:
         if bench["name"].endswith("_median"):
             result[bench["name"]] = bench
+        elif bench["name"].endswith("_stddev"):
+            stddev[bench["name"]] = bench["real_time"]
+    for name, bench in result.items():
+        std_name = name[: -len("_median")] + "_stddev"
+        if std_name in stddev:
+            bench["_stddev"] = stddev[std_name]
+    if not result:
+        # A one-repetition run with aggregates enabled has no _median entry.
+        for bench in data["benchmarks"]:
+            if bench["name"].endswith("/real_time"):
+                result[bench["name"].replace("/real_time",
+                                             "/real_time_median")] = bench
     return result
 
 
@@ -121,13 +208,33 @@ def run_matrix(args, work: Path):
     work.mkdir(parents=True, exist_ok=True)
 
     run_bench(args.build, args.cpus, "Frame", scene_names(HEADLINE), BACKENDS,
-              work / "headline.json", [], args.min_time, args.repetitions)
+              work / "headline.json", [], args.min_time, args.repetitions,
+              args.threads)
     run_bench(args.build, args.cpus, "Stress", scene_names(STRESS), BACKENDS,
-              work / "stress.json", [], args.min_time, args.repetitions)
+              work / "stress.json", [], args.min_time, args.repetitions,
+              args.threads)
     run_bench(args.build, args.cpus, "Frame", scene_names(LEARNSPH), BACKENDS,
               work / "learnsph.json",
               [f"--learnsph_res={args.learnsph_res}"], args.min_time,
-              args.repetitions)
+              args.repetitions, args.threads)
+    run_bench(args.build, args.cpus, "Order",
+              [scene for row in ORDER for scene in row[1:]], BACKENDS,
+              work / "order.json", [], args.min_time, args.repetitions,
+              args.threads)
+    run_bench(args.build, args.cpus, "Dynamic",
+              [scene for row in DYNAMIC for scene in row[1:]], BACKENDS,
+              work / "dynamic.json",
+              [f"--learnsph_res={args.learnsph_res}"], args.min_time,
+              args.repetitions, args.threads)
+    if not args.no_scale:
+        run_bench(args.build, args.cpus, "Scale", scene_names(SCALE), BACKENDS,
+                  work / "scale.json", ["--memory_budget_mb=8192"],
+                  args.min_time, args.repetitions, args.threads)
+    run_bench(args.build, args.cpus, "Growing", scene_names(GROWING),
+              ["apfrnn_cpu", "tree"], work / "growing.json", [],
+              args.min_time, args.repetitions, args.threads)
+    run_threads(args.build, args.cpus, scene_names(THREADS), BACKENDS,
+                work / "threads.json", args.min_time, args.repetitions)
     motion_scenes = {
         family: [name for _, row_family, static, jitter in MOTION
                  if row_family == family for name in (static, jitter)]
@@ -135,10 +242,10 @@ def run_matrix(args, work: Path):
     }
     run_bench(args.build, args.cpus, "Frame", motion_scenes["Frame"],
               ["apfrnn_cpu"], work / "motion.json", [], args.min_time,
-              args.repetitions)
+              args.repetitions, args.threads)
     run_bench(args.build, args.cpus, "Stress", motion_scenes["Stress"],
               ["apfrnn_cpu"], work / "droplets_motion.json", [],
-              args.min_time, args.repetitions)
+              args.min_time, args.repetitions, args.threads)
     memory = {}
     if not args.no_memory:
         for family, rows in (("Frame", HEADLINE), ("Stress", STRESS)):
@@ -180,8 +287,15 @@ def run_matrix(args, work: Path):
 
 def load_inputs(json_dir: Path):
     names = ["headline", "stress", "learnsph", "motion",
-             "droplets_motion"]
-    data = {name: load_medians(json_dir / f"{name}.json") for name in names}
+             "droplets_motion", "order", "dynamic", "scale", "growing",
+             "threads"]
+    data = {}
+    for name in names:
+        path = json_dir / f"{name}.json"
+        if path.exists():
+            data[name] = load_medians(path)
+        else:
+            data[name] = {}
     memory_path = json_dir / "memory.json"
     if not memory_path.exists():
         memory_path = json_dir / "learnsph_memory.json"
@@ -342,13 +456,124 @@ def table_motion(data):
     return "\n".join(lines)
 
 
+def available(data, family, backend, scene):
+    return expected_name(family, backend, scene) in data
+
+
+def table_order(data):
+    order = data["order"]
+    lines = [
+        "| Scene | ispc z-sorted | Tree z-sorted | vs Tree | ispc unsorted | Tree unsorted | vs Tree |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for label, sorted_scene, unsorted_scene in ORDER:
+        if not available(order, "Order", "tree", sorted_scene):
+            continue
+        a_s = get(order, "Order", "apfrnn_cpu", sorted_scene)
+        t_s = get(order, "Order", "tree", sorted_scene)
+        a_u = get(order, "Order", "apfrnn_cpu", unsorted_scene)
+        t_u = get(order, "Order", "tree", unsorted_scene)
+        lines.append(
+            f"| {label} | {fmt_ms(a_s['real_time'])} | "
+            f"{fmt_ms(t_s['real_time'])} | "
+            f"{fmt_ratio(t_s['real_time'] / a_s['real_time'])} | "
+            f"{fmt_ms(a_u['real_time'])} | {fmt_ms(t_u['real_time'])} | "
+            f"{fmt_ratio(t_u['real_time'] / a_u['real_time'])} |")
+    return "\n".join(lines)
+
+
+def table_dynamic(data):
+    dynamic = data["dynamic"]
+    lines = [
+        "| Scene | Boundary | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for label, static_scene, dynamic_scene in DYNAMIC:
+        for tag, scene in (("static", static_scene),
+                           ("all dynamic", dynamic_scene)):
+            if not available(dynamic, "Dynamic", "tree", scene):
+                continue
+            a = get(dynamic, "Dynamic", "apfrnn_cpu", scene)
+            t = get(dynamic, "Dynamic", "tree", scene)
+            c = get(dynamic, "Dynamic", "compact", scene)
+            lines.append(
+                f"| {label} | {tag} | {fmt_ms(a['real_time'])} | "
+                f"{fmt_ms(t['real_time'])} | {fmt_ms(c['real_time'])} | "
+                f"{fmt_ratio(t['real_time'] / a['real_time'])} |")
+    return "\n".join(lines)
+
+
+def table_scale(data):
+    scale = data["scale"]
+    lines = [
+        "| Distribution | Points | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for distribution, scene in SCALE:
+        if not available(scale, "Scale", "tree", scene):
+            continue
+        a = get(scale, "Scale", "apfrnn_cpu", scene)
+        t = get(scale, "Scale", "tree", scene)
+        c = get(scale, "Scale", "compact", scene)
+        points = scene.rsplit("_", 1)[-1].upper()
+        if points.endswith("K"):
+            points = points[:-1] + "k"
+        lines.append(
+            f"| {distribution} | {points} | {a['AvgNeighbors']:.0f} | "
+            f"{fmt_ms(a['real_time'])} | {fmt_ms(t['real_time'])} | "
+            f"{fmt_ms(c['real_time'])} | "
+            f"{fmt_ratio(t['real_time'] / a['real_time'])} | "
+            f"{fmt_ratio(c['real_time'] / a['real_time'])} |")
+    return "\n".join(lines)
+
+
+def table_growing(data):
+    growing = data["growing"]
+    lines = [
+        "| Scene | ispc_apfrnn | TreeNSearch | vs Tree |",
+        "|---|---:|---:|---:|",
+    ]
+    for label, scene in GROWING:
+        if not available(growing, "Growing", "tree", scene):
+            continue
+        a = get(growing, "Growing", "apfrnn_cpu", scene)
+        t = get(growing, "Growing", "tree", scene)
+        lines.append(
+            f"| {label} | {fmt_ms(a['real_time'])} | "
+            f"{fmt_ms(t['real_time'])} | "
+            f"{fmt_ratio(t['real_time'] / a['real_time'])} |")
+    return "\n".join(lines)
+
+
+def table_threads(data):
+    threads = data["threads"]
+    lines = [
+        "| Scene | Threads | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for label, scene, counts in THREADS:
+        for count in counts:
+            name = f"{scene}/{count}"
+            if not available(threads, "Threads", "tree", name):
+                continue
+            a = get(threads, "Threads", "apfrnn_cpu", name)
+            t = get(threads, "Threads", "tree", name)
+            c = get(threads, "Threads", "compact", name)
+            lines.append(
+                f"| {label} | {count} | {fmt_ms(a['real_time'])} | "
+                f"{fmt_ms(t['real_time'])} | {fmt_ms(c['real_time'])} | "
+                f"{fmt_ratio(t['real_time'] / a['real_time'])} |")
+    return "\n".join(lines)
+
+
 def replace_block(text: str, name: str, content: str):
     start = f"<!-- bench:{name}:start -->"
     end = f"<!-- bench:{name}:end -->"
     left = text.find(start)
     right = text.find(end, left + 1)
     if left < 0 or right < 0:
-        raise SystemExit(f"README is missing marker block {name!r}")
+        # README may intentionally omit optional benchmark tables.
+        return text
     return text[:left] + start + "\n" + content + "\n" + text[right:]
 
 
@@ -363,6 +588,11 @@ def generate(data, memory, gpu_data=None):
                                       "Stress"),
         "motion": table_motion(data),
         "learnsph": table_learnsph(data, memory),
+        "order": table_order(data),
+        "dynamic": table_dynamic(data),
+        "scale": table_scale(data),
+        "growing": table_growing(data),
+        "threads": table_threads(data),
     }
     if gpu_data is not None:
         replacements["gpu"] = table_gpu(gpu_data)
@@ -381,6 +611,10 @@ def main():
                         default=Path("build/bench-tables"))
     parser.add_argument("--min-time", default="2s")
     parser.add_argument("--repetitions", type=int, default=7)
+    parser.add_argument("--threads", type=int, default=8,
+                        help="worker threads for Frame/Stress/Cold runs")
+    parser.add_argument("--no-scale", action="store_true",
+                        help="skip the 175k..8M dense/sparse scale run")
     parser.add_argument("--memory-time", default="0.5s")
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument("--learnsph-res", default="../learnsph/res")

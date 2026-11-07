@@ -6,10 +6,13 @@
 #include "scene.hpp"
 #include "vtk_points.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
 #include <utility>
@@ -32,12 +35,51 @@ struct SceneData {
   // the sorted order changes between frames.
   float jitter = 0.0f;
   std::vector<float> jitter_base;
+  // Fountain-like growth: set 0 gains grow_per_frame points per frame until
+  // it reaches grow_limit. The points are sampled uniformly in the axis-
+  // aligned box stored in grow_min/grow_extent. The harness calls
+  // Backend::resize() after advance() so every backend sees the new pointer.
+  bool growing = false;
+  int grow_limit = 0;
+  int grow_per_frame = 0;
+  float grow_min[3] = {0.0f, 0.0f, 0.0f};
+  float grow_extent[3] = {1.0f, 1.0f, 1.0f};
+  uint32_t grow_seed = 0x9e3779b9u;
 
   int points(int set) const {
     return static_cast<int>(xyz[static_cast<std::size_t>(set)].size() / 3);
   }
 
+  void grow(int step) {
+    if (!growing) {
+      return;
+    }
+    const int current = points(0);
+    const int target = std::min(grow_limit, current + grow_per_frame);
+    if (target <= current) {
+      return;
+    }
+    std::vector<float> &fluid = xyz[0];
+    fluid.reserve(static_cast<std::size_t>(target) * 3);
+    uint32_t state =
+        grow_seed ^ (0x9e3779b9u * static_cast<uint32_t>(step + 1));
+    const auto unit = [&]() {
+      state ^= state << 13;
+      state ^= state >> 17;
+      state ^= state << 5;
+      return static_cast<float>(state & 0xffffffu) / 16777216.0f;
+    };
+    for (int index = current; index < target; ++index) {
+      fluid.push_back(grow_min[0] + unit() * grow_extent[0]);
+      fluid.push_back(grow_min[1] + unit() * grow_extent[1]);
+      fluid.push_back(grow_min[2] + unit() * grow_extent[2]);
+    }
+  }
+
   void advance(int step) {
+    if (growing) {
+      grow(step);
+    }
     if (jitter > 0.0f) {
       std::vector<float> &fluid = xyz[0];
       if (jitter_base.empty()) {
@@ -69,7 +111,85 @@ struct SceneData {
 struct SceneSpec {
   std::string name;
   std::function<SceneData()> make;
+  // TreeNSearch is designed for almost z-sorted particle data. Benchmarks
+  // sort by Morton code by default so every backend sees the input order an
+  // SPH simulation would normally maintain. Unsorted/ scenes keep raw input
+  // order as the adversarial case.
+  bool zsorted = true;
 };
+
+// Spreads the low 21 bits of `value` so that three of them can be interleaved
+// into a 63-bit Morton code.
+inline uint64_t spread_morton_bits(uint64_t value) {
+  value &= 0x1fffffULL;
+  value = (value | (value << 32)) & 0x1f00000000ffffULL;
+  value = (value | (value << 16)) & 0x1f0000ff0000ffULL;
+  value = (value | (value << 8)) & 0x100f00f00f00f00fULL;
+  value = (value | (value << 4)) & 0x10c30c30c30c30c3ULL;
+  value = (value | (value << 2)) & 0x1249249249249249ULL;
+  return value;
+}
+
+inline uint64_t morton3(uint32_t x, uint32_t y, uint32_t z) {
+  return spread_morton_bits(x) | (spread_morton_bits(y) << 1) |
+         (spread_morton_bits(z) << 2);
+}
+
+// Reorders one interleaved xyz buffer along the Morton curve of a uniform
+// grid with cell size `cell` and origin (ox, oy, oz). The permutation is
+// stable for points that share a cell, so equal inputs keep a deterministic
+// order.
+inline void zsort_xyz(std::vector<float> &xyz, float cell, float ox, float oy,
+                      float oz) {
+  const std::size_t count = xyz.size() / 3;
+  if (count < 2) {
+    return;
+  }
+  std::vector<std::pair<uint64_t, uint32_t>> keys(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    const auto cell_index = [&](std::size_t axis) {
+      const float value = xyz[3 * index + axis];
+      const double coordinate =
+          std::floor((static_cast<double>(value) - ox) / cell);
+      const double clamped =
+          std::clamp(coordinate, 0.0, 2097151.0); // 21 bits per axis
+      return static_cast<uint32_t>(clamped);
+    };
+    keys[index] = {morton3(cell_index(0), cell_index(1), cell_index(2)),
+                   static_cast<uint32_t>(index)};
+  }
+  std::sort(keys.begin(), keys.end());
+  std::vector<float> sorted(xyz.size());
+  for (std::size_t index = 0; index < count; ++index) {
+    const std::size_t source = keys[index].second;
+    sorted[3 * index + 0] = xyz[3 * source + 0];
+    sorted[3 * index + 1] = xyz[3 * source + 1];
+    sorted[3 * index + 2] = xyz[3 * source + 2];
+  }
+  xyz.swap(sorted);
+}
+
+inline void zsort_scene(SceneData &scene) {
+  if (scene.radius <= 0.0f || scene.xyz.empty()) {
+    return;
+  }
+  float ox = std::numeric_limits<float>::infinity();
+  float oy = ox;
+  float oz = ox;
+  for (const std::vector<float> &xyz : scene.xyz) {
+    for (std::size_t index = 0; index + 2 < xyz.size(); index += 3) {
+      ox = std::min(ox, xyz[index + 0]);
+      oy = std::min(oy, xyz[index + 1]);
+      oz = std::min(oz, xyz[index + 2]);
+    }
+  }
+  // The paper's calibrated cell size is 1.5x the support radius. The exact
+  // value only affects locality, not which points are neighbors.
+  const float cell = std::max(1.5f * scene.radius, 1.0e-6f);
+  for (std::vector<float> &xyz : scene.xyz) {
+    zsort_xyz(xyz, cell, ox, oy, oz);
+  }
+}
 
 inline const char *distribution_name(Distribution distribution) {
   switch (distribution) {
@@ -205,13 +325,18 @@ inline SceneSpec droplet_scene(int droplets, int points_per_droplet,
 // A saved learnsph frame: fluid and static boundary, searched fluid-fluid and
 // fluid-boundary with the learnsph support radius.
 inline SceneSpec vtk_scene(const std::string &name, const std::string &fluid,
-                           const std::string &boundary) {
-  return {name, [=] {
+                           const std::string &boundary,
+                           bool static_boundary = true) {
+  std::string scene_name = name;
+  if (!static_boundary) {
+    scene_name += "_dynamic_boundary";
+  }
+  return {scene_name, [=] {
             SceneData data;
             data.radius = 0.048f;
             data.xyz = {read_vtk_points(fluid).xyz,
                         read_vtk_points(boundary).xyz};
-            data.is_static = {false, true};
+            data.is_static = {false, static_boundary};
             data.pairs = {{0, 0}, {0, 1}};
             return data;
           }};
@@ -309,7 +434,8 @@ inline bool file_exists(const std::string &path) {
 
 // The saved learnsph frames under `res` (learnsph/res) that exist. The
 // *_nsearch frames are written by learnsph's capture_nsearch_frames test.
-inline std::vector<SceneSpec> learnsph_scenes(const std::string &res) {
+inline std::vector<SceneSpec> learnsph_scenes(const std::string &res,
+                                              bool static_boundary = true) {
   struct Frame {
     const char *name, *fluid, *boundary;
   };
@@ -333,8 +459,133 @@ inline std::vector<SceneSpec> learnsph_scenes(const std::string &res) {
     const std::string fluid = res + "/" + frame.fluid;
     const std::string boundary = res + "/" + frame.boundary;
     if (file_exists(fluid) && file_exists(boundary)) {
-      scenes.push_back(
-          vtk_scene(std::string("learnsph_") + frame.name, fluid, boundary));
+      scenes.push_back(vtk_scene(
+          std::string("learnsph_") + frame.name, fluid, boundary,
+          static_boundary));
+    }
+  }
+  return scenes;
+}
+
+// The same scene with the input order left as generated. Used to quantify how
+// much the almost-z-sorted assumption matters to each backend.
+inline SceneSpec unsorted_scene(SceneSpec spec) {
+  spec.name += "_unsorted";
+  spec.zsorted = false;
+  return spec;
+}
+
+// The same scene with every point set marked dynamic. This removes the
+// static-target cache advantage, so the timing measures neighbor search
+// instead of end-to-end caching.
+inline SceneSpec all_dynamic_scene(SceneSpec spec) {
+  spec.name += "_dynamic_boundary";
+  auto make = spec.make;
+  spec.make = [make] {
+    SceneData data = make();
+    data.is_static.assign(data.is_static.size(), false);
+    return data;
+  };
+  return spec;
+}
+
+// Order-sensitivity pairs: each scene sorted and unsorted. Only a handful of
+// scenes so the table stays readable.
+inline std::vector<SceneSpec> order_scenes() {
+  using D = Distribution;
+  std::vector<SceneSpec> scenes;
+  for (const SceneSpec &spec :
+       {synthetic_scene(D::Uniform, 200000),
+        synthetic_scene(D::Slab, 200000),
+        synthetic_scene(D::Clustered, 200000)}) {
+    scenes.push_back(spec);
+    scenes.push_back(unsorted_scene(spec));
+  }
+  return scenes;
+}
+
+// Static-boundary vs all-dynamic pairs. The static variant is the real
+// learnsph workload; the dynamic variant is the algorithm-only comparison.
+inline std::vector<SceneSpec> dynamic_scenes(const std::string &res) {
+  using D = Distribution;
+  std::vector<SceneSpec> scenes;
+  for (const SceneSpec &spec :
+       {synthetic_scene(D::Uniform, 200000),
+        synthetic_scene(D::Slab, 200000),
+        synthetic_scene(D::Clustered, 200000)}) {
+    scenes.push_back(spec);
+    scenes.push_back(all_dynamic_scene(spec));
+  }
+  for (const SceneSpec &spec : learnsph_scenes(res, /*static_boundary=*/true)) {
+    scenes.push_back(spec);
+    scenes.push_back(all_dynamic_scene(spec));
+  }
+  return scenes;
+}
+
+// Fountain-like growth: add points to set 0 every frame until `limit`. The
+// growth box is the initial bounding box of the fluid, so density rises just
+// as it does in the Fountain scene.
+inline SceneSpec growing_scene(SceneSpec spec, int limit, int per_frame) {
+  spec.name += "_growing";
+  auto make = spec.make;
+  spec.make = [=] {
+    SceneData data = make();
+    if (data.xyz.empty() || data.points(0) <= 0 || limit <= data.points(0)) {
+      return data;
+    }
+    data.growing = true;
+    data.grow_limit = limit;
+    data.grow_per_frame = per_frame;
+    data.motion = Motion::Static;
+    data.jitter = 0.0f;
+    float low[3] = {data.xyz[0][0], data.xyz[0][1], data.xyz[0][2]};
+    float high[3] = {low[0], low[1], low[2]};
+    for (std::size_t index = 0; index + 2 < data.xyz[0].size(); index += 3) {
+      for (int axis = 0; axis < 3; ++axis) {
+        low[axis] = std::min(low[axis], data.xyz[0][index + axis]);
+        high[axis] = std::max(high[axis], data.xyz[0][index + axis]);
+      }
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      data.grow_min[axis] = low[axis];
+      data.grow_extent[axis] = std::max(high[axis] - low[axis], 1.0e-3f);
+    }
+    return data;
+  };
+  return spec;
+}
+
+// Resize-under-load scenes. The point count doubles over roughly 40 frames,
+// which exercises the same regrow path a fountain reaches as emitters fill
+// the domain.
+inline std::vector<SceneSpec> growing_scenes() {
+  using D = Distribution;
+  std::vector<SceneSpec> scenes;
+  for (const SceneSpec &spec :
+       {synthetic_scene(D::Uniform, 200000),
+        synthetic_scene(D::Slab, 200000),
+        synthetic_scene(D::Clustered, 200000)}) {
+    scenes.push_back(growing_scene(spec, 400000, 5000));
+  }
+  return scenes;
+}
+
+// Dense vs sparse scaling, the axis the TreeNSearch paper uses from 175k to
+// 27M. The sparse points are separated by far more than the radius, so every
+// point has zero neighbors; dense is a uniform SPH-like cloud. 27M is opt-in
+// because the fixed-row tables need more than the default memory budget.
+inline std::vector<SceneSpec> scale_scenes() {
+  using D = Distribution;
+  std::vector<SceneSpec> scenes;
+  for (int points : {175000, 500000, 1000000, 2000000, 4000000, 8000000}) {
+    scenes.push_back(synthetic_scene(D::Uniform, points));
+    scenes.push_back(synthetic_scene(D::HugeDomain, points));
+  }
+  if (const char *big = std::getenv("APFRNN_BENCH_BIG")) {
+    if (std::atoi(big) != 0) {
+      scenes.push_back(synthetic_scene(D::Uniform, 27000000));
+      scenes.push_back(synthetic_scene(D::HugeDomain, 27000000));
     }
   }
   return scenes;

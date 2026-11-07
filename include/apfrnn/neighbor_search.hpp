@@ -67,6 +67,7 @@ public:
     kPathSameActive2 = 1ull << 19,
     kPathSameGrown = 1ull << 20,      // fixed rows overflowed and regrew
     kPathSameCsr = 1ull << 21,
+    kPathSameSparseKeys = 1ull << 32, // merged sorted cell-key stencil
     kPathCrossSweep = 1ull << 22,
     kPathCrossNoCandidates = 1ull << 23,
     kPathCrossTargetMajor = 1ull << 24,
@@ -77,8 +78,9 @@ public:
     kPathCrossGrown = 1ull << 29,
     kPathCrossCsr = 1ull << 30,
     kPathGpu = 1ull << 31,
+    kPathCrossCellRange = 1ull << 33, // sorted-cell range search
   };
-  static constexpr int kPathBits = 32;
+  static constexpr int kPathBits = 34;
   // Short name of one Path bit, e.g. "same_csr".
   static const char *path_name(uint64_t path);
 
@@ -201,6 +203,8 @@ private:
   bool remember_cross_block_rows(Pair &pair, PointSet &source,
                                  PointSet &target, int capacity);
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
+  static bool cell_range_cross_candidate(const PointSet &source,
+                                         const PointSet &target);
   void filter_same_active(int set);
   void filter_cross_active(Pair &pair, int source_set, int target_set);
 

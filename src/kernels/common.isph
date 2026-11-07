@@ -46,6 +46,8 @@ struct HashGrid {
   const uniform int *uniform vals;
   uniform uint64 empty_key;
   uniform uint32 mask;
+  // One control byte per slot: 0x80 = empty, otherwise a 7-bit fingerprint.
+  const uniform uint8 *uniform control;
 };
 
 // Candidate point ranges of each query cell:
@@ -173,15 +175,17 @@ static inline varying int find_cell_index(const uniform HashGrid &hash,
                                    varying uint64 key) {
   varying uint64 h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
   h64 ^= h64 >> 33;
+  const varying uint8 fingerprint =
+      (varying uint8)(h64 >> 56) & (varying uint8)0x7f;
   varying uint32 h = (varying uint32)h64 & hash.mask;
 
   while (true) {
-    varying uint64 ht_key = hash.keys[h];
-    if (ht_key == key) {
-      return hash.vals[h];
-    }
-    if (ht_key == hash.empty_key) {
+    const varying uint8 control = hash.control[h];
+    if (control == (varying uint8)0x80) {
       return -1;
+    }
+    if (control == fingerprint && hash.keys[h] == key) {
+      return hash.vals[h];
     }
     h = (h + 1) & hash.mask;
   }

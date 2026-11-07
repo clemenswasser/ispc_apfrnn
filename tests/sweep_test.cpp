@@ -94,6 +94,19 @@ TEST_CASE("sweep decision keeps uniformly sparse sets on the sweep") {
   CHECK(apfrnn::sweep::should_use(cloud.x, cloud.y, cloud.z, bounds, radius));
 }
 
+TEST_CASE("sweep decision hands very large sparse windows to the grid") {
+  constexpr float radius = 2.0f;
+  // The x window holds ~133 points at 2M/60000; the sweep would scan all of
+  // them for every query even though the grid finds the (zero) neighbors
+  // immediately.
+  const Cloud cloud = uniform_cloud(2000000, 60000.0f, 21);
+  const apfrnn::Bounds bounds = cloud.bounds();
+  REQUIRE(apfrnn::sweep::estimated_cells_per_point(bounds, cloud.x.size(),
+                                                   radius) > 10000.0);
+  CHECK_FALSE(
+      apfrnn::sweep::should_use(cloud.x, cloud.y, cloud.z, bounds, radius));
+}
+
 TEST_CASE("sweep decision sends clustered sparse sets to the grid") {
   constexpr float radius = 2.0f;
   // Droplets of 128 points, each small enough to fit in one coarse decision

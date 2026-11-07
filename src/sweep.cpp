@@ -1,7 +1,11 @@
 #include "sweep.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <numeric>
 #include <tbb/blocked_range.h>
@@ -13,6 +17,12 @@ namespace apfrnn::sweep {
 namespace {
 
 constexpr double kMinCellsPerPoint = 10000.0;
+// A sweep scans an x-window of `2*r` for every query. It is only attractive
+// while that window is short; uniformly sparse random clouds eventually put
+// hundreds of points in the window and the grid/hash path wins. Keep the
+// threshold well above the paper's 200k-scale sparse case, where the sweep is
+// genuinely faster, and below the 2M+ regime where it degrades.
+constexpr double kMaxSweepWindow = 96.0;
 constexpr int kMaxRowCapacity = 65536;
 
 // A huge bounding box only makes the sweep attractive when its points are
@@ -52,24 +62,26 @@ void scan(const Cloud &query, const IntBuffer &query_rows, const Cloud &target,
           Done &&done) {
   const float radius_sq = radius * radius;
   const std::vector<float> &target_x = target.index->x;
+  const std::vector<float> &target_y = target.index->y;
+  const std::vector<float> &target_z = target.index->z;
   const IntBuffer &target_order = target.index->order;
   const int target_count = static_cast<int>(target_x.size());
 
-  auto scan_from = [&](int window_begin, int point, float qx) {
-    const float qy = query.y[static_cast<std::size_t>(point)];
-    const float qz = query.z[static_cast<std::size_t>(point)];
+  auto scan_from = [&](int window_begin, int point, float qx, float qy,
+                       float qz) {
     for (int j = window_begin; j < target_count; ++j) {
-      if (target_x[static_cast<std::size_t>(j)] > qx + radius) {
+      const float tx = target_x[static_cast<std::size_t>(j)];
+      if (tx > qx + radius) {
         break;
       }
-      const int other = target_order[static_cast<std::size_t>(j)];
-      if (same_set && other == point) {
-        continue;
-      }
-      const float dx = target.x[static_cast<std::size_t>(other)] - qx;
-      const float dy = target.y[static_cast<std::size_t>(other)] - qy;
-      const float dz = target.z[static_cast<std::size_t>(other)] - qz;
+      const float dx = tx - qx;
+      const float dy = target_y[static_cast<std::size_t>(j)] - qy;
+      const float dz = target_z[static_cast<std::size_t>(j)] - qz;
       if (dx * dx + dy * dy + dz * dz <= radius_sq) {
+        const int other = target_order[static_cast<std::size_t>(j)];
+        if (same_set && other == point) {
+          continue;
+        }
         visit(other);
       }
     }
@@ -91,7 +103,9 @@ void scan(const Cloud &query, const IntBuffer &query_rows, const Cloud &target,
         ++window_begin;
       }
       scan_from(window_begin,
-                query.index->order[static_cast<std::size_t>(k)], qx);
+                query.index->order[static_cast<std::size_t>(k)], qx,
+                query.index->y[static_cast<std::size_t>(k)],
+                query.index->z[static_cast<std::size_t>(k)]);
     }
     return;
   }
@@ -101,7 +115,9 @@ void scan(const Cloud &query, const IntBuffer &query_rows, const Cloud &target,
     const int window_begin = static_cast<int>(
         std::lower_bound(target_x.begin(), target_x.end(), qx - radius) -
         target_x.begin());
-    scan_from(window_begin, point, qx);
+    scan_from(window_begin, point, qx,
+              query.y[static_cast<std::size_t>(point)],
+              query.z[static_cast<std::size_t>(point)]);
   }
 }
 
@@ -109,6 +125,8 @@ void scan(const Cloud &query, const IntBuffer &query_rows, const Cloud &target,
 
 void Index::clear() {
   x.clear();
+  y.clear();
+  z.clear();
   order.clear();
   valid = false;
 }
@@ -126,12 +144,35 @@ double estimated_cells_per_point(const Bounds &bounds, std::size_t num_points,
   return cells / static_cast<double>(num_points);
 }
 
+double estimated_window(const Bounds &bounds, std::size_t num_points,
+                        float radius) {
+  const double r = static_cast<double>(radius);
+  if (num_points == 0 || bounds.empty() || !(r > 0.0)) {
+    return 0.0;
+  }
+  const double extent_x = static_cast<double>(bounds.max_x - bounds.min_x) + r;
+  return static_cast<double>(num_points) * 2.0 * r / extent_x;
+}
+
 bool should_use(const std::vector<float> &x, const std::vector<float> &y,
                 const std::vector<float> &z, const Bounds &bounds,
                 float radius) {
   const std::size_t num_points = x.size();
+  // Large sparse sets: the sparse grid now has an incremental order merge,
+  // a cursor stencil, and a log-time cell-range cross, so a fresh x-sort is
+  // no longer the cheaper option.
+  if (num_points >= 1000000) {
+    return false;
+  }
   if (estimated_cells_per_point(bounds, num_points, radius) <=
       kMinCellsPerPoint) {
+    return false;
+  }
+  const double extent_x =
+      static_cast<double>(bounds.max_x - bounds.min_x) + radius;
+  if (extent_x > 0.0 &&
+      static_cast<double>(num_points) * 2.0 * radius / extent_x >
+          kMaxSweepWindow) {
     return false;
   }
   if (num_points < static_cast<std::size_t>(kClusterMinPoints) ||
@@ -181,11 +222,99 @@ bool should_use(const std::vector<float> &x, const std::vector<float> &y,
   return max_run < kClusterRunThreshold && unique_ratio >= kClusterUniqueRatio;
 }
 
-void ensure_index(Index &index, const std::vector<float> &x) {
+void adopt_sorted_order(Index &index, const std::vector<float> &x,
+                        const std::vector<float> &y,
+                        const std::vector<float> &z, const IntBuffer &order,
+                        const std::vector<uint64_t> &cell_keys) {
+  const std::size_t count = x.size();
+  if (y.size() != count || z.size() != count || order.size() != count ||
+      cell_keys.size() != count) {
+    index.clear();
+    return;
+  }
+  index.x = x;
+  index.y = y;
+  index.z = z;
+  index.order = order;
+  index.valid = true;
+  if (count < 2) {
+    return;
+  }
+
+  // Signed cell-x of a packed key. The grid order is sorted by (cell x,
+  // cell y, cell z), so equal cell-x runs are contiguous.
+  auto cell_x = [](uint64_t key) {
+    int value = static_cast<int>((key >> 42) & 0x1FFFFFULL);
+    if ((value & 0x100000) != 0) {
+      value |= ~0x1FFFFF;
+    }
+    return value;
+  };
+  std::vector<int> slab;
+  slab.reserve(static_cast<std::size_t>(count) / 64 + 2);
+  slab.push_back(0);
+  int previous = cell_x(cell_keys[0]);
+  for (std::size_t i = 1; i < count; ++i) {
+    const int current = cell_x(cell_keys[i]);
+    if (current != previous) {
+      slab.push_back(static_cast<int>(i));
+      previous = current;
+    }
+  }
+  slab.push_back(static_cast<int>(count));
+
+  struct SlabPoint {
+    float x;
+    float y;
+    float z;
+    int index;
+  };
+  const int num_slabs = static_cast<int>(slab.size()) - 1;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_slabs, 8),
+      [&](const tbb::blocked_range<int> &range) {
+        std::vector<SlabPoint> points;
+        for (int s = range.begin(); s < range.end(); ++s) {
+          const int begin = slab[static_cast<std::size_t>(s)];
+          const int end = slab[static_cast<std::size_t>(s) + 1];
+          const std::size_t length = static_cast<std::size_t>(end - begin);
+          if (length < 2) {
+            continue;
+          }
+          points.resize(length);
+          for (std::size_t i = 0; i < length; ++i) {
+            const std::size_t at = static_cast<std::size_t>(begin) + i;
+            points[i] = {index.x[at], index.y[at], index.z[at],
+                         index.order[at]};
+          }
+          std::sort(points.begin(), points.end(),
+                    [](const SlabPoint &a, const SlabPoint &b) {
+                      if (a.x != b.x) {
+                        return a.x < b.x;
+                      }
+                      return a.index < b.index;
+                    });
+          for (std::size_t i = 0; i < length; ++i) {
+            const std::size_t at = static_cast<std::size_t>(begin) + i;
+            index.x[at] = points[i].x;
+            index.y[at] = points[i].y;
+            index.z[at] = points[i].z;
+            index.order[at] = points[i].index;
+          }
+        }
+      });
+}
+
+void ensure_index(Index &index, const std::vector<float> &x,
+                  const std::vector<float> &y, const std::vector<float> &z) {
   if (index.valid) {
     return;
   }
   const int num_points = static_cast<int>(x.size());
+  if (y.size() != x.size() || z.size() != x.size()) {
+    index.clear();
+    return;
+  }
   index.order.resize(static_cast<std::size_t>(num_points));
   std::iota(index.order.begin(), index.order.end(), 0);
   tbb::parallel_sort(index.order.begin(), index.order.end(),
@@ -195,9 +324,13 @@ void ensure_index(Index &index, const std::vector<float> &x) {
                        return xa < xb || (xa == xb && a < b);
                      });
   index.x.resize(static_cast<std::size_t>(num_points));
+  index.y.resize(static_cast<std::size_t>(num_points));
+  index.z.resize(static_cast<std::size_t>(num_points));
   for (int i = 0; i < num_points; ++i) {
-    index.x[static_cast<std::size_t>(i)] =
-        x[static_cast<std::size_t>(index.order[static_cast<std::size_t>(i)])];
+    const int source = index.order[static_cast<std::size_t>(i)];
+    index.x[static_cast<std::size_t>(i)] = x[static_cast<std::size_t>(source)];
+    index.y[static_cast<std::size_t>(i)] = y[static_cast<std::size_t>(source)];
+    index.z[static_cast<std::size_t>(i)] = z[static_cast<std::size_t>(source)];
   }
   index.valid = true;
 }
@@ -208,6 +341,146 @@ bool write_fixed_rows(const Cloud &query, const IntBuffer &query_rows,
                       IntBuffer &counts, int &row_stride) {
   const int num_points = static_cast<int>(query.x.size());
 
+  double expected_window = 0.0;
+  if (target.index != nullptr && target.index->valid &&
+      !target.index->x.empty()) {
+    const float extent = target.index->x.back() - target.index->x.front();
+    if (extent > 0.0f) {
+      expected_window = static_cast<double>(target.index->x.size()) *
+                        2.0 * radius / extent;
+    }
+  }
+  if (expected_window >= 32.0 && query.index != nullptr &&
+      query.index->valid && target.index != nullptr && target.index->valid &&
+      query.index->order.size() == static_cast<std::size_t>(num_points) &&
+      query_rows.size() == static_cast<std::size_t>(num_points)) {
+    const int target_points = static_cast<int>(target.index->order.size());
+    IntBuffer lo(static_cast<std::size_t>(num_points));
+    IntBuffer hi(static_cast<std::size_t>(num_points));
+    const auto target_x = target.index->x.begin();
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 16384),
+        [&](const tbb::blocked_range<int> &range) {
+          const int begin = range.begin();
+          const int end = range.end();
+          int lower = static_cast<int>(
+              std::lower_bound(target_x, target_x + target_points,
+                               query.index->x[static_cast<std::size_t>(begin)] -
+                                   radius) -
+              target_x);
+          int upper = lower;
+          for (int k = begin; k < end; ++k) {
+            const float qx = query.index->x[static_cast<std::size_t>(k)];
+            while (lower < target_points &&
+                   target.index->x[static_cast<std::size_t>(lower)] <
+                       qx - radius) {
+              ++lower;
+            }
+            upper = std::max(upper, lower);
+            while (upper < target_points &&
+                   target.index->x[static_cast<std::size_t>(upper)] <=
+                       qx + radius) {
+              ++upper;
+            }
+            lo[static_cast<std::size_t>(k)] = lower;
+            hi[static_cast<std::size_t>(k)] = upper;
+          }
+        });
+    counts.resize(static_cast<std::size_t>(num_points));
+    IntBuffer row_query(static_cast<std::size_t>(num_points));
+    const float radius_sq = radius * radius;
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 256),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int k = range.begin(); k < range.end(); ++k) {
+            const int original =
+                query.index->order[static_cast<std::size_t>(k)];
+            const float qx = query.index->x[static_cast<std::size_t>(k)];
+            const float qy = query.index->y[static_cast<std::size_t>(k)];
+            const float qz = query.index->z[static_cast<std::size_t>(k)];
+            int count = 0;
+#if defined(__clang__)
+#pragma clang loop vectorize(enable) interleave(enable)
+#endif
+            for (int j = lo[static_cast<std::size_t>(k)];
+                 j < hi[static_cast<std::size_t>(k)]; ++j) {
+              const float dx =
+                  target.index->x[static_cast<std::size_t>(j)] - qx;
+              const float dy =
+                  target.index->y[static_cast<std::size_t>(j)] - qy;
+              const float dz =
+                  target.index->z[static_cast<std::size_t>(j)] - qz;
+              if (dx * dx + dy * dy + dz * dz <= radius_sq) {
+                ++count;
+              }
+            }
+            if (same_set && count > 0) {
+              --count;  // the query point is always in its own target set
+            }
+            const int row = query_rows[static_cast<std::size_t>(original)];
+            counts[static_cast<std::size_t>(row)] = count;
+            row_query[static_cast<std::size_t>(row)] = k;
+          }
+        });
+
+    int max_count = 0;
+    for (int count : counts) {
+      max_count = std::max(max_count, count);
+    }
+    const int stride = std::max(1, max_count);
+    const int64_t bytes = static_cast<int64_t>(num_points) *
+                          static_cast<int64_t>(stride) *
+                          static_cast<int64_t>(sizeof(int));
+    if (max_count > kMaxRowCapacity || bytes > memory_budget) {
+      return false;
+    }
+    neighbors.resize(static_cast<std::size_t>(num_points) *
+                     static_cast<std::size_t>(stride));
+    row_stride = stride;
+    if (max_count == 0) {
+      return true;
+    }
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 4096),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int row = range.begin(); row < range.end(); ++row) {
+            const int count = counts[static_cast<std::size_t>(row)];
+            if (count == 0) {
+              continue;
+            }
+            const int k = row_query[static_cast<std::size_t>(row)];
+            const int original =
+                query.index->order[static_cast<std::size_t>(k)];
+            const float qx = query.index->x[static_cast<std::size_t>(k)];
+            const float qy = query.index->y[static_cast<std::size_t>(k)];
+            const float qz = query.index->z[static_cast<std::size_t>(k)];
+            int *out = neighbors.data() +
+                       static_cast<std::size_t>(row) *
+                           static_cast<std::size_t>(stride);
+            int slot = 0;
+            for (int j = lo[static_cast<std::size_t>(k)];
+                 j < hi[static_cast<std::size_t>(k)]; ++j) {
+              const float dx =
+                  target.index->x[static_cast<std::size_t>(j)] - qx;
+              const float dy =
+                  target.index->y[static_cast<std::size_t>(j)] - qy;
+              const float dz =
+                  target.index->z[static_cast<std::size_t>(j)] - qz;
+              if (dx * dx + dy * dy + dz * dz <= radius_sq) {
+                const int other =
+                    target.index->order[static_cast<std::size_t>(j)];
+                if (same_set && other == original) {
+                  continue;
+                }
+                out[slot++] = other;
+              }
+            }
+          }
+        });
+    return true;
+  }
+
+  // Scalar fallback for callers without x-sorted indexes.
   IntBuffer row_counts(static_cast<std::size_t>(num_points));
   tbb::parallel_for(
       tbb::blocked_range<int>(0, num_points, 256),
@@ -225,7 +498,6 @@ bool write_fixed_rows(const Cloud &query, const IntBuffer &query_rows,
   for (int count : row_counts) {
     max_count = std::max(max_count, count);
   }
-
   const int stride = std::max(1, max_count);
   const int64_t bytes = static_cast<int64_t>(num_points) *
                         static_cast<int64_t>(stride) *
@@ -233,7 +505,6 @@ bool write_fixed_rows(const Cloud &query, const IntBuffer &query_rows,
   if (max_count > kMaxRowCapacity || bytes > memory_budget) {
     return false;
   }
-
   counts = std::move(row_counts);
   neighbors.resize(static_cast<std::size_t>(num_points) *
                    static_cast<std::size_t>(stride));

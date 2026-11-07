@@ -15,4 +15,5 @@ exec taskset -c "${cpus}" "${build_dir}/bench/ispc_apfrnn_bench" \
   --benchmark_filter="${filter}" \
   --benchmark_min_time=0.5s \
   --benchmark_repetitions=3 \
+  --threads=8 \
   --benchmark_report_aggregates_only=true
