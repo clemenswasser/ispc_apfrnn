@@ -685,7 +685,7 @@ void NSearch::run() {
           continue;
         }
         ensure_ordered_cell_x(source.data);
-        ensure_occupancy(source.data, &source.bounds);
+        ensure_occupancy_cells(source.data);
         if (!source.data.ordered_x_valid || source.data.num_cells <= 0 ||
             source.data.scratch_unique_keys.size() !=
                 static_cast<std::size_t>(source.data.num_cells)) {

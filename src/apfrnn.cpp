@@ -3013,7 +3013,7 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
               nz - 1,
               std::max(0, static_cast<int>((z[at] - box.min_z) * inv_block)));
           const std::size_t index =
-              (static_cast<std::size_t>(bz) * ny + by) * nx + bx;
+              (static_cast<std::size_t>(bx) * ny + by) * nz + bz;
           __atomic_fetch_or(&data.occupancy_bits[index >> 3],
                             static_cast<uint8_t>(1u << (index & 7)),
                             __ATOMIC_RELAXED);
@@ -3022,7 +3022,182 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   data.occupancy_valid = true;
 }
 
-inline bool occupancy_may_contain(const NeighborSearchData &data, float qx,
+inline // Cell-aligned coarse occupancy built straight from the sorted unique cell
+// keys. The block edge is a power-of-two number of cells, so block ids are
+// monotonic in the sorted key order; partitioning the fill by bitmap byte
+// range lets every worker write its own bytes with plain ORs, avoiding the
+// 8M-atomic float pass over all points.
+void ensure_occupancy_cells(NeighborSearchData &data) {
+  if (data.occupancy_valid) {
+    return;
+  }
+  const int num_cells = data.num_cells;
+  if (num_cells <= 0 || !(data.cell_radius > 0.0f) ||
+      data.scratch_unique_keys.size() !=
+          static_cast<std::size_t>(num_cells)) {
+    return;
+  }
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const uint64_t mask =
+      data.cell_keys_signed_order ? SortPointKey::kSignBits : 0;
+  const int field_offset = mask != 0 ? 0x100000 : 0;
+  auto real_coord = [&](uint64_t key, int shift) {
+    return static_cast<int>(((key ^ mask) >> shift) & 0x1FFFFFULL) -
+           field_offset;
+  };
+  int min_cx;
+  int max_cx;
+  int min_cy;
+  int max_cy;
+  int min_cz;
+  int max_cz;
+  if (data.cell_coord_valid) {
+    min_cx = data.cell_coord_min_x;
+    max_cx = data.cell_coord_max_x;
+    min_cy = data.cell_coord_min_y;
+    max_cy = data.cell_coord_max_y;
+    min_cz = data.cell_coord_min_z;
+    max_cz = data.cell_coord_max_z;
+  } else {
+    struct CellBox {
+      int min_x = INT_MAX;
+      int max_x = INT_MIN;
+      int min_y = INT_MAX;
+      int max_y = INT_MIN;
+      int min_z = INT_MAX;
+      int max_z = INT_MIN;
+    };
+    const CellBox box = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, num_cells, 16384), CellBox{},
+        [&](const tbb::blocked_range<int> &range, CellBox acc) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const int x = real_coord(keys[i], 42);
+            const int y = real_coord(keys[i], 21);
+            const int z = real_coord(keys[i], 0);
+            acc.min_x = std::min(acc.min_x, x);
+            acc.max_x = std::max(acc.max_x, x);
+            acc.min_y = std::min(acc.min_y, y);
+            acc.max_y = std::max(acc.max_y, y);
+            acc.min_z = std::min(acc.min_z, z);
+            acc.max_z = std::max(acc.max_z, z);
+          }
+          return acc;
+        },
+        [](CellBox a, const CellBox &b) {
+          a.min_x = std::min(a.min_x, b.min_x);
+          a.max_x = std::max(a.max_x, b.max_x);
+          a.min_y = std::min(a.min_y, b.min_y);
+          a.max_y = std::max(a.max_y, b.max_y);
+          a.min_z = std::min(a.min_z, b.min_z);
+          a.max_z = std::max(a.max_z, b.max_z);
+          return a;
+        });
+    min_cx = box.min_x;
+    max_cx = box.max_x;
+    min_cy = box.min_y;
+    max_cy = box.max_y;
+    min_cz = box.min_z;
+    max_cz = box.max_z;
+  }
+  if (max_cx < min_cx || max_cy < min_cy || max_cz < min_cz) {
+    return;
+  }
+  constexpr int64_t kMaxBits = int64_t{1} << 27;
+  const int64_t budget = std::min<int64_t>(
+      kMaxBits, std::max<int64_t>(1024, int64_t{512} * num_cells));
+  int shift = 1;
+  int64_t nx = 0;
+  int64_t ny = 0;
+  int64_t nz = 0;
+  for (; shift <= 30; ++shift) {
+    const int block_cells = 1 << shift;
+    const int origin_x = min_cx & ~(block_cells - 1);
+    const int origin_y = min_cy & ~(block_cells - 1);
+    const int origin_z = min_cz & ~(block_cells - 1);
+    nx = ((max_cx - origin_x) >> shift) + 1;
+    ny = ((max_cy - origin_y) >> shift) + 1;
+    nz = ((max_cz - origin_z) >> shift) + 1;
+    if (nx * ny * nz <= budget) {
+      break;
+    }
+  }
+  if (shift > 30) {
+    return;
+  }
+  const int block_cells = 1 << shift;
+  const int origin_x = min_cx & ~(block_cells - 1);
+  const int origin_y = min_cy & ~(block_cells - 1);
+  const int origin_z = min_cz & ~(block_cells - 1);
+  const int64_t blocks = nx * ny * nz;
+  if (blocks <= 0) {
+    return;
+  }
+  const int64_t num_bytes = (blocks + 7) / 8;
+  data.occupancy_bits.assign(static_cast<std::size_t>(num_bytes), 0);
+  data.occupancy_block = data.cell_radius * block_cells;
+  data.occupancy_inv_block = 1.0f / data.occupancy_block;
+  data.occupancy_min_x = static_cast<float>(origin_x) * data.cell_radius;
+  data.occupancy_min_y = static_cast<float>(origin_y) * data.cell_radius;
+  data.occupancy_min_z = static_cast<float>(origin_z) * data.cell_radius;
+  data.occupancy_nx = static_cast<int>(nx);
+  data.occupancy_ny = static_cast<int>(ny);
+  data.occupancy_nz = static_cast<int>(nz);
+  auto key_of_block = [&](int64_t bid) {
+    const int bz = static_cast<int>(bid % nz);
+    const int64_t rest = bid / nz;
+    const int by = static_cast<int>(rest % ny);
+    const int bx = static_cast<int>(rest / ny);
+    return make_key(origin_x + (bx << shift) + field_offset,
+                    origin_y + (by << shift) + field_offset,
+                    origin_z + (bz << shift) + field_offset);
+  };
+  auto ordered_less = [mask](uint64_t a, uint64_t b) {
+    return (a ^ mask) < b;
+  };
+  const int chunks = static_cast<int>(
+      std::max<int64_t>(1, std::min<int64_t>(
+                               4 * tbb::this_task_arena::max_concurrency(),
+                               num_bytes)));
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int64_t b0 = num_bytes * chunk / chunks;
+    const int64_t b1 = num_bytes * (chunk + 1) / chunks;
+    if (b0 >= b1) {
+      return;
+    }
+    const int64_t bid0 = b0 * 8;
+    const int64_t bid1 = std::min<int64_t>(blocks, b1 * 8);
+    if (bid0 >= blocks) {
+      return;
+    }
+    const uint64_t want_lo = key_of_block(bid0);
+    const int lo = static_cast<int>(
+        std::lower_bound(keys, keys + num_cells, want_lo, ordered_less) -
+        keys);
+    int hi = num_cells;
+    if (bid1 < blocks) {
+      const uint64_t want_hi = key_of_block(bid1);
+      hi = static_cast<int>(
+          std::lower_bound(keys, keys + num_cells, want_hi, ordered_less) -
+          keys);
+    }
+    uint8_t *bits = data.occupancy_bits.data();
+    for (int i = lo; i < hi; ++i) {
+      int bx = (real_coord(keys[i], 42) - origin_x) >> shift;
+      int by = (real_coord(keys[i], 21) - origin_y) >> shift;
+      int bz = (real_coord(keys[i], 0) - origin_z) >> shift;
+      bx = std::min<int>(static_cast<int>(nx) - 1, std::max(0, bx));
+      by = std::min<int>(static_cast<int>(ny) - 1, std::max(0, by));
+      bz = std::min<int>(static_cast<int>(nz) - 1, std::max(0, bz));
+      const int64_t bid =
+          (static_cast<int64_t>(bx) * ny + by) * nz + bz;
+      bits[bid >> 3] =
+          static_cast<uint8_t>(bits[bid >> 3] | (1u << (bid & 7)));
+    }
+  });
+  data.occupancy_valid = true;
+}
+
+bool occupancy_may_contain(const NeighborSearchData &data, float qx,
                                   float qy, float qz, float radius) {
   if (!data.occupancy_valid) {
     return true;
@@ -3063,9 +3238,9 @@ inline bool occupancy_may_contain(const NeighborSearchData &data, float qx,
       qz - radius >= center_z0 &&
       qz + radius < center_z0 + data.occupancy_block) {
     const std::size_t index =
-        (static_cast<std::size_t>(center_z) * data.occupancy_ny + center_y) *
-            data.occupancy_nx +
-        center_x;
+        (static_cast<std::size_t>(center_x) * data.occupancy_ny + center_y) *
+            data.occupancy_nz +
+        center_z;
     return ((data.occupancy_bits[index >> 3] >> (index & 7)) & 1u) != 0;
   }
   auto range = [&](float q, float min_value, int n, int &first, int &last) {
@@ -3082,9 +3257,9 @@ inline bool occupancy_may_contain(const NeighborSearchData &data, float qx,
     for (int by = y0; by <= y1; ++by) {
       for (int bx = x0; bx <= x1; ++bx) {
         const std::size_t index =
-            (static_cast<std::size_t>(bz) * data.occupancy_ny + by) *
-                data.occupancy_nx +
-            bx;
+            (static_cast<std::size_t>(bx) * data.occupancy_ny + by) *
+                data.occupancy_nz +
+            bz;
         if ((data.occupancy_bits[index >> 3] >> (index & 7)) & 1u) {
           return true;
         }
@@ -3274,7 +3449,7 @@ bool write_cross_rows_target_major(NeighborSearchData &source,
     return true;
   }
   ensure_ordered_cell_x(source);
-  ensure_occupancy(source);
+  ensure_occupancy_cells(source);
   if (!source.ordered_x_valid || source.num_cells <= 0 ||
       source.scratch_unique_keys.size() !=
           static_cast<std::size_t>(source.num_cells)) {

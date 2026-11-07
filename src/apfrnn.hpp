@@ -423,6 +423,9 @@ void ensure_ordered_cell_x(NeighborSearchData &data);
 void ensure_cell_x_index(NeighborSearchData &data);
 void ensure_occupancy(NeighborSearchData &data,
                       const Bounds *known = nullptr);
+// Builds the coarse occupancy grid from the sorted unique cell keys on a
+// cell-aligned block grid (plain byte writes, no per-point atomics).
+void ensure_occupancy_cells(NeighborSearchData &data);
 
 bool write_cross_rows_cell_range(NeighborSearchData &source,
                                  NeighborSearchData &target, float radius,
