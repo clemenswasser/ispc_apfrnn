@@ -73,7 +73,6 @@ bool wants_small_cells(const NeighborSearchData &data, int last_capacity) {
 SamePlan same_set(const NeighborSearchData &data, int last_capacity,
                   int64_t memory_budget) {
   SamePlan plan;
-  plan.fixed_rows = data.num_points <= kFixedMaxPoints;
 
   int first = last_capacity > 0 ? last_capacity : kSameInitialCapacity;
   first = std::min(first, kSameMaxCapacity);
@@ -81,6 +80,11 @@ SamePlan same_set(const NeighborSearchData &data, int last_capacity,
     first = kSameInitialCapacity;
   }
   plan.first_capacity = first;
+  // The point cap is the fast path; above it, fixed rows are still allowed
+  // when their fitted buffer fits the memory budget (8M dense sets do on an
+  // 8 GiB budget, and the block/CSR fallbacks are much slower).
+  plan.fixed_rows = data.num_points <= kFixedMaxPoints ||
+                    row_bytes(data.num_points, first) <= memory_budget;
 
   const bool on_the_fly = data.dense_valid && !data.blocks_valid &&
                           data.max_cell_points > 0 && first < 256 &&
@@ -116,7 +120,6 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
                     const NeighborSearchData &target, int pair_last_capacity,
                     int64_t memory_budget) {
   CrossPlan plan;
-  plan.fixed_rows = source.num_points <= kFixedMaxPoints;
 
   int first =
       pair_last_capacity > 0 ? pair_last_capacity : kCrossInitialCapacity;
@@ -126,6 +129,8 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
     first = kCrossInitialCapacity;
   }
   plan.first_capacity = first;
+  plan.fixed_rows = source.num_points <= kFixedMaxPoints ||
+                    row_bytes(source.num_points, first) <= memory_budget;
 
   const bool moderate = moderate_density(source, source_last_capacity);
   const bool sparse_target =
