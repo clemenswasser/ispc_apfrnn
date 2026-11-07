@@ -1247,6 +1247,30 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
 
   // Writers that skip the range build still read the pair's radius.
   pair.cross.radius = build_radius();
+  // A sparse target writes one id into ~0.85 source rows, so the fixed row
+  // layout touches a fresh cache line per entry. The compact CSR layout keeps
+  // the same ids in a few MB: count the rows exactly, then fill the packed
+  // rows (see write_cross_neighbors_target_major_csr_parallel).
+  if (cross_plan.fixed_rows &&
+      cross_plan.writer == plan::CrossWriter::TargetMajor &&
+      skin_ <= 0.0f && source.data.num_points > 0 &&
+      target.data.num_points > 0) {
+    note_path(kPathCrossTargetMajor);
+    pair.fixed_valid = false;
+    pair.fixed_max_count = -1;
+    pair.active_valid = false;
+    pair.skin_lists = false;
+    pair.cross_block_active = false;
+    pair.cross_block_valid = false;
+    IntBuffer().swap(pair.fixed_neighbors);
+    IntBuffer().swap(pair.fixed_counts);
+    IntBuffer().swap(pair.cross_row_offset);
+    IntBuffer().swap(pair.cross_row_capacity);
+    write_cross_neighbors_target_major_csr_parallel(pair.cross, source.data,
+                                                    target.data);
+    pair.valid = true;
+    return;
+  }
   auto try_fixed = [&](int capacity) {
     switch (cross_plan.writer) {
     case plan::CrossWriter::TargetMajor:

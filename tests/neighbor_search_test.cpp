@@ -519,7 +519,9 @@ TEST_CASE("cross sparse-target scatter matches brute force") {
   search.set_active_search(fluid_id, fluid_id, true);
   search.set_active_search(fluid_id, emitter_id, true);
   search.run();
-  CHECK(search.last_stats().cross_fixed_pairs >= 1);
+  // A sparse target now writes compact CSR rows (the fixed row layout touched
+  // one fresh cache line per entry for the same data).
+  CHECK(search.last_stats().cross_csr_pairs >= 1);
   check_same_set(search, fluid_id, fluid, radius);
   check_cross_set(search, fluid_id, emitter_id, fluid, emitter, radius);
 

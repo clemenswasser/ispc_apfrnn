@@ -537,6 +537,14 @@ void write_cross_neighbors_target_major_parallel(
     const NeighborSearchData &target_data, int capacity,
     IntBuffer &fixed_neighbors, IntBuffer &counts);
 
+// Two-pass compact CSR variant of the sparse-target writer: count every
+// source row's hits, prefix-sum them into row_ptr, then fill the packed rows.
+// A source row receives ~0.85 entries, so the fixed layout touches one fresh
+// line per entry while the CSR rows stay in a few MB.
+void write_cross_neighbors_target_major_csr_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data);
+
 // Same-set writer that builds the merged cell runs on the fly from the
 // set's own dense cell map, skipping the per-frame global range build.
 void write_neighbors_fixed_query_pair_dense_parallel(

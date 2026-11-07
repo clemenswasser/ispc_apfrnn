@@ -4507,6 +4507,75 @@ void write_neighbors_fixed_query_pair_dense_parallel(
 }
 
 
+void write_cross_neighbors_target_major_csr_parallel(
+    CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data) {
+  const int num_source = source_data.num_points;
+  const int num_target = target_data.num_points;
+  if (num_source <= 0 || num_target <= 0 || !source_data.dense_valid ||
+      source_data.cell_stencil != 1) {
+    return;
+  }
+  // Cells come from the source grid's own cell size; the search radius is the
+  // pair's.
+  const float inv_radius = 1.0f / source_data.cell_radius;
+  const float r2 = query_data.radius * query_data.radius;
+  const ispc::Points targets = points_of(target_data);
+  const ispc::DenseGrid grid = dense_of(source_data);
+  const ispc::Cells cells = cells_of(source_data);
+  const ispc::Points candidates = points_of(source_data);
+  IntBuffer &counts = query_data.counts;
+  IntBuffer &row_ptr = query_data.row_ptr;
+  IntBuffer &col_idx = query_data.col_idx;
+  auto zero_counts = [&]() {
+    constexpr int kGrain = 1 << 16;
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_source, kGrain),
+        [&](const tbb::blocked_range<int> &range) {
+          std::fill(counts.begin() + range.begin(),
+                    counts.begin() + range.end(), 0);
+        });
+  };
+  counts.resize(static_cast<std::size_t>(num_source));
+  row_ptr.resize(static_cast<std::size_t>(num_source) + 1);
+  zero_counts();
+  constexpr int kTargetBlock = 64;
+  // Pass 0: exact hits per source row.
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_target, kTargetBlock),
+      [&](const tbb::blocked_range<int> &range) {
+        ispc::target_major_csr(range.begin(), range.end(), &targets, &grid,
+                               &cells, &candidates, inv_radius, r2, 0,
+                               counts.data(), row_ptr.data(), col_idx.data());
+      });
+  const int total = tbb::parallel_scan(
+      tbb::blocked_range<int>(0, num_source), 0,
+      [&](const tbb::blocked_range<int> &range, int sum, bool final_scan) {
+        int running = sum;
+        for (int i = range.begin(); i < range.end(); ++i) {
+          if (final_scan) {
+            row_ptr[i] = running;
+          }
+          running += counts[i];
+        }
+        return running;
+      },
+      [](int left, int right) { return left + right; });
+  row_ptr[num_source] = total;
+  col_idx.resize(static_cast<std::size_t>(total));
+  // Pass 1: reuse counts as the per-row fill cursor; it ends at the exact row
+  // counts, which the pair keeps for its statistics and skin filtering.
+  zero_counts();
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_target, kTargetBlock),
+      [&](const tbb::blocked_range<int> &range) {
+        ispc::target_major_csr(range.begin(), range.end(), &targets, &grid,
+                               &cells, &candidates, inv_radius, r2, 1,
+                               counts.data(), row_ptr.data(), col_idx.data());
+      });
+  query_data.num_points = num_source;
+}
+
 void write_cross_neighbors_fixed_query_pair_dense_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, int capacity,

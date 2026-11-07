@@ -298,6 +298,33 @@ static inline void rows_oct(uniform int q_start, uniform int q_end,
   }
 }
 
+// Packs cell coordinates exactly like the host make_key().
+static inline uniform uint64 make_key_uniform(uniform int cx, uniform int cy,
+                                              uniform int cz) {
+  uniform uint64 ux = ((uniform uint64)((uniform uint32)cx)) & 0x1FFFFFULL;
+  uniform uint64 uy = ((uniform uint64)((uniform uint32)cy)) & 0x1FFFFFULL;
+  uniform uint64 uz = ((uniform uint64)((uniform uint32)cz)) & 0x1FFFFFULL;
+  return (ux << 42) | (uy << 21) | uz;
+}
+
+// Host floor_to_cell(): clamp non-finite and out-of-range coordinates instead
+// of invoking undefined behavior in the float-to-int conversion. Clamping only
+// adds candidate work; the exact distance test still decides neighbors.
+static inline uniform int floor_to_cell_uniform(uniform float value) {
+  const uniform int kCellMin = -0x100000;
+  const uniform int kCellMax = 0xFFFFF;
+  if (value != value) {
+    return value < 0.0f ? kCellMin : kCellMax;
+  }
+  if (value >= (uniform float)kCellMax) {
+    return kCellMax;
+  }
+  if (value <= (uniform float)kCellMin) {
+    return kCellMin;
+  }
+  return (uniform int)floor(value);
+}
+
 // Collects the 27 neighbor cells of cell (cx, cy, cz) as at most 9 runs of
 // contiguous target points (adjacent cells along z are contiguous).
 static inline uniform int dense_runs(const uniform DenseGrid &grid,
@@ -509,6 +536,67 @@ export void write_fixed_rows_dense(
 static inline uniform float axis_gap(uniform float q, uniform float lo,
                                      uniform float hi) {
   return q < lo ? lo - q : (q > hi ? q - hi : 0.0f);
+}
+
+// Two-pass target-major CSR writer for a dense source grid and a sparse
+// target set. Pass 0 counts the hits of every source row; pass 1 appends the
+// target id at row_ptr[row] + cursor[row]. The entries of a 2M-point emitter
+// pair then occupy a few MB instead of touching one fresh 64 B line per entry
+// (the fixed-row layout's RFO floor).
+export void target_major_csr(
+    uniform int begin, uniform int end,
+    const uniform Points *uniform tpts_in,
+    const uniform DenseGrid *uniform grid_in,
+    const uniform Cells *uniform src_in,
+    const uniform Points *uniform spts_in, uniform float inv_radius,
+    uniform float r2, uniform int pass, uniform int *uniform counts,
+    uniform const int row_ptr[], uniform int col_idx[]) {
+  const uniform Points tpts = *tpts_in;
+  const uniform DenseGrid grid = *grid_in;
+  const uniform Cells src = *src_in;
+  const uniform Points spts = *spts_in;
+  uniform int run_start[9];
+  uniform int run_end[9];
+  // Targets arrive in cell order, so consecutive targets usually share the
+  // query cell (the emitter averages ~7 points per cell): reuse its runs.
+  uniform int cached_cx = 0x7FFFFFFF;
+  uniform int cached_cy = 0;
+  uniform int cached_cz = 0;
+  uniform int num_runs = 0;
+  for (uniform int t = begin; t < end; ++t) {
+    const uniform float<3> q = point_at(tpts, t);
+    const uniform int cx = floor_to_cell_uniform(q.x * inv_radius);
+    const uniform int cy = floor_to_cell_uniform(q.y * inv_radius);
+    const uniform int cz = floor_to_cell_uniform(q.z * inv_radius);
+    if (cx != cached_cx || cy != cached_cy || cz != cached_cz) {
+      num_runs = dense_runs(grid, src, make_key_uniform(cx, cy, cz),
+                            run_start, run_end);
+      cached_cx = cx;
+      cached_cy = cy;
+      cached_cz = cz;
+    }
+    const uniform int value = tpts.index[t];
+    for (uniform int run = 0; run < num_runs; ++run) {
+      // The candidate index is the gang base plus the lane, so the hit path
+      // needs no per-lane vector extract.
+      uniform int base = run_start[run];
+      foreach (j = run_start[run] ... run_end[run]) {
+        const float<3> pj = point_at(spts, j);
+        const varying bool hit = length_sq(pj - q) <= r2;
+        uniform int mask = packmask(hit);
+        while (mask != 0) {
+          const uniform int lane = count_trailing_zeros(mask);
+          const uniform int jj = base + lane;
+          const uniform int position = atomic_add_global(&counts[jj], 1);
+          if (pass != 0) {
+            col_idx[row_ptr[jj] + position] = value;
+          }
+          mask &= mask - 1;
+        }
+        base += programCount;
+      }
+    }
+  }
 }
 
 // Squared distance from q to the box [lo, hi]; 0 inside.
