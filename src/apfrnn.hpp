@@ -223,6 +223,7 @@ struct NeighborSearchData {
   // rebuild.
   std::vector<uint8_t> occupancy_bits;
   float occupancy_block = 0.0f;
+  float occupancy_inv_block = 0.0f;
   float occupancy_min_x = 0.0f;
   float occupancy_min_y = 0.0f;
   float occupancy_min_z = 0.0f;

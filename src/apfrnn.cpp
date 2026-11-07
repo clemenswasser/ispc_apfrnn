@@ -2604,12 +2604,63 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
                                        unpack_coord(key, 0)));
           cursor[k] = lower_bound_key(last[k]);
         }
+        auto advance_and_test = [&](int query, int k, uint64_t want) {
+          int &position = cursor[k];
+          if (want < last[k]) {
+            position = lower_bound_key(want);
+          } else {
+            while (position < num_cells &&
+                   order_key(keys[position]) < want) {
+              ++position;
+            }
+          }
+          last[k] = want;
+          if (position < num_cells && order_key(keys[position]) == want) {
+            test_cell(query, position);
+            if (position > 0 &&
+                order_key(keys[position - 1]) == want - 1) {
+              test_cell(query, position - 1);
+            }
+            if (position + 1 < num_cells &&
+                order_key(keys[position + 1]) == want + 1) {
+              test_cell(query, position + 1);
+            }
+          } else {
+            if (position > 0 &&
+                order_key(keys[position - 1]) == want - 1) {
+              test_cell(query, position - 1);
+            }
+            if (position < num_cells &&
+                order_key(keys[position]) == want + 1) {
+              test_cell(query, position);
+            }
+          }
+        };
         for (int cell = begin; cell < end; ++cell) {
           const int query = cell_point(cell);
           const uint64_t key = keys[cell];
           const int cx = unpack_coord(key, 42);
           const int cy = unpack_coord(key, 21);
           const int cz = unpack_coord(key, 0);
+          if (cx > 0 && cx < 0xFFFFE && cy > 0 && cy < 0xFFFFE &&
+              cz >= 0 && cz < 0xFFFFE) {
+            const uint64_t ordered =
+                signed_order ? (key | SortPointKey::kSignBits) : key;
+            const int next = cell + 1;
+            const uint64_t direct = ordered + 1;
+            if (next < num_cells && order_key(keys[next]) == direct) {
+              test_cell(query, next);
+            }
+            advance_and_test(query, 0, ordered + (uint64_t{1} << 21));
+            advance_and_test(
+                query, 1,
+                ordered + (uint64_t{1} << 42) - (uint64_t{1} << 21));
+            advance_and_test(query, 2, ordered + (uint64_t{1} << 42));
+            advance_and_test(
+                query, 3,
+                ordered + (uint64_t{1} << 42) + (uint64_t{1} << 21));
+            continue;
+          }
           // Same (x, y), next z: the next occupied position when the key is
           // exactly one greater.
           if (signed_order || (cz >= 0 && cz < 0xFFFFF)) {
@@ -2840,6 +2891,7 @@ void ensure_occupancy(NeighborSearchData &data) {
     return;
   }
   data.occupancy_block = block;
+  data.occupancy_inv_block = 1.0f / block;
   data.occupancy_min_x = box.min_x;
   data.occupancy_min_y = box.min_y;
   data.occupancy_min_z = box.min_z;
@@ -2872,8 +2924,8 @@ void ensure_occupancy(NeighborSearchData &data) {
   data.occupancy_valid = true;
 }
 
-bool occupancy_may_contain(const NeighborSearchData &data, float qx,
-                           float qy, float qz, float radius) {
+inline bool occupancy_may_contain(const NeighborSearchData &data, float qx,
+                                  float qy, float qz, float radius) {
   if (!data.occupancy_valid) {
     return true;
   }
@@ -2892,7 +2944,32 @@ bool occupancy_may_contain(const NeighborSearchData &data, float qx,
       qy - radius >= upper_y || qz - radius >= upper_z) {
     return false;
   }
-  const float inv_block = 1.0f / data.occupancy_block;
+  const float inv_block = data.occupancy_inv_block;
+  auto block_of = [&](float q, float min_value, int n) {
+    int block = static_cast<int>((q - min_value) * inv_block);
+    return std::min(n - 1, std::max(0, block));
+  };
+  const int center_x = block_of(qx, data.occupancy_min_x, data.occupancy_nx);
+  const int center_y = block_of(qy, data.occupancy_min_y, data.occupancy_ny);
+  const int center_z = block_of(qz, data.occupancy_min_z, data.occupancy_nz);
+  const float center_x0 =
+      data.occupancy_min_x + center_x * data.occupancy_block;
+  const float center_y0 =
+      data.occupancy_min_y + center_y * data.occupancy_block;
+  const float center_z0 =
+      data.occupancy_min_z + center_z * data.occupancy_block;
+  if (qx - radius >= center_x0 &&
+      qx + radius < center_x0 + data.occupancy_block &&
+      qy - radius >= center_y0 &&
+      qy + radius < center_y0 + data.occupancy_block &&
+      qz - radius >= center_z0 &&
+      qz + radius < center_z0 + data.occupancy_block) {
+    const std::size_t index =
+        (static_cast<std::size_t>(center_z) * data.occupancy_ny + center_y) *
+            data.occupancy_nx +
+        center_x;
+    return ((data.occupancy_bits[index >> 3] >> (index & 7)) & 1u) != 0;
+  }
   auto range = [&](float q, float min_value, int n, int &first, int &last) {
     first = static_cast<int>((q - radius - min_value) * inv_block);
     last = static_cast<int>((q + radius - min_value) * inv_block);
