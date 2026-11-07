@@ -710,9 +710,14 @@ bool bucket_sort_changed_keys(std::vector<SortPointKey> &keys,
   const int span = max_x - min_x + 1;
   constexpr int kMaxSpan = 1 << 18;
   constexpr int kMinPoints = 65536;
+  // Up to 4096 points per x-bucket: the per-bucket comparison sorts are then
+  // cache-resident and compare far fewer times than one global sort. The old
+  // 32-point guard sent every sparse 1M-8M changed-key sort to the global
+  // parallel_sort (measured 121.2 -> 114.0 ms at sparse 8M with 4096).
+  constexpr long long kMaxPointsPerBucket = 4096;
   if (num_points < kMinPoints || span <= 0 || span > kMaxSpan ||
       static_cast<long long>(num_points) >
-          static_cast<long long>(span) * 32) {
+          static_cast<long long>(span) * kMaxPointsPerBucket) {
     return false;
   }
   const uint64_t mask = signed_order ? SortPointKey::kSignBits : 0;
