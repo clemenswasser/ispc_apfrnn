@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(git push:*)",
+      "Edit(AGENTS.md)",
+      "Edit(CLAUDE.md)",
+      "Edit(opencode.json)",
+      "Edit(.claude/**)",
+      "Edit(.githooks/**)",
+      "Edit(scripts/agent_check.py)",
+      "Edit(scripts/perf_evidence.sh)",
+      "Edit(scripts/bench_tables.py)",
+      "Edit(bench/scenes.hpp)",
+      "Edit(bench/search_bench.cpp)",
+      "Edit(bench/backends.hpp)",
+      "Edit(bench/reference.hpp)",
+      "Edit(support/scene.hpp)"
+    ],
+    "deny": [
+      "Bash(*--no-verify*)",
+      "Bash(*core.hooksPath*)",
+      "Bash(*llama-server*)"
+    ]
+  }
+}

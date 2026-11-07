@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec python3 "$(git rev-parse --show-toplevel)/scripts/agent_check.py" commit-msg "$1"

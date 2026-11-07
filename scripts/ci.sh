@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+python3 scripts/agent_check.py range main
+
 release_build="${1:-build-ci-release}"
 asan_build="${2:-build-ci-asan}"
 coverage_build="${3:-build-ci-coverage}"
