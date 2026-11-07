@@ -17,6 +17,9 @@
 #include <tbb/parallel_scan.h>
 #include <tbb/parallel_sort.h>
 #include <tbb/task_arena.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace apfrnn {
 
@@ -77,6 +80,25 @@ inline int max_row_count(const IntBuffer &counts) {
 // contents never need to survive: growing drops the old buffer first instead
 // of letting resize() copy it, and shrinking reuses the already-faulted pages
 // unless the rows fell below half the buffer.
+// The row buffers are hundreds of MB and are streamed in point order; with
+// 4 KB pages their TLB footprint dwarfs the TLB. Transparent huge pages are
+// madvise-only on this host, so hint the large allocations.
+inline void hint_huge_pages(void *data, std::size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  constexpr std::uintptr_t kPage = std::uintptr_t{2} << 20;
+  if (data == nullptr || bytes < (std::size_t{16} << 20)) {
+    return;
+  }
+  const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+  const std::uintptr_t aligned = (begin + kPage - 1) & ~(kPage - 1);
+  const std::uintptr_t end = (begin + bytes) & ~(kPage - 1);
+  if (end > aligned) {
+    madvise(reinterpret_cast<void *>(aligned),
+            static_cast<std::size_t>(end - aligned), MADV_HUGEPAGE);
+  }
+#endif
+}
+
 inline void prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
                                std::size_t num_points, int row_stride) {
   const std::size_t required = num_points * static_cast<std::size_t>(row_stride);
@@ -85,6 +107,8 @@ inline void prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
     IntBuffer().swap(values);
   }
   values.resize(required);
+  hint_huge_pages(values.data(),
+                  values.size() * static_cast<std::size_t>(sizeof(int)));
 }
 
 // Sizes the block-row buffers. The layout has already been computed in
@@ -279,7 +303,13 @@ inline bool sort_point_set(
     bool &signed_order, CellBounds *bounds_out, const float *interleaved,
     IntBuffer *inverse_out) {
   int const num_points = static_cast<int>(x.size());
+  const bool new_dense_keys =
+      dense_keys.capacity() < static_cast<std::size_t>(num_points);
   dense_keys.resize(num_points);
+  if (new_dense_keys) {
+    hint_huge_pages(dense_keys.data(),
+                    dense_keys.size() * sizeof(uint64_t));
+  }
   const CellBounds bounds = tbb::parallel_reduce(
       tbb::blocked_range<int>(0, num_points, 2048), CellBounds{},
       [&](const tbb::blocked_range<int> &range, CellBounds acc) {
@@ -454,10 +484,22 @@ inline bool sort_point_set(
         },
         [](int left, int right) { return left + right; });
 
+    const bool new_sorted =
+        sorted_x.capacity() < static_cast<std::size_t>(num_points);
     sorted_x.resize(num_points);
     sorted_y.resize(num_points);
     sorted_z.resize(num_points);
     original_index.resize(num_points);
+    if (new_sorted) {
+      hint_huge_pages(sorted_x.data(),
+                      sorted_x.size() * sizeof(float));
+      hint_huge_pages(sorted_y.data(),
+                      sorted_y.size() * sizeof(float));
+      hint_huge_pages(sorted_z.data(),
+                      sorted_z.size() * sizeof(float));
+      hint_huge_pages(original_index.data(),
+                      original_index.size() * sizeof(int));
+    }
 
     tbb::parallel_for(
         tbb::blocked_range<int>(0, num_points, 2048),
