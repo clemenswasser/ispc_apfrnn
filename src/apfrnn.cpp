@@ -939,19 +939,6 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
   int *out_order = data.incremental_order.data();
   uint64_t *out_keys = data.incremental_merge_keys.data();
 
-  auto gather_xyz = [&](int idx, float &gx, float &gy, float &gz) {
-    if (interleaved != nullptr) {
-      const float *q = interleaved + 3 * static_cast<std::size_t>(idx);
-      gx = q[0];
-      gy = q[1];
-      gz = q[2];
-    } else {
-      const std::size_t at = static_cast<std::size_t>(idx);
-      gx = x[at];
-      gy = y[at];
-      gz = z[at];
-    }
-  };
   const int num_a = unchanged_count;
   const int num_b = changed_count;
   const int *unchanged_at = unchanged_positions.data();
@@ -1004,45 +991,48 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
         key = b[ib].key;
         idx = b[ib++].index;
       }
-      float gx;
-      float gy;
-      float gz;
-      gather_xyz(idx, gx, gy, gz);
-      out_keys[write] = key;
-      out_x[write] = gx;
-      out_y[write] = gy;
-      out_z[write] = gz;
+out_keys[write] = key;
       out_order[write] = idx;
       ++write;
     }
     for (; ia < end_a; ++ia) {
       const int position = unchanged_at[ia];
       const int idx = previous_order[position];
-      float gx;
-      float gy;
-      float gz;
-      gather_xyz(idx, gx, gy, gz);
-      out_keys[write] = previous_sorted[position];
-      out_x[write] = gx;
-      out_y[write] = gy;
-      out_z[write] = gz;
+out_keys[write] = previous_sorted[position];
       out_order[write] = idx;
       ++write;
     }
     for (; ib < end_b; ++ib) {
       const int idx = b[ib].index;
-      float gx;
-      float gy;
-      float gz;
-      gather_xyz(idx, gx, gy, gz);
-      out_keys[write] = b[ib].key;
-      out_x[write] = gx;
-      out_y[write] = gy;
-      out_z[write] = gz;
+out_keys[write] = b[ib].key;
       out_order[write] = idx;
       ++write;
     }
   });
+
+  // Independent random reads, eight or more in flight per thread; inside
+  // the branchy merge each gather sat on the merge's critical path.
+  {
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 4096),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const std::size_t idx = static_cast<std::size_t>(
+                out_order[static_cast<std::size_t>(i)]);
+            const std::size_t at = static_cast<std::size_t>(i);
+            if (interleaved != nullptr) {
+              const float *q = interleaved + 3 * idx;
+              out_x[at] = q[0];
+              out_y[at] = q[1];
+              out_z[at] = q[2];
+            } else {
+              out_x[at] = x[idx];
+              out_y[at] = y[idx];
+              out_z[at] = z[idx];
+            }
+          }
+        });
+  }
 
   // Cell ranges from the merged key order. Position 0 and every key change
   // starts a cell; chunks count locally, a short prefix assigns cell ids.
