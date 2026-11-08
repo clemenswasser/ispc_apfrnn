@@ -150,6 +150,11 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
   } else if (target.blocks_valid && source.blocks_valid &&
              source.cell_stencil == 1) {
     plan.writer = CrossWriter::Blocked;
+  } else if (source.num_points < 4096 && source.dense_valid &&
+             target.dense_valid && source.cell_stencil == 1) {
+    // Tiny dense sources have short candidate runs; pairing two queries
+    // shares each run load without the per-run overhead of one query.
+    plan.writer = CrossWriter::QueryPair;
   } else {
     plan.writer = CrossWriter::Active2;
   }
