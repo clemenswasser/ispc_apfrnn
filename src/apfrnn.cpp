@@ -2418,17 +2418,26 @@ static void build_hash_stencil_ranges(NeighborSearchData &data) {
   ensure_cell_ranges(data);
   ensure_hash_table(data);
   const int num_cells = data.num_cells;
+  // A column of z cells is one run in raw key order unless the grid crosses
+  // z = 0, where the packed two's-complement fields wrap. Nine slots are
+  // enough in the common same-sign case.
+  const bool split_z =
+      !(data.cell_coord_valid &&
+        (data.cell_coord_min_z >= 0 || data.cell_coord_max_z < 0));
+  const int slots =
+      split_z ? ispc::hash_stencil_runs_per_cell() : 9;
+  const std::size_t total = static_cast<std::size_t>(num_cells) * slots;
   const bool reuse =
       data.cached_range_valid && data.cached_range_stencil == -1 &&
       data.hash_range_keys == data.scratch_unique_keys &&
       data.cached_range_cell_starts == data.cell_starts &&
       data.cached_range_cell_ends == data.cell_ends &&
-      data.cell_num_neighbors.size() == static_cast<std::size_t>(num_cells);
+      data.cell_num_neighbors.size() == static_cast<std::size_t>(num_cells) &&
+      data.cell_neighbor_starts.size() == total &&
+      data.cell_neighbor_ends.size() == total;
   if (reuse) {
     return;
   }
-  const int slots = ispc::hash_stencil_runs_per_cell();
-  const std::size_t total = static_cast<std::size_t>(num_cells) * slots;
   data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
   data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
   data.cell_neighbor_starts.resize(total);
@@ -2437,7 +2446,7 @@ static void build_hash_stencil_ranges(NeighborSearchData &data) {
     const ispc::Cells cells = cells_of(data);
     const ispc::HashGrid hash = hash_of(data);
     ispc::hash_stencil_ranges(
-        begin, end, &cells, &hash, &cells, num_cells,
+        begin, end, &cells, &hash, &cells, num_cells, slots, split_z,
         data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
         data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data());
   });

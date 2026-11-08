@@ -237,8 +237,9 @@ export void hash_stencil_ranges(
     const uniform Cells *uniform queries_in,
     const uniform HashGrid *uniform hash_in,
     const uniform Cells *uniform targets_in, uniform int num_target_cells,
-    uniform int out_offsets[], uniform int out_counts[],
-    uniform int out_starts[], uniform int out_ends[]) {
+    uniform int slots, uniform bool split_z, uniform int out_offsets[],
+    uniform int out_counts[], uniform int out_starts[],
+    uniform int out_ends[]) {
   const uniform Cells queries = *queries_in;
   const uniform HashGrid hash = *hash_in;
   const uniform Cells targets = *targets_in;
@@ -247,7 +248,7 @@ export void hash_stencil_ranges(
     const varying int cx = unpack_coord(key, 42);
     const varying int cy = unpack_coord(key, 21);
     const varying int cz = unpack_coord(key, 0);
-    const varying int base = cell * HASH_STENCIL_RUNS;
+    const varying int base = cell * slots;
     varying int runs = 0;
     varying int run_start = -1;
     varying int run_end = -1;
@@ -261,7 +262,7 @@ export void hash_stencil_ranges(
           const varying int z = cz + dz;
           const varying uint64 want = make_key(cx + dx, cy + dy, z);
           varying int found = -1;
-          if (last >= 0 && z != 0) {
+          if (last >= 0 && (!split_z || z != 0)) {
             const varying int next = last + 1;
             if (next < num_target_cells && targets.keys[next] == want) {
               found = next;
