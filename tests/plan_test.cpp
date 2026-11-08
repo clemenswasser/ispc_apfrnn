@@ -17,6 +17,14 @@ apfrnn::NeighborSearchData grid(int num_points, int num_cells,
 
 constexpr int64_t kBudget = 3LL * 1024 * 1024 * 1024;
 
+// Smallest capacity >= n whose row stride (capacity + row_slack()) is a whole
+// number of 64-byte lines. The slack is the gang width, so the expected
+// capacities depend on the ISPC target.
+int line_capacity(int n) {
+  const int slack = apfrnn::row_slack();
+  return (n + slack + 15) / 16 * 16 - slack;
+}
+
 } // namespace
 
 TEST_CASE("same-set plan picks the on-the-fly pair writer for moderate density") {
@@ -76,8 +84,7 @@ TEST_CASE("cross plan picks target-major for sparse dense targets") {
   const auto plan = apfrnn::plan::cross_set(source, 64, dense_target, 0, kBudget);
   CHECK(plan.writer == apfrnn::plan::CrossWriter::PairDense);
   CHECK_FALSE(plan.build_ranges);
-  // Cross row strides are line-aligned: 32 + row_slack() rounds to 48 ints.
-  CHECK(plan.first_capacity == 40);
+  CHECK(plan.first_capacity == line_capacity(32));
 }
 
 TEST_CASE("cross plan pairs a low-density source with a dense target") {
@@ -97,7 +104,7 @@ TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
   CHECK(plan.writer == apfrnn::plan::CrossWriter::Active2);
   // Clamped to the cross maximum, then rounded up so the row stride
   // (capacity + row_slack()) is a whole number of 64-byte lines.
-  CHECK(plan.first_capacity == 4104);
+  CHECK(plan.first_capacity == line_capacity(4096));
 }
 
 TEST_CASE("fitted capacities keep a margin for degree changes") {
@@ -105,8 +112,9 @@ TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 80);
   CHECK(apfrnn::plan::same_fitted_capacity(8000, 16384) ==
         apfrnn::round_up_to_row_align(8500));
-  CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) == 88);
-  CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == 72);
+  CHECK(apfrnn::plan::cross_fitted_capacity(70, 128) ==
+        line_capacity(apfrnn::round_up_to_row_align(78)));
+  CHECK(apfrnn::plan::cross_fitted_capacity(70, 64) == line_capacity(64));
 }
 
 TEST_CASE("grown capacities respect limits and budget") {
