@@ -47,7 +47,7 @@ struct CrossPlan {
 };
 
 // Half-radius cells pay off for sets whose rows are much longer than the
-// densest cell. Only used without a skin.
+// densest cell.
 bool wants_small_cells(const NeighborSearchData &data, int last_capacity);
 
 SamePlan same_set(const NeighborSearchData &data, int last_capacity,

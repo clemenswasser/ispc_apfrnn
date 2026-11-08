@@ -94,78 +94,6 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
       .count();
 }
 
-// Largest squared displacement from the positions a set was last built at.
-// Skin reuse is only safe while this stays within skin / 2; comparing each
-// frame against the previous frame would let small steps accumulate.
-float max_distance_sq_to(const std::vector<float> &ax,
-                         const std::vector<float> &ay,
-                         const std::vector<float> &az,
-                         const std::vector<float> &bx,
-                         const std::vector<float> &by,
-                         const std::vector<float> &bz) {
-  const std::size_t count = ax.size();
-  if (bx.size() != count || ay.size() != count || by.size() != count ||
-      az.size() != count || bz.size() != count) {
-    return std::numeric_limits<float>::infinity();
-  }
-  const int n = static_cast<int>(count);
-  return tbb::parallel_reduce(
-      tbb::blocked_range<int>(0, n, 16384), 0.0f,
-      [&](const tbb::blocked_range<int> &range, float acc) {
-        for (int i = range.begin(); i < range.end(); ++i) {
-          const float dx = ax[static_cast<std::size_t>(i)] -
-                           bx[static_cast<std::size_t>(i)];
-          const float dy = ay[static_cast<std::size_t>(i)] -
-                           by[static_cast<std::size_t>(i)];
-          const float dz = az[static_cast<std::size_t>(i)] -
-                           bz[static_cast<std::size_t>(i)];
-          acc = std::max(acc, dx * dx + dy * dy + dz * dz);
-        }
-        return acc;
-      },
-      [](float a, float b) { return std::max(a, b); });
-}
-
-// Keeps the CSR neighbors within `radius` at the current positions. With a
-// skin, rows are searched at radius + skin over the sorted coordinates of the
-// last grid build, which a skin-reused set lags by up to skin / 2 (see
-// sync_dynamic_sets); unlike fixed rows, CSR rows have no filtered copy.
-// Rows are indexed by sorted source position and hold target original
-// indices.
-void filter_csr_rows(IntBuffer &row_ptr, IntBuffer &col_idx, IntBuffer &counts,
-                     const IntBuffer &source_original,
-                     const std::vector<float> &qx, const std::vector<float> &qy,
-                     const std::vector<float> &qz, const std::vector<float> &tx,
-                     const std::vector<float> &ty, const std::vector<float> &tz,
-                     float radius) {
-  const float r2 = radius * radius;
-  const int rows = static_cast<int>(row_ptr.size()) - 1;
-  int out = 0;
-  for (int row = 0; row < rows; ++row) {
-    const std::size_t q =
-        static_cast<std::size_t>(source_original[static_cast<std::size_t>(row)]);
-    const int begin = row_ptr[static_cast<std::size_t>(row)];
-    const int end = row_ptr[static_cast<std::size_t>(row) + 1];
-    row_ptr[static_cast<std::size_t>(row)] = out;
-    for (int k = begin; k < end; ++k) {
-      const int neighbor = col_idx[static_cast<std::size_t>(k)];
-      const std::size_t t = static_cast<std::size_t>(neighbor);
-      const float dx = qx[q] - tx[t];
-      const float dy = qy[q] - ty[t];
-      const float dz = qz[q] - tz[t];
-      if (dx * dx + dy * dy + dz * dz <= r2) {
-        col_idx[static_cast<std::size_t>(out++)] = neighbor;
-      }
-    }
-    if (static_cast<std::size_t>(row) < counts.size()) {
-      counts[static_cast<std::size_t>(row)] =
-          out - row_ptr[static_cast<std::size_t>(row)];
-    }
-  }
-  row_ptr[static_cast<std::size_t>(rows)] = out;
-  col_idx.resize(static_cast<std::size_t>(out));
-}
-
 } // namespace
 
 struct NSearch::PointSet {
@@ -174,8 +102,6 @@ struct NSearch::PointSet {
   bool valid = false;
   bool same_lists_valid = false;
   bool fixed_valid = false;
-  bool skin_lists = false;
-  bool active_valid = false;
   int fixed_capacity = 128;
   int last_fixed_capacity = 0;
   Bounds bounds;  // of x/y/z, maintained by sync_source
@@ -194,12 +120,6 @@ struct NSearch::PointSet {
   std::vector<float> cached_y;
   std::vector<float> cached_z;
   bool target_cache_valid = false;
-  // Positions at the last grid build for skin reuse. cached_* above serve the
-  // skin-free target cache; skin and target caching are mutually exclusive.
-  std::vector<float> skin_x;
-  std::vector<float> skin_y;
-  std::vector<float> skin_z;
-  bool skin_ref_valid = false;
   std::vector<float> gpu_xyz;
   bool gpu_xyz_valid = false;
   uint64_t gpu_version = 0;  // bumped whenever gpu_xyz is repacked
@@ -210,8 +130,6 @@ struct NSearch::PointSet {
   IntBuffer original_to_sorted;
   IntBuffer fixed_neighbors;
   IntBuffer fixed_counts;
-  IntBuffer active_neighbors;
-  IntBuffer active_counts;
   // Max row count of the fixed rows, known from the writer; -1 forces the
   // stats pass to rescan (paths that do not track it).
   int fixed_max_count = -1;
@@ -259,8 +177,6 @@ struct NSearch::Pair {
   bool valid = false;
   bool same_set = false;
   bool fixed_valid = false;
-  bool skin_lists = false;
-  bool active_valid = false;
   int fixed_capacity = 64;
   int last_fixed_capacity = 0;
   bool gpu_rows = false;
@@ -270,8 +186,6 @@ struct NSearch::Pair {
   CrossNeighborSearchData cross;
   IntBuffer fixed_neighbors;
   IntBuffer fixed_counts;
-  IntBuffer active_neighbors;
-  IntBuffer active_counts;
   // Max row count of the fixed rows, known from the writer; -1 forces the
   // stats pass to rescan (paths that do not track it).
   int fixed_max_count = -1;
@@ -501,8 +415,6 @@ const char *NSearch::path_name(uint64_t path) {
   case kPathRangeCacheBuilt: return "range_cache_built";
   case kPathRangeCacheShared: return "range_cache_shared";
   case kPathTargetReuse: return "target_reuse";
-  case kPathSkinReuse: return "skin_reuse";
-  case kPathSkinFilter: return "skin_filter";
   case kPathParallelBuild: return "parallel_build";
   case kPathParallelPairs: return "parallel_pairs";
   case kPathSameSweep: return "same_sweep";
@@ -624,7 +536,7 @@ void NSearch::run() {
         const bool short_window =
             sparse_target &&
             sweep::estimated_window(target.bounds, target.data.num_points,
-                                    build_radius()) <= 256.0;
+                                    radius_) <= 256.0;
         bool cell_range = cell_range_cross_candidate(source, target);
         if (cell_range) {
           ensure_cell_x_index(target.data);
@@ -712,7 +624,7 @@ void NSearch::run() {
                 static_cast<std::size_t>(source.data.num_cells)) {
           continue;
         }
-        const float radius = build_radius();
+        const float radius = radius_;
         for (int capacity : {1, 2, 4, 8, 16, 32}) {
           int max_count = 0;
           if (!write_cross_rows_target_major(
@@ -728,8 +640,6 @@ void NSearch::run() {
           pair.fixed_capacity = capacity;
           pair.last_fixed_capacity =
               plan::cross_fitted_capacity(max_count, capacity);
-          pair.skin_lists = skin_ > 0.0f;
-          pair.active_valid = false;
           pair.cross_block_active = false;
           pair.same_set = false;
           pair.valid = true;
@@ -931,31 +841,16 @@ void NSearch::run() {
     }
   }
 
-  if (skin_ > 0.0f) {
-#ifdef APFRNN_HAVE_SYCL
-    // Skin filtering reads the rows; make any deferred copy visible first.
-    if (gpu_) {
-      apfrnn_sycl_wait(gpu_->context);
-    }
-#endif
-    const auto filter_start = std::chrono::steady_clock::now();
-    filter_skin_lists();
-    last_stats_.filter_ms = elapsed_ms(filter_start);
-    note_path(kPathSkinFilter);
-  }
-
   collect_memory_stats();
   last_stats_.paths = path_bits_.load(std::memory_order_relaxed);
 }
 
 void NSearch::update_cell_size() {
   bool small_cells = false;
-  if (skin_ <= 0.0f) {
-    for (const PointSet &point_set : sets_) {
-      small_cells = small_cells || plan::wants_small_cells(
-                                       point_set.data,
-                                       point_set.last_fixed_capacity);
-    }
+  for (const PointSet &point_set : sets_) {
+    small_cells = small_cells ||
+                  plan::wants_small_cells(point_set.data,
+                                          point_set.last_fixed_capacity);
   }
   if (small_cells != use_small_cells_) {
     use_small_cells_ = small_cells;
@@ -967,11 +862,8 @@ void NSearch::update_cell_size() {
 }
 
 void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
-  // Dynamic positions are synced on every run. With a skin, the existing
-  // neighbor lists remain valid while every point moves at most skin/2. A
-  // pure target set that did not move keeps its grid (target cache).
-  const bool target_cache = skin_ <= 0.0f;
-  const float reuse_distance_sq = 0.25f * skin_ * skin_;
+  // Dynamic positions are synced on every run. A pure target set that did
+  // not move keeps its grid (target cache).
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     if (point_set.is_static) {
@@ -981,7 +873,7 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     // disabled at this size), so the per-frame SoA copy is redundant: the key
     // pass reads the caller's interleaved buffer and computes the AABB.
     const bool skip_positions =
-        search_backend_ == SearchBackend::CpuExact && skin_ <= 0.0f &&
+        search_backend_ == SearchBackend::CpuExact &&
         is_source[static_cast<std::size_t>(set)] &&
         point_set.source_type == SourceType::Float &&
         point_set.source != nullptr && point_set.source_count >= 1000000 &&
@@ -997,10 +889,10 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
     }
     last_stats_.max_displacement_sq =
         std::max(last_stats_.max_displacement_sq, max_distance_sq);
-    // With no skin, an unchanged set keeps its sorted coordinates, grid,
+    // An unchanged set keeps its sorted coordinates, grid,
     // ranges and rows. This is not just a target cache: a source set that did
     // not move needs no rebuild either.
-    if (skin_ <= 0.0f && point_set.valid && max_distance_sq == 0.0f) {
+    if (point_set.valid && max_distance_sq == 0.0f) {
       point_set.dirty = false;
       // Keep the unchanged grid, sorted order, ranges and cells. Source sets
       // still rewrite their rows so consumers always see a fresh run().
@@ -1010,20 +902,8 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
       note_path(kPathTargetReuse);
       continue;
     }
-    // Skin lists are only valid while no point has moved more than skin / 2
-    // from the positions they were built at. A per-frame check misses slow
-    // motion that accumulates over several frames.
-    float build_distance_sq = max_distance_sq;
-    if (skin_ > 0.0f && !point_set.dirty) {
-      build_distance_sq =
-          point_set.skin_ref_valid
-              ? max_distance_sq_to(point_set.x, point_set.y, point_set.z,
-                                   point_set.skin_x, point_set.skin_y,
-                                   point_set.skin_z)
-              : std::numeric_limits<float>::infinity();
-    }
     const bool target_unchanged =
-        target_cache && !is_source[static_cast<std::size_t>(set)] &&
+        !is_source[static_cast<std::size_t>(set)] &&
         point_set.valid && point_set.target_cache_valid &&
         point_set.cached_x == point_set.x &&
         point_set.cached_y == point_set.y && point_set.cached_z == point_set.z;
@@ -1031,21 +911,15 @@ void NSearch::sync_dynamic_sets(const std::vector<bool> &is_source) {
       point_set.dirty = false;
       ++last_stats_.reused_sets;
       note_path(kPathTargetReuse);
-    } else if (skin_ <= 0.0f || point_set.dirty || !point_set.valid ||
-               !point_set.skin_lists ||
-               build_distance_sq > reuse_distance_sq) {
+    } else {
       point_set.dirty = true;
       ++last_stats_.rebuilt_sets;
-    } else {
-      ++last_stats_.reused_sets;
-      note_path(kPathSkinReuse);
     }
   }
 }
 
 void NSearch::build_point_sets(const std::vector<bool> &is_source,
                                const std::vector<bool> &needs_same_set) {
-  const bool target_cache = skin_ <= 0.0f;
   const int set_count = static_cast<int>(sets_.size());
   if (effective_backend_ == SearchBackend::GpuExact) {
     for (int set = 0; set < set_count; ++set) {
@@ -1094,18 +968,7 @@ void NSearch::build_point_sets(const std::vector<bool> &is_source,
       build_point_grid(set);
       grid_ms[static_cast<std::size_t>(set)] = elapsed_ms(grid_start);
       grid_rebuilt[static_cast<std::size_t>(set)] = 1;
-      if (skin_ > 0.0f) {
-        point_set.skin_x = point_set.x;
-        point_set.skin_y = point_set.y;
-        point_set.skin_z = point_set.z;
-        point_set.skin_ref_valid = true;
-      } else {
-        point_set.skin_x.clear();
-        point_set.skin_y.clear();
-        point_set.skin_z.clear();
-        point_set.skin_ref_valid = false;
-      }
-      if (target_cache && !is_source[static_cast<std::size_t>(set)]) {
+      if (!is_source[static_cast<std::size_t>(set)]) {
         point_set.cached_x = point_set.x;
         point_set.cached_y = point_set.y;
         point_set.cached_z = point_set.z;
@@ -1180,12 +1043,6 @@ void NSearch::build_same_pair(Pair &pair, int set) {
   }
   if (!point_set.fixed_valid) {
     write_neighbors_parallel(point_set.data);
-    if (skin_ > 0.0f) {
-      filter_csr_rows(point_set.data.row_ptr, point_set.data.col_idx,
-                      point_set.data.counts, point_set.data.original_index,
-                      point_set.x, point_set.y, point_set.z, point_set.x,
-                      point_set.y, point_set.z, radius_);
-    }
   }
   pair.same_set = true;
   pair.valid = true;
@@ -1230,7 +1087,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     for (int capacity : {1, 2, 4, 8, 16, 32}) {
       int max_count = 0;
       if (!write_cross_rows_cell_range(
-              source.data, target.data, build_radius(), capacity,
+              source.data, target.data, radius_, capacity,
               pair.fixed_neighbors, pair.fixed_counts,
               pair.incremental_rows_touched,
               pair.incremental_rows_touched_overflow, max_count)) {
@@ -1242,8 +1099,6 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       pair.fixed_capacity = capacity;
       pair.last_fixed_capacity =
           plan::cross_fitted_capacity(max_count, capacity);
-      pair.skin_lists = skin_ > 0.0f;
-      pair.active_valid = false;
       pair.cross_block_active = false;
       note_path(kPathCrossCellRange);
       return;
@@ -1259,7 +1114,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   const bool short_target_window =
       sparse_target &&
       sweep::estimated_window(target.bounds, target.data.num_points,
-                              build_radius()) <= 256.0;
+                              radius_) <= 256.0;
   if (source.use_sweep || target.use_sweep || short_target_window) {
     if (build_sweep_cross_lists(pair, source, target)) {
       note_path(kPathCrossSweep);
@@ -1277,20 +1132,17 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
                       pair.last_fixed_capacity, memory_budget_);
 
   // Writers that skip the range build still read the pair's radius.
-  pair.cross.radius = build_radius();
+  pair.cross.radius = radius_;
   // A sparse target writes one id into ~0.85 source rows, so the fixed row
   // layout touches a fresh cache line per entry. The compact CSR layout keeps
   // the same ids in a few MB: count the rows exactly, then fill the packed
   // rows (see write_cross_neighbors_target_major_csr_parallel).
   if (cross_plan.fixed_rows &&
-      cross_plan.writer == plan::CrossWriter::TargetMajor &&
-      skin_ <= 0.0f && source.data.num_points > 0 &&
+      cross_plan.writer == plan::CrossWriter::TargetMajor && source.data.num_points > 0 &&
       target.data.num_points > 0) {
     note_path(kPathCrossTargetMajor);
     pair.fixed_valid = false;
     pair.fixed_max_count = -1;
-    pair.active_valid = false;
-    pair.skin_lists = false;
     pair.cross_block_active = false;
     pair.cross_block_valid = false;
     IntBuffer().swap(pair.fixed_neighbors);
@@ -1342,8 +1194,6 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.fixed_max_count = max_count;
     pair.fixed_valid = true;
     pair.cross_block_active = false;
-    pair.skin_lists = skin_ > 0.0f;
-    pair.active_valid = false;
     pair.fixed_capacity = capacity + row_slack();
     pair.last_fixed_capacity = plan::cross_fitted_capacity(max_count, capacity);
     return true;
@@ -1352,7 +1202,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   if (cross_plan.fixed_rows) {
     if (cross_plan.build_ranges) {
       build_cross_cell_ranges_from_sorted_inplace(pair.cross, source.data,
-                                                  target.data, build_radius());
+                                                  target.data, radius_);
       if (pair.cross.shared_starts != nullptr) {
         note_path(kPathRangeCacheShared);
       }
@@ -1364,8 +1214,6 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
         pair.fixed_neighbors.resize(
             static_cast<std::size_t>(source.data.num_points));
         pair.fixed_valid = true;
-        pair.skin_lists = false;
-        pair.active_valid = false;
         return;
       }
     }
@@ -1423,42 +1271,15 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   }
 
   note_path(kPathCrossCsr);
-  pair.skin_lists = false;
-  pair.active_valid = false;
   pair.cross_block_active = false;
   pair.cross_block_valid = false;
   // The CSR path is the low-memory fallback; release the block-row layout and
   // cached capacities so it does not keep the memory it was meant to save.
   IntBuffer().swap(pair.cross_row_offset);
   IntBuffer().swap(pair.cross_row_capacity);
-  // Searched at radius + skin like the fixed rows, then filtered.
   build_cross_neighbor_search_data_from_sorted_inplace(
-      pair.cross, source.data, target.data, build_radius());
+      pair.cross, source.data, target.data, radius_);
   write_cross_neighbors_parallel(pair.cross, target.data);
-  if (skin_ > 0.0f) {
-    filter_csr_rows(pair.cross.row_ptr, pair.cross.col_idx, pair.cross.counts,
-                    source.data.original_index, source.x, source.y, source.z,
-                    target.x, target.y, target.z, radius_);
-  }
-}
-
-void NSearch::filter_skin_lists() {
-  const int set_count = static_cast<int>(sets_.size());
-  for (int set_i = 0; set_i < set_count; ++set_i) {
-    for (int set_j = 0; set_j < set_count; ++set_j) {
-      Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
-                         [static_cast<std::size_t>(set_j)];
-      if (!pair.active || !pair.valid) {
-        continue;
-      }
-      if (set_i == set_j &&
-          sets_[static_cast<std::size_t>(set_i)].skin_lists) {
-        filter_same_active(set_i);
-      } else if (set_i != set_j && pair.skin_lists) {
-        filter_cross_active(pair, set_i, set_j);
-      }
-    }
-  }
 }
 
 void NSearch::collect_memory_stats() {
@@ -1496,20 +1317,12 @@ void NSearch::collect_memory_stats() {
           }
           last_stats_.neighbor_bytes +=
               source.fixed_neighbors.capacity() * sizeof(int) +
-              source.fixed_counts.capacity() * sizeof(int) +
-              source.active_neighbors.capacity() * sizeof(int) +
-              source.active_counts.capacity() * sizeof(int);
-          if (skin_ <= 0.0f || !source.skin_lists) {
-            const int known = source.fixed_max_count;
-            last_stats_.max_neighbors =
-                std::max(last_stats_.max_neighbors,
-                         known >= 0 ? known
-                                    : max_row_count(source.fixed_counts));
-          } else {
-            last_stats_.max_neighbors = std::max(
-                last_stats_.max_neighbors,
-                max_row_count(source.active_counts));
-          }
+              source.fixed_counts.capacity() * sizeof(int);
+          const int known = source.fixed_max_count;
+          last_stats_.max_neighbors =
+              std::max(last_stats_.max_neighbors,
+                       known >= 0 ? known
+                                  : max_row_count(source.fixed_counts));
         } else {
           ++last_stats_.same_csr_pairs;
           last_stats_.neighbor_bytes +=
@@ -1522,19 +1335,11 @@ void NSearch::collect_memory_stats() {
         ++last_stats_.cross_fixed_pairs;
         last_stats_.neighbor_bytes +=
             pair.fixed_neighbors.capacity() * sizeof(int) +
-            pair.fixed_counts.capacity() * sizeof(int) +
-            pair.active_neighbors.capacity() * sizeof(int) +
-            pair.active_counts.capacity() * sizeof(int);
-        if (skin_ <= 0.0f || !pair.skin_lists) {
-          const int known = pair.fixed_max_count;
-          last_stats_.max_neighbors = std::max(
-              last_stats_.max_neighbors,
-              known >= 0 ? known : max_row_count(pair.fixed_counts));
-        } else {
-          last_stats_.max_neighbors = std::max(
-              last_stats_.max_neighbors,
-              max_row_count(pair.active_counts));
-        }
+            pair.fixed_counts.capacity() * sizeof(int);
+        const int known = pair.fixed_max_count;
+        last_stats_.max_neighbors = std::max(
+            last_stats_.max_neighbors,
+            known >= 0 ? known : max_row_count(pair.fixed_counts));
       } else {
         ++last_stats_.cross_csr_pairs;
         last_stats_.neighbor_bytes +=
@@ -1595,16 +1400,6 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
   }
 
   if (pair.same_set && source.fixed_valid) {
-    if (skin_ > 0.0f && source.skin_lists) {
-      const int count =
-          source.active_counts[static_cast<std::size_t>(sorted_index)];
-      const int *neighbors =
-          source.active_neighbors.data() +
-          static_cast<std::size_t>(sorted_index) *
-              static_cast<std::size_t>(source.fixed_capacity);
-      return {reinterpret_cast<const uint32_t *>(neighbors),
-              static_cast<std::size_t>(count)};
-    }
     const int count =
         source.fixed_counts[static_cast<std::size_t>(sorted_index)];
     const int *neighbors =
@@ -1627,16 +1422,6 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
   }
 
   if (!pair.same_set && pair.fixed_valid) {
-    if (skin_ > 0.0f && pair.skin_lists) {
-      const int count =
-          pair.active_counts[static_cast<std::size_t>(sorted_index)];
-      const int *neighbors =
-          pair.active_neighbors.data() +
-          static_cast<std::size_t>(sorted_index) *
-              static_cast<std::size_t>(pair.fixed_capacity);
-      return {reinterpret_cast<const uint32_t *>(neighbors),
-              static_cast<std::size_t>(count)};
-    }
     const int count =
         pair.fixed_counts[static_cast<std::size_t>(sorted_index)];
     const int *neighbors =
@@ -1704,16 +1489,12 @@ bool NSearch::set_search_backend(SearchBackend backend) {
     set.probe_age = 0;
     set.fixed_valid = false;
     set.same_lists_valid = false;
-    set.active_valid = false;
-    set.skin_lists = false;
   }
   for (std::vector<Pair> &row : pairs_) {
     for (Pair &pair : row) {
       pair.valid = false;
       pair.fixed_valid = false;
       pair.cross_block_active = false;
-      pair.active_valid = false;
-      pair.skin_lists = false;
       pair.gpu_rows = false;
       pair.gpu_neighbors = nullptr;
       pair.gpu_offsets = nullptr;
@@ -1721,20 +1502,6 @@ bool NSearch::set_search_backend(SearchBackend backend) {
     }
   }
   return true;
-}
-
-void NSearch::set_skin(float skin) {
-  if (skin < 0.0f || skin == skin_) {
-    return;
-  }
-
-  skin_ = skin;
-  for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
-    sets_[static_cast<std::size_t>(set)].dirty = true;
-    sets_[static_cast<std::size_t>(set)].valid = false;
-    sets_[static_cast<std::size_t>(set)].sweep_decision_valid = false;
-    invalidate_pairs_for_set(set);
-  }
 }
 
 void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
@@ -1757,7 +1524,7 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   // The sweep path replaced original_index with the identity, so any keys
   // saved by an earlier grid build no longer describe this order.
   point_set.data.incremental_valid = false;
-  const float grid_radius = build_radius();
+  const float grid_radius = radius_;
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;
   const float *interleaved =
       point_set.source_type == SourceType::Float && point_set.source != nullptr
@@ -1785,7 +1552,7 @@ void NSearch::set_memory_budget(int64_t bytes) {
 }
 
 bool NSearch::lazy_sorted_coords(const PointSet &point_set) const {
-  if (effective_backend_ != SearchBackend::CpuExact || skin_ > 0.0f) {
+  if (effective_backend_ != SearchBackend::CpuExact) {
     return false;
   }
   if (point_set.source_type != SourceType::Float ||
@@ -1823,14 +1590,12 @@ void NSearch::build_point_grid(int set) {
   point_set.valid = false;
   point_set.same_lists_valid = false;
   point_set.fixed_valid = false;
-  point_set.skin_lists = skin_ > 0.0f;
-  point_set.active_valid = false;
   point_set.dirty = false;
 
   if (!point_set.sweep_decision_valid) {
     point_set.sweep_decision = sweep::should_use(
         point_set.x, point_set.y, point_set.z, point_set.bounds,
-        build_radius());
+        radius_);
     point_set.sweep_decision_valid = true;
   }
   if (point_set.sweep_decision) {
@@ -1839,7 +1604,7 @@ void NSearch::build_point_grid(int set) {
     NeighborSearchData &data = point_set.data;
     const int num_points = static_cast<int>(point_set.x.size());
     data.num_points = num_points;
-    data.radius = build_radius();
+    data.radius = radius_;
     data.num_cells = 0;
     for (auto *buffer :
          {&data.cell_starts, &data.cell_ends, &data.cell_neighbor_offset,
@@ -1872,7 +1637,7 @@ void NSearch::build_point_grid(int set) {
 
   point_set.use_sweep = false;
   point_set.sweep.clear();
-  const float grid_radius = build_radius();
+  const float grid_radius = radius_;
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;
   const float *interleaved =
       point_set.source_type == SourceType::Float && point_set.source != nullptr
@@ -1921,10 +1686,9 @@ void NSearch::build_grid_same_lists(int set) {
     return;
   }
   NeighborSearchData &data = point_set.data;
-  // The CSR and block-row fallbacks search at the exact radius; a static
-  // set's grid is not rebuilt between frames, so restore the build radius
-  // (radius + skin) that fixed and skin rows are written with.
-  data.radius = build_radius();
+  // A static set's grid is not rebuilt between frames, so restore the radius
+  // in case an earlier writer changed it.
+  data.radius = radius_;
   point_set.fixed_valid = false;
   point_set.fixed_max_count = -1;
   // Whether the counts buffer still holds only this writer's rows from the
@@ -1940,7 +1704,7 @@ void NSearch::build_grid_same_lists(int set) {
   const bool grid_rebuilt =
       point_set.lists_grid_generation != point_set.grid_generation;
   point_set.lists_grid_generation = point_set.grid_generation;
-  const bool block_rows_ok = skin_ <= 0.0f && (first_lists || !grid_rebuilt);
+  const bool block_rows_ok = first_lists || !grid_rebuilt;
   // Every occupied cell holds at most one point, so there are no intra-cell
   // pairs and the sorted cell-key order already indexes the 3x3x3 stencil.
   // Merge the key array with itself instead of probing a hash 27 times per
@@ -1965,8 +1729,6 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.last_fixed_capacity =
           plan::same_fitted_capacity(max_count, capacity);
       point_set.fixed_valid = true;
-      point_set.skin_lists = skin_ > 0.0f;
-      point_set.active_valid = false;
       point_set.same_lists_valid = true;
       note_path(kPathSameSparseKeys);
       return;
@@ -1990,8 +1752,6 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.last_fixed_capacity =
           plan::same_fitted_capacity(max_count, capacity);
       point_set.fixed_valid = true;
-      point_set.skin_lists = skin_ > 0.0f;
-      point_set.active_valid = false;
       point_set.same_lists_valid = true;
       note_path(kPathSameQueryOct);
       return;
@@ -2012,7 +1772,7 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.block_caps_valid = false;
     point_set.block_layout_valid = false;
   }
-  if (grid_rebuilt && !first_lists && skin_ <= 0.0f) {
+  if (grid_rebuilt && !first_lists) {
     if (build_moving_block_rows(set)) {
       note_path(kPathSameBlockRows);
       return;
@@ -2036,7 +1796,7 @@ void NSearch::build_grid_same_lists(int set) {
       plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
   // Per-block rows avoid padding every row to the set's maximum. They need
-  // exact counts and do not support skin lists. On later frames the last
+  // exact counts. On later frames the last
   // frame's counts decide; on the first build the counts are taken below.
   auto wants_block_rows = [&](int &min_block) {
     if (!block_rows_ok ||
@@ -2096,8 +1856,6 @@ void NSearch::build_grid_same_lists(int set) {
         plan::same_fitted_capacity(max_count, capacity);
     point_set.block_rows = false;
     point_set.fixed_valid = true;
-    point_set.skin_lists = skin_ > 0.0f;
-    point_set.active_valid = false;
     point_set.same_lists_valid = true;
     return true;
   };
@@ -2128,8 +1886,6 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.fixed_neighbors.resize(
           static_cast<std::size_t>(data.num_points));
       point_set.fixed_valid = true;
-      point_set.skin_lists = false;
-      point_set.active_valid = false;
       point_set.same_lists_valid = true;
       return;
     }
@@ -2177,10 +1933,7 @@ void NSearch::build_grid_same_lists(int set) {
   point_set.block_rows = false;
 
   note_path(kPathSameCsr);
-  point_set.skin_lists = false;
-  point_set.active_valid = false;
-  // Searched at radius + skin and filtered in build_same_pair.
-  build_same_set_neighbor_lists_inplace(data, build_radius());
+  build_same_set_neighbor_lists_inplace(data, radius_);
   point_set.same_lists_valid = true;
 }
 
@@ -2348,8 +2101,6 @@ bool NSearch::build_moving_block_rows(int set) {
       point_set.fixed_valid = true;
       point_set.fixed_capacity = 0;
       point_set.last_fixed_capacity = 0;
-      point_set.skin_lists = false;
-      point_set.active_valid = false;
       point_set.same_lists_valid = true;
       return true;
     }
@@ -2362,7 +2113,7 @@ bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
   NeighborSearchData &data = point_set.data;
   const int num_points = data.num_points;
-  if (num_points == 0 || skin_ > 0.0f) {
+  if (num_points == 0) {
     return false;
   }
   data.radius = radius_;
@@ -2532,8 +2283,6 @@ bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {
   point_set.fixed_valid = true;
   point_set.fixed_capacity = 0;
   point_set.last_fixed_capacity = 0;
-  point_set.skin_lists = false;
-  point_set.active_valid = false;
   point_set.same_lists_valid = true;
   return true;
 }
@@ -2541,7 +2290,7 @@ bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {
 bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
                                      PointSet &target, bool pair_queries,
                                      bool dense_ranges) {
-  if (skin_ > 0.0f || !pair.cross_block_valid) {
+  if (!pair.cross_block_valid) {
     return false;
   }
   // Zero means the layout was evaluated and the fixed rows were cheaper.
@@ -2595,18 +2344,12 @@ bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
   }
   pair.cross_block_active = true;
   pair.fixed_valid = true;
-  pair.skin_lists = false;
-  pair.active_valid = false;
   return true;
 }
 
 bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
                                         PointSet &target, int capacity) {
   pair.cross_block_active = false;
-  if (skin_ > 0.0f) {
-    pair.cross_block_valid = false;
-    return false;
-  }
   // A moving set rebuilds its grid every frame, so a block layout learned now
   // cannot be reused and the scan would only add work. An infinite distance is
   // the first sync (no previous coordinates), not observed motion, so a static
@@ -2718,7 +2461,7 @@ bool NSearch::build_sweep_same_lists(int set) {
                            &point_set.sweep};
   int row_stride = 0;
   if (!sweep::write_fixed_rows(cloud, point_set.original_to_sorted, cloud,
-                               true, build_radius(), memory_budget_,
+                               true, radius_, memory_budget_,
                                point_set.fixed_neighbors,
                                point_set.fixed_counts, row_stride)) {
     return false;
@@ -2726,8 +2469,6 @@ bool NSearch::build_sweep_same_lists(int set) {
   point_set.fixed_capacity = row_stride;
   point_set.last_fixed_capacity = row_stride;
   point_set.fixed_valid = true;
-  point_set.skin_lists = skin_ > 0.0f;
-  point_set.active_valid = false;
   point_set.same_lists_valid = true;
   return true;
 }
@@ -2739,7 +2480,7 @@ bool NSearch::build_sweep_cross_lists(Pair &pair, PointSet &source,
   const sweep::Cloud cloud{target.x, target.y, target.z, &target.sweep};
   int row_stride = 0;
   if (!sweep::write_fixed_rows(query, source.original_to_sorted, cloud, false,
-                               build_radius(), memory_budget_,
+                               radius_, memory_budget_,
                                pair.fixed_neighbors, pair.fixed_counts,
                                row_stride)) {
     return false;
@@ -2747,121 +2488,7 @@ bool NSearch::build_sweep_cross_lists(Pair &pair, PointSet &source,
   pair.fixed_capacity = row_stride;
   pair.last_fixed_capacity = row_stride;
   pair.fixed_valid = true;
-  pair.skin_lists = skin_ > 0.0f;
-  pair.active_valid = false;
   return true;
-}
-
-void NSearch::filter_same_active(int set) {
-  PointSet &point_set = sets_[static_cast<std::size_t>(set)];
-  if (!point_set.fixed_valid || !point_set.skin_lists) {
-    point_set.active_valid = false;
-    return;
-  }
-
-  const int capacity = point_set.fixed_capacity;
-  const int num_points = point_set.data.num_points;
-  point_set.active_neighbors.resize(static_cast<std::size_t>(num_points) *
-                                    static_cast<std::size_t>(capacity));
-  point_set.active_counts.resize(static_cast<std::size_t>(num_points));
-
-  const float radius_sq = radius_ * radius_;
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_points, 256),
-      [&](const tbb::blocked_range<int> &range) {
-        for (int sorted_index = range.begin(); sorted_index < range.end();
-             ++sorted_index) {
-          const int original =
-              point_set.data.original_index[static_cast<std::size_t>(
-                  sorted_index)];
-          const float qx = point_set.x[static_cast<std::size_t>(original)];
-          const float qy = point_set.y[static_cast<std::size_t>(original)];
-          const float qz = point_set.z[static_cast<std::size_t>(original)];
-          const int *skin_row =
-              point_set.fixed_neighbors.data() +
-              static_cast<std::size_t>(sorted_index) *
-                  static_cast<std::size_t>(capacity);
-          const int skin_count =
-              point_set.fixed_counts[static_cast<std::size_t>(sorted_index)];
-          int active_count = 0;
-          int *active_row =
-              point_set.active_neighbors.data() +
-              static_cast<std::size_t>(sorted_index) *
-                  static_cast<std::size_t>(capacity);
-          for (int index = 0; index < skin_count; ++index) {
-            const int neighbor = skin_row[index];
-            const float dx =
-                point_set.x[static_cast<std::size_t>(neighbor)] - qx;
-            const float dy =
-                point_set.y[static_cast<std::size_t>(neighbor)] - qy;
-            const float dz =
-                point_set.z[static_cast<std::size_t>(neighbor)] - qz;
-            if (dx * dx + dy * dy + dz * dz <= radius_sq) {
-              active_row[active_count++] = neighbor;
-            }
-          }
-          point_set.active_counts[static_cast<std::size_t>(sorted_index)] =
-              active_count;
-        }
-      });
-  point_set.active_valid = true;
-}
-
-void NSearch::filter_cross_active(Pair &pair, int source_set,
-                                  int target_set) {
-  if (!pair.fixed_valid || !pair.skin_lists) {
-    pair.active_valid = false;
-    return;
-  }
-
-  const PointSet &source = sets_[static_cast<std::size_t>(source_set)];
-  const PointSet &target = sets_[static_cast<std::size_t>(target_set)];
-  const int capacity = pair.fixed_capacity;
-  const int num_points = source.data.num_points;
-  pair.active_neighbors.resize(static_cast<std::size_t>(num_points) *
-                               static_cast<std::size_t>(capacity));
-  pair.active_counts.resize(static_cast<std::size_t>(num_points));
-
-  const float radius_sq = radius_ * radius_;
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_points, 256),
-      [&](const tbb::blocked_range<int> &range) {
-        for (int sorted_index = range.begin(); sorted_index < range.end();
-             ++sorted_index) {
-          const int original =
-              source.data.original_index[static_cast<std::size_t>(
-                  sorted_index)];
-          const float qx = source.x[static_cast<std::size_t>(original)];
-          const float qy = source.y[static_cast<std::size_t>(original)];
-          const float qz = source.z[static_cast<std::size_t>(original)];
-          const int *skin_row =
-              pair.fixed_neighbors.data() +
-              static_cast<std::size_t>(sorted_index) *
-                  static_cast<std::size_t>(capacity);
-          const int skin_count =
-              pair.fixed_counts[static_cast<std::size_t>(sorted_index)];
-          int active_count = 0;
-          int *active_row =
-              pair.active_neighbors.data() +
-              static_cast<std::size_t>(sorted_index) *
-                  static_cast<std::size_t>(capacity);
-          for (int index = 0; index < skin_count; ++index) {
-            const int neighbor = skin_row[index];
-            const float dx =
-                target.x[static_cast<std::size_t>(neighbor)] - qx;
-            const float dy =
-                target.y[static_cast<std::size_t>(neighbor)] - qy;
-            const float dz =
-                target.z[static_cast<std::size_t>(neighbor)] - qz;
-            if (dx * dx + dy * dy + dz * dz <= radius_sq) {
-              active_row[active_count++] = neighbor;
-            }
-          }
-          pair.active_counts[static_cast<std::size_t>(sorted_index)] =
-              active_count;
-        }
-      });
-  pair.active_valid = true;
 }
 
 void NSearch::invalidate_pairs_for_set(int set) {
@@ -2872,8 +2499,6 @@ void NSearch::invalidate_pairs_for_set(int set) {
   sets_[static_cast<std::size_t>(set)].same_lists_valid = false;
   sets_[static_cast<std::size_t>(set)].fixed_valid = false;
   sets_[static_cast<std::size_t>(set)].fixed_max_count = -1;
-  sets_[static_cast<std::size_t>(set)].skin_lists = false;
-  sets_[static_cast<std::size_t>(set)].active_valid = false;
   const int set_count = static_cast<int>(sets_.size());
   for (int other = 0; other < set_count; ++other) {
     clear_pair(pairs_[static_cast<std::size_t>(set)]
@@ -3040,8 +2665,6 @@ bool NSearch::build_gpu_pair(Pair &pair, int source, int target,
   pair.gpu_nq = result.nq;
   pair.same_set = source == target;
   pair.fixed_valid = false;
-  pair.skin_lists = false;
-  pair.active_valid = false;
   pair.valid = true;
   return true;
 #else
@@ -3058,8 +2681,6 @@ void NSearch::clear_pair(Pair &pair) {
   pair.same_set = false;
   pair.fixed_valid = false;
   pair.cross_block_active = false;
-  pair.skin_lists = false;
-  pair.active_valid = false;
   pair.gpu_rows = false;
   pair.gpu_neighbors = nullptr;
   pair.gpu_offsets = nullptr;
@@ -3071,8 +2692,6 @@ void NSearch::clear_pair(Pair &pair) {
     pair.incremental_rows_touched.clear();
     pair.incremental_rows_touched_overflow = false;
   }
-  pair.active_neighbors.clear();
-  pair.active_counts.clear();
 }
 
 } // namespace apfrnn

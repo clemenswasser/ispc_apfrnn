@@ -4688,7 +4688,7 @@ void write_cross_neighbors_target_major_csr_parallel(
   row_ptr[num_source] = total;
   col_idx.resize(static_cast<std::size_t>(total));
   // Pass 1: reuse counts as the per-row fill cursor; it ends at the exact row
-  // counts, which the pair keeps for its statistics and skin filtering.
+  // counts, which the pair keeps for its statistics.
   zero_counts();
   {
     tbb::parallel_for(

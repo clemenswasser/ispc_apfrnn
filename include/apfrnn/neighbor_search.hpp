@@ -52,35 +52,33 @@ public:
     kPathRangeCacheBuilt = 1ull << 4, // a set built the shared range cache
     kPathRangeCacheShared = 1ull << 5,  // a pair read the shared cache
     kPathTargetReuse = 1ull << 6,     // an unchanged target kept its grid
-    kPathSkinReuse = 1ull << 7,       // a set kept its skin lists
-    kPathSkinFilter = 1ull << 8,      // skin lists were filtered to radius
-    kPathParallelBuild = 1ull << 9,   // small sets were built in parallel
-    kPathParallelPairs = 1ull << 10,  // small pairs ran as one parallel job
-    kPathSameSweep = 1ull << 11,
-    kPathSameBlockRows = 1ull << 12,
-    kPathSameIsolated = 1ull << 13,
-    kPathSameRangesDenseFused = 1ull << 14,
-    kPathSameRangesMerged = 1ull << 15,
-    kPathSamePairDense = 1ull << 16,
-    kPathSameBlocked = 1ull << 17,
-    kPathSameQueryOct = 1ull << 18,
-    kPathSameActive2 = 1ull << 19,
-    kPathSameGrown = 1ull << 20,      // fixed rows overflowed and regrew
-    kPathSameCsr = 1ull << 21,
-    kPathSameSparseKeys = 1ull << 32, // merged sorted cell-key stencil
-    kPathCrossSweep = 1ull << 22,
-    kPathCrossNoCandidates = 1ull << 23,
-    kPathCrossTargetMajor = 1ull << 24,
-    kPathCrossPairDense = 1ull << 25,
-    kPathCrossQueryPair = 1ull << 26,
-    kPathCrossBlocked = 1ull << 27,
-    kPathCrossActive2 = 1ull << 28,
-    kPathCrossGrown = 1ull << 29,
-    kPathCrossCsr = 1ull << 30,
-    kPathGpu = 1ull << 31,
-    kPathCrossCellRange = 1ull << 33, // sorted-cell range search
+    kPathParallelBuild = 1ull << 7,   // small sets were built in parallel
+    kPathParallelPairs = 1ull << 8,   // small pairs ran as one parallel job
+    kPathSameSweep = 1ull << 9,
+    kPathSameBlockRows = 1ull << 10,
+    kPathSameIsolated = 1ull << 11,
+    kPathSameRangesDenseFused = 1ull << 12,
+    kPathSameRangesMerged = 1ull << 13,
+    kPathSamePairDense = 1ull << 14,
+    kPathSameBlocked = 1ull << 15,
+    kPathSameQueryOct = 1ull << 16,
+    kPathSameActive2 = 1ull << 17,
+    kPathSameGrown = 1ull << 18,      // fixed rows overflowed and regrew
+    kPathSameCsr = 1ull << 19,
+    kPathSameSparseKeys = 1ull << 30, // merged sorted cell-key stencil
+    kPathCrossSweep = 1ull << 20,
+    kPathCrossNoCandidates = 1ull << 21,
+    kPathCrossTargetMajor = 1ull << 22,
+    kPathCrossPairDense = 1ull << 23,
+    kPathCrossQueryPair = 1ull << 24,
+    kPathCrossBlocked = 1ull << 25,
+    kPathCrossActive2 = 1ull << 26,
+    kPathCrossGrown = 1ull << 27,
+    kPathCrossCsr = 1ull << 28,
+    kPathGpu = 1ull << 29,
+    kPathCrossCellRange = 1ull << 31, // sorted-cell range search
   };
-  static constexpr int kPathBits = 34;
+  static constexpr int kPathBits = 32;
   // Short name of one Path bit, e.g. "same_csr".
   static const char *path_name(uint64_t path);
 
@@ -90,7 +88,6 @@ public:
     double same_build_ms = 0.0;
     double same_set_ms = 0.0;
     double cross_set_ms = 0.0;
-    double filter_ms = 0.0;
     std::vector<double> pair_ms;
     std::size_t neighbor_bytes = 0;
     std::size_t grid_bytes = 0;
@@ -141,9 +138,7 @@ public:
   int get_n_points(int set) const;
   int n_sets() const;
   float radius() const { return radius_; }
-  float skin() const { return skin_; }
   void set_radius(float radius);
-  void set_skin(float skin);
 
   // GPU Exact is opt-in and statically linked only in an
   // APFRNN_ENABLE_SYCL=ON build. Returns false when the GPU backend is not
@@ -179,7 +174,6 @@ private:
   // True when this run skipped a position copy for a large moving source; the
   // per-frame block-layout scan assumes a static scene and must not run.
   bool skipped_position_sync_ = false;
-  float build_radius() const { return radius_ + skin_; }
   int add_source(const void *xyz, bool is_double, int n, bool is_static);
   void resize_source(int set, const void *xyz, bool is_double, int n);
   float sync_source(int set, bool skip_positions = false);
@@ -192,7 +186,6 @@ private:
                         const std::vector<bool> &needs_same_set);
   void build_same_pair(Pair &pair, int set);
   void build_cross_pair(Pair &pair, int source, int target);
-  void filter_skin_lists();
   void collect_memory_stats();
 
   void build_point_grid(int set);
@@ -211,8 +204,6 @@ private:
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
   static bool cell_range_cross_candidate(const PointSet &source,
                                          const PointSet &target);
-  void filter_same_active(int set);
-  void filter_cross_active(Pair &pair, int source_set, int target_set);
 
   bool build_gpu_pair(Pair &pair, int source, int target,
                       bool defer_same_copy);
@@ -226,7 +217,6 @@ private:
   SearchBackend search_backend_ = SearchBackend::CpuExact;
   SearchBackend effective_backend_ = SearchBackend::CpuExact;
   bool use_small_cells_ = false;
-  float skin_ = 0.0f;
   int64_t memory_budget_ = 3LL * 1024 * 1024 * 1024;
   std::vector<PointSet> sets_;
   std::vector<std::vector<Pair>> pairs_;

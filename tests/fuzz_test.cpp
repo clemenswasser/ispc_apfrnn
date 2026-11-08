@@ -3,7 +3,7 @@
 // Each seed builds a random multi-set scene and runs it for several frames,
 // mutating it between frames the way callers do: motion (rigid and per-point),
 // points jumping far away and back (dense grid <-> hash grid <-> sweep),
-// resizes, static toggles, pair toggles, skin, radius and memory-budget
+// resizes, static toggles, pair toggles, radius and memory-budget
 // changes, and sets added after a run. Every active pair is checked against
 // the reference on every frame, so state that leaks from one frame's plan
 // into the next is caught, not only first-frame results.
@@ -84,8 +84,7 @@ public:
       }
       search_->run();
       const uint64_t paths = search_->last_stats().paths;
-      log() << "frame " << frame << " radius " << radius_ << " skin " << skin_
-            << " budget " << budget_ << " paths:" << describe(paths) << "\n";
+      log() << "frame " << frame << " radius " << radius_ << " budget " << budget_ << " paths:" << describe(paths) << "\n";
       paths_seen |= paths;
       if (frame > 0) {
         paths_entered |= paths & ~previous;
@@ -226,7 +225,7 @@ private:
       log() << "  set " << id << " op " << op << "\n";
       switch (op) {
       case 0:
-      case 1: {  // per-point jitter, sometimes within a skin
+      case 1: {  // per-point jitter
         const float amount = radius_ * pick({0.01f, 0.1f, 0.6f});
         for (int i = 0; i < n; ++i) {
           c.x[i] += uniform_f(-amount, amount);
@@ -280,10 +279,6 @@ private:
     log() << "  global op " << global << "\n";
     switch (global) {
     case 0: randomize_pairs(0.6); break;
-    case 1:
-      skin_ = chance(0.5) ? 0.0f : 0.3f * radius_;
-      search_->set_skin(skin_);
-      break;
     case 2:
       radius_ = pick({0.6f, 1.0f, 1.7f});
       search_->set_radius(radius_);
@@ -314,7 +309,6 @@ private:
   // sets, pairs and settings, run once.
   std::vector<int> fresh_neighbors(int q, int t, int i) const {
     NSearch fresh(radius_);
-    fresh.set_skin(skin_);
     fresh.set_memory_budget(budget_);
     for (const FuzzSet &set : sets_) {
       if (set.is_double) {
@@ -424,7 +418,6 @@ private:
   std::mt19937 rng_;
   bool trace_ = false;
   float radius_ = 1.0f;
-  float skin_ = 0.0f;
   int64_t budget_ = 3LL << 30;
   std::unique_ptr<NSearch> search_;
   std::vector<FuzzSet> sets_;

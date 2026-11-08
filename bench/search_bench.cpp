@@ -22,7 +22,6 @@
 //                            ../learnsph/res); scenes whose files are missing
 //                            are skipped.
 //   --traces=DIR             captured traces (default traces)
-//   --skin=F                 add an apfrnn_skin backend with skin F * radius
 //   --memory_budget_mb=N     cap on one fixed-row allocation (library default
 //                            when omitted); useful to compare CSR fallback.
 
@@ -508,11 +507,8 @@ int main(int argc, char **argv) {
     constexpr const char *kBudget = "--memory_budget_mb=";
     constexpr const char *kThreads = "--threads=";
     constexpr const char *kTraces = "--traces=";
-    constexpr const char *kSkin = "--skin=";
     if (std::strncmp(argv[i], kTraces, std::strlen(kTraces)) == 0) {
       traces = argv[i] + std::strlen(kTraces);
-    } else if (std::strncmp(argv[i], kSkin, std::strlen(kSkin)) == 0) {
-      apfrnn::bench::benchmark_skin() = std::stof(argv[i] + std::strlen(kSkin));
     } else if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
       learnsph_res = argv[i] + std::strlen(kRes);
     } else if (std::strncmp(argv[i], kBudget, std::strlen(kBudget)) == 0) {

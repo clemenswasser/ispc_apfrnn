@@ -96,15 +96,11 @@ inline int64_t &benchmark_memory_budget_mb() {
 
 class ApfrnnBackend final : public Backend {
 public:
-  explicit ApfrnnBackend(SearchBackend backend, float skin = 0.0f)
-      : backend_(backend), skin_(skin) {}
+  explicit ApfrnnBackend(SearchBackend backend) : backend_(backend) {}
 
   void setup(const SceneData &scene) override {
     search_ = std::make_unique<NSearch>(scene.radius);
     search_->set_search_backend(backend_);
-    if (skin_ > 0.0f) {
-      search_->set_skin(skin_ * scene.radius);
-    }
     if (benchmark_memory_budget_mb() > 0) {
       search_->set_memory_budget(benchmark_memory_budget_mb() << 20);
     }
@@ -147,7 +143,6 @@ public:
     state.counters["SameBuildMs"] = stats.same_build_ms;
     state.counters["SameMs"] = stats.same_set_ms;
     state.counters["CrossMs"] = stats.cross_set_ms;
-    state.counters["FilterMs"] = stats.filter_ms;
     const int set_count = search_->n_sets();
     for (int query = 0; query < set_count; ++query) {
       for (int target = 0; target < set_count; ++target) {
@@ -176,7 +171,6 @@ public:
 
 private:
   SearchBackend backend_;
-  float skin_;
   std::unique_ptr<NSearch> search_;
 };
 
@@ -286,12 +280,6 @@ private:
 
 #endif
 
-// Set by --skin=F: adds an apfrnn_skin backend with a skin of F * radius.
-inline float &benchmark_skin() {
-  static float skin = 0.0f;
-  return skin;
-}
-
 // Backends usable in this build and on this machine: GPU variants only with
 // the SYCL backend and a GPU, the baselines only with APFRNN_BUILD_BASELINES.
 inline std::vector<BackendSpec> available_backends() {
@@ -300,12 +288,6 @@ inline std::vector<BackendSpec> available_backends() {
   };
   std::vector<BackendSpec> backends = {
       {"apfrnn_cpu", apfrnn(SearchBackend::CpuExact)}};
-  if (benchmark_skin() > 0.0f) {
-    backends.push_back({"apfrnn_skin", [skin = benchmark_skin()] {
-                          return std::make_unique<ApfrnnBackend>(
-                              SearchBackend::CpuExact, skin);
-                        }});
-  }
   if (NSearch(1.0f).gpu_available()) {
     backends.push_back(
         {"apfrnn_gpu", apfrnn(SearchBackend::GpuExact), false});

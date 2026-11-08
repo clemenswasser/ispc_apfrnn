@@ -369,80 +369,6 @@ TEST_CASE("learnsph-like slab scene remains exact across moving frames") {
   }
 }
 
-TEST_CASE("native skin reuses and then rebuilds neighbor lists") {
-  constexpr float radius = 1.0f;
-  constexpr float skin = 0.2f;
-
-  auto fluid = apfrnn::support::make_point_cloud(48, 8.0f, 606);
-  auto boundary = apfrnn::support::make_point_cloud(24, 8.0f, 607);
-  auto fluid_xyz = interleave(fluid);
-  auto boundary_xyz = interleave(boundary);
-
-  apfrnn::NSearch search(radius);
-  search.set_skin(skin);
-  const int fluid_id =
-      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
-  const int boundary_id = search.add_point_set(
-      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
-  search.set_all_searches(false);
-  search.set_active_search(fluid_id, fluid_id, true);
-  search.set_active_search(fluid_id, boundary_id, true);
-  search.run();
-
-  check_same_set(search, fluid_id, fluid, radius);
-  check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
-
-  // Move less than skin/2: the skin lists remain valid and are filtered.
-  translate(fluid, 0.04f, -0.02f, 0.03f);
-  for (std::size_t index = 0; index < fluid.x.size(); ++index) {
-    fluid_xyz[3 * index + 0] = fluid.x[index];
-    fluid_xyz[3 * index + 1] = fluid.y[index];
-    fluid_xyz[3 * index + 2] = fluid.z[index];
-  }
-  search.run();
-  CHECK(search.last_stats().grid_ms == 0.0);
-  check_same_set(search, fluid_id, fluid, radius);
-  check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
-
-  // Move farther than the reuse threshold: force a rebuild.
-  translate(fluid, 0.5f, 0.4f, -0.3f);
-  for (std::size_t index = 0; index < fluid.x.size(); ++index) {
-    fluid_xyz[3 * index + 0] = fluid.x[index];
-    fluid_xyz[3 * index + 1] = fluid.y[index];
-    fluid_xyz[3 * index + 2] = fluid.z[index];
-  }
-  search.run();
-  CHECK(search.last_stats().grid_ms > 0.0);
-  check_same_set(search, fluid_id, fluid, radius);
-  check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
-}
-
-TEST_CASE("skin rebuilds after slow motion accumulates past the threshold") {
-  constexpr float radius = 1.0f;
-  constexpr float skin = 0.2f;
-  // Two points 1.35 apart: outside radius + skin, so the first build has no
-  // candidate for the pair.
-  std::vector<float> xyz = {0.0f, 0.0f, 0.0f, 1.35f, 0.0f, 0.0f};
-
-  apfrnn::NSearch search(radius);
-  search.set_skin(skin);
-  const int set = search.add_point_set(xyz.data(), 2);
-  search.set_all_searches(false);
-  search.set_active_search(set, set, true);
-  search.run();
-  CHECK(sorted_neighbors(search.get_neighbors(set, set, 0)).empty());
-
-  // Each step is below skin / 2, but five steps total 0.4 and bring the
-  // points within radius. A per-frame displacement check would reuse the
-  // stale lists forever and miss the pair.
-  for (int frame = 0; frame < 5; ++frame) {
-    xyz[3] -= 0.08f;
-    search.run();
-  }
-  CHECK(sorted_neighbors(search.get_neighbors(set, set, 0)) ==
-        std::vector<int>{1});
-}
-
 TEST_CASE("native randomized activation matrix matches brute force") {
   std::mt19937 generator(424242);
   std::uniform_real_distribution<float> radius_distribution(0.4f, 1.8f);
@@ -1145,38 +1071,6 @@ TEST_CASE("native search sparse fallbacks match brute force") {
     check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
   }
 
-  // The same sparse backend must also filter skin lists correctly.
-  {
-    constexpr float radius = 1.0f;
-    constexpr float skin = 0.25f;
-    auto fluid = make_clustered_domain(10, 20, 1000.0f, 2.0f, 905);
-    auto boundary = make_clustered_domain(5, 20, 1000.0f, 2.0f, 906);
-    auto fluid_xyz = interleave(fluid);
-    auto boundary_xyz = interleave(boundary);
-    apfrnn::NSearch search(radius);
-    search.set_skin(skin);
-    const int fluid_id = search.add_point_set(
-        fluid_xyz.data(), static_cast<int>(fluid.x.size()));
-    const int boundary_id = search.add_point_set(
-        boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
-    search.set_all_searches(false);
-    search.set_active_search(fluid_id, fluid_id, true);
-    search.set_active_search(fluid_id, boundary_id, true);
-    search.run();
-    check_same_set(search, fluid_id, fluid, radius);
-    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
-
-    translate(fluid, 0.05f, -0.03f, 0.02f);
-    for (std::size_t index = 0; index < fluid.x.size(); ++index) {
-      fluid_xyz[3 * index + 0] = fluid.x[index];
-      fluid_xyz[3 * index + 1] = fluid.y[index];
-      fluid_xyz[3 * index + 2] = fluid.z[index];
-    }
-    search.run();
-    check_same_set(search, fluid_id, fluid, radius);
-    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
-  }
-
   // A grid source cross-searched against a sparse sweep target exercises
   // the unordered-source fallback and the non-empty list fill pass.
   {
@@ -1296,11 +1190,6 @@ TEST_CASE("block-fixed rows match brute force") {
   search.run();  // cached per-row capacities and the no-count path
 
   CHECK(search.last_stats().same_block_pairs == 1);
-  check_same_set(search, set, cloud, radius);
-
-  // A skin invalidates the block path; the exact fallback must still work.
-  search.set_skin(0.1f);
-  search.run();
   check_same_set(search, set, cloud, radius);
 }
 
@@ -1700,12 +1589,10 @@ TEST_CASE("a sweep set converted to a grid mid-run keeps earlier pairs exact") {
   check_cross_set(search, d, s, dense, sparse, radius);
 }
 
-TEST_CASE("cross rows with a skin stay exact after a same-set CSR fallback") {
-  // The small budget sends the high-degree same-set pair to the exact-radius
-  // CSR fallback, which lowers the set's search radius below the grid's
-  // radius + skin cell size. The cross writers that skip the range build
-  // (target-major, pair-dense) must still use the grid's cells and the
-  // pair's radius.
+TEST_CASE("cross rows stay exact after a same-set CSR fallback") {
+  // The small budget sends the high-degree same-set pair to the CSR
+  // fallback. The cross writers that skip the range build (target-major,
+  // pair-dense) must still use the grid's cells and the pair's radius.
   constexpr float radius = 0.6f;
   const float side = std::cbrt(1500.0f / 6.0f);
   for (uint32_t seed = 1; seed <= 3; ++seed) {
@@ -1718,7 +1605,6 @@ TEST_CASE("cross rows with a skin stay exact after a same-set CSR fallback") {
       auto probe_xyz = interleave(probes);
 
       apfrnn::NSearch search(radius);
-      search.set_skin(0.3f * radius);
       search.set_memory_budget(budget);
       const int f = search.add_point_set(fluid_xyz.data(),
                                          static_cast<int>(fluid.x.size()));
@@ -1874,52 +1760,6 @@ TEST_CASE("hash-grid stencil ranges are exact across the zero cell layer") {
   CHECK((paths & apfrnn::NSearch::kPathGridHash) != 0);
   CHECK((paths & apfrnn::NSearch::kPathSameRangesMerged) != 0);
   check_same_set(search, id, cloud, 1.0f);
-}
-
-TEST_CASE("CSR fallback rows stay exact on a skin-reused target") {
-  // `fluid` (only a target) moves less than skin / 2, so it keeps its grid
-  // (skin reuse) and that grid's sorted coordinates lag behind the caller's. `probes` changes
-  // size, so pair (probes, fluid) is rebuilt; the tiny budget sends it to
-  // the CSR fallback, which must search at radius + skin and filter at the
-  // current positions like the fixed rows do.
-  constexpr float radius = 1.5f;
-  constexpr float skin = 0.4f;
-  const float side = std::cbrt(3000.0f / 6.0f);
-  auto fluid = apfrnn::support::make_point_cloud(3000, side, 31);
-  auto probes = apfrnn::support::make_point_cloud(400, side, 32);
-  auto fluid_xyz = interleave(fluid);
-  auto probe_xyz = interleave(probes);
-
-  apfrnn::NSearch search(radius);
-  search.set_skin(skin);
-  search.set_memory_budget(1 << 16);
-  const int f =
-      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
-  const int p = search.add_point_set(probe_xyz.data(),
-                                     static_cast<int>(probes.x.size()));
-  search.set_all_searches(false);
-  search.set_active_search(p, f, true);
-  search.run();
-
-  std::mt19937 generator(3);
-  std::uniform_real_distribution<float> jitter(-0.11f, 0.11f);  // < skin / 2
-  for (std::size_t i = 0; i < fluid.x.size(); ++i) {
-    fluid.x[i] += jitter(generator);
-    fluid.y[i] += jitter(generator);
-    fluid.z[i] += jitter(generator);
-  }
-  const auto moved = interleave(fluid);
-  std::copy(moved.begin(), moved.end(), fluid_xyz.begin());
-  probes = apfrnn::support::make_point_cloud(500, side, 33);
-  probe_xyz = interleave(probes);
-  search.resize_point_set(p, probe_xyz.data(),
-                          static_cast<int>(probes.x.size()));
-  search.run();
-  const uint64_t paths = search.last_stats().paths;
-  CHECK((paths & apfrnn::NSearch::kPathSkinReuse) != 0);
-  CHECK((paths & apfrnn::NSearch::kPathCrossCsr) != 0);
-
-  check_cross_set(search, p, f, probes, fluid, radius);
 }
 
 TEST_CASE("a set that switches from block rows to the sweep reads sweep rows") {

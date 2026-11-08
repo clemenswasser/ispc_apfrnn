@@ -31,10 +31,8 @@ struct SearchFixtureData {
   int emitter_id = -1;
   Motion motion = Motion::Static;
   int step = 0;
-  float skin = 0.0f;
 
-  void build(Distribution distribution, int fluid_points,
-             float skin_distance = 0.0f) {
+  void build(Distribution distribution, int fluid_points) {
     static std::unique_ptr<tbb::global_control> thread_control;
     static bool thread_control_set = false;
     if (!thread_control_set) {
@@ -50,8 +48,6 @@ struct SearchFixtureData {
     }
     scene = make_scene(distribution, fluid_points);
     search = std::make_unique<NSearch>(scene.radius);
-    skin = skin_distance;
-    search->set_skin(skin);
     fluid_id = search->add_point_set(
         scene.fluid_xyz.data(), static_cast<int>(scene.fluid.x.size()));
     boundary_id = search->add_point_set(
@@ -119,7 +115,6 @@ void attach_counters(benchmark::State &state, const SearchFixtureData &data) {
   state.counters["SameBuildMs"] = stats.same_build_ms;
   state.counters["SameMs"] = stats.same_set_ms;
   state.counters["CrossMs"] = stats.cross_set_ms;
-  state.counters["FilterMs"] = stats.filter_ms;
   state.counters["NeighborMB"] =
       static_cast<double>(stats.neighbor_bytes) / (1024.0 * 1024.0);
   state.counters["GridMB"] =
@@ -163,22 +158,6 @@ void api_frame(benchmark::State &state, Distribution distribution,
   SearchFixtureData data;
   data.build(distribution, fluid_points);
   data.motion = motion;
-  for (auto _ : state) {
-    data.advance();
-    data.search->run();
-    if (consume) {
-      const int64_t total = consume_neighbors(data);
-      benchmark::DoNotOptimize(&total);
-    }
-  }
-  attach_counters(state, data);
-}
-
-void api_skin(benchmark::State &state, Distribution distribution,
-              int fluid_points, bool consume) {
-  SearchFixtureData data;
-  data.build(distribution, fluid_points, 0.4f);
-  data.motion = Motion::SmallMove;
   for (auto _ : state) {
     data.advance();
     data.search->run();
@@ -262,12 +241,6 @@ void register_frame(const char *motion_name, Motion motion,
       ->Unit(benchmark::kMillisecond);
 }
 
-void register_skin(const std::string &name, int points, bool consume) {
-  benchmark::RegisterBenchmark(name, api_skin, Distribution::Uniform, points,
-                               consume)
-      ->Unit(benchmark::kMillisecond);
-}
-
 } // namespace
 
 void register_api_benchmarks() {
@@ -309,13 +282,6 @@ void register_api_benchmarks() {
     register_frame("large_move", Motion::LargeMove, distribution, points);
   }
 
-  for (int points : {50000, 200000, 1000000}) {
-    register_skin("Api/Skin/" + scene_label(kUniform, points), points, false);
-  }
-  for (int points : {50000, 200000}) {
-    register_skin("Api/SkinConsume/" + scene_label(kUniform, points), points,
-                  true);
-  }
   for (int points : {50000, 200000}) {
     benchmark::RegisterBenchmark(
         "Api/Consume/" + scene_label(kUniform, points), api_frame, kUniform,
