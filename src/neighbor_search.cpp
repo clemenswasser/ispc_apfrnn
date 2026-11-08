@@ -1712,6 +1712,8 @@ void NSearch::build_grid_same_lists(int set) {
   // writer.
   if (grid_rebuilt && data.cell_stencil == 1 && data.max_cell_points <= 8 &&
       data.num_cells > 0 && data.num_points >= 2048 &&
+      (data.num_points >= 4096 ||
+       data.num_cells == data.num_points) &&
       static_cast<int64_t>(data.num_cells) * 4 >=
           static_cast<int64_t>(data.num_points) * 3 &&
       data.scratch_unique_keys.size() ==
