@@ -1994,6 +1994,26 @@ bool NSearch::build_moving_block_rows(int set) {
   point_set.row_offset.resize(n);
   point_set.row_capacity.resize(n);
   point_set.fixed_counts.resize(n);
+  // The exact rows of a high-degree set can exceed the memory budget by
+  // design: the library lets the output exceed it rather than fall back to
+  // CSR, and the block-row path uses the same allowance. The per-point layout
+  // also carries the degree margin, so its allowance includes that margin.
+  int64_t row_budget = memory_budget_;
+  if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
+    const int64_t exact_neighbors = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, n, 1 << 14), int64_t{0},
+        [&](const tbb::blocked_range<std::size_t> &range, int64_t acc) {
+          for (std::size_t i = range.begin(); i < range.end(); ++i) {
+            acc += point_set.fixed_counts[i];
+          }
+          return acc;
+        },
+        [](int64_t a, int64_t b) { return a + b; });
+    row_budget =
+        std::max(row_budget,
+                 plan::block_output_budget(
+                     exact_neighbors + exact_neighbors / 8, num_points));
+  }
   // Attempt 0 lays out and writes every row; if its overflowed rows do not
   // fit in the buffer's headroom, attempt 1 lays out again with their grown
   // capacities.
@@ -2026,7 +2046,7 @@ bool NSearch::build_moving_block_rows(int set) {
         },
         [](int64_t a, int64_t b) { return a + b; });
     const int64_t bytes = total * 4 + static_cast<int64_t>(num_points) * 2 * 4;
-    if (total > INT_MAX || bytes > memory_budget_) {
+    if (total > INT_MAX || bytes > row_budget) {
       point_set.moving_caps_valid = false;
       return false;
     }
@@ -2085,7 +2105,7 @@ bool NSearch::build_moving_block_rows(int set) {
       }
       if (spilled <= static_cast<int64_t>(values.capacity()) &&
           spilled * 4 + static_cast<int64_t>(num_points) * 2 * 4 <=
-              memory_budget_) {
+              row_budget) {
         int offset = static_cast<int>(total);
         for (int row : overflowed) {
           const int capacity = point_set.moving_caps[static_cast<std::size_t>(

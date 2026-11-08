@@ -59,7 +59,7 @@ std::vector<std::string> selected(const char *fallback) {
   return names;
 }
 
-void run_scene(const SceneSpec &spec, int frames) {
+void run_scene(const SceneSpec &spec, int frames, int64_t budget = 0) {
   SceneData scene = spec.make();
   // The benchmark moves every static scene with a small smooth flow. Replay
   // the same motion here so late-frame state (changed cells, multi-point
@@ -78,6 +78,9 @@ void run_scene(const SceneSpec &spec, int frames) {
         high > low ? 6.2831853f / (high - low) : 1.0f;
   }
   NSearch search(scene.radius);
+  if (budget > 0) {
+    search.set_memory_budget(budget);
+  }
   const int sets = static_cast<int>(scene.xyz.size());
   for (int set = 0; set < sets; ++set) {
     search.add_point_set(scene.xyz[static_cast<std::size_t>(set)].data(),
@@ -134,6 +137,22 @@ TEST_CASE("large sparse benchmark scenes stay exact over moving frames") {
     INFO(name);
     CHECK(found);
   }
+}
+
+TEST_CASE("moving high-degree sets stay exact with a small row budget") {
+  // Dense clusters make rows much larger than the budget. The per-point row
+  // layout may exceed the budget by the exact output size instead of falling
+  // back to CSR, and must stay exact across moving frames.
+  SceneSpec spec{"dense_moving_budget", [] {
+                   SceneData scene;
+                   scene.radius = 2.0f;
+                   scene.xyz = {apfrnn::bench::interleave(
+                       apfrnn::bench::make_clustered(50000, 20.0f, 23))};
+                   scene.is_static = {false};
+                   scene.pairs = {{0, 0}};
+                   return scene;
+                 }};
+  run_scene(spec, 3, int64_t{16} << 20);
 }
 
 TEST_CASE("sparse moving sets with multi-point cells stay exact") {
