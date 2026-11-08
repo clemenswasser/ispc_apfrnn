@@ -734,49 +734,40 @@ void NSearch::run() {
             pair_times[index] = elapsed_ms(pair_start);
           }
         });
-    // A cross pair lazily builds state on both of its sets (sorted
-    // coordinates, cell ranges, sweep index, range cache), so two pairs that
-    // share a set must not run at the same time. Run them in rounds in which
-    // every set appears at most once.
+    // Cross pairs only read their sets' grids and ranges: every set that is
+    // an active target has its range cache built before this loop, and the
+    // same-set phase has materialized the cell ranges. Run all pending pairs
+    // at once instead of serializing every pair that shares a set.
+    for (int set = 0; set < set_count; ++set) {
+      PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+      if (!point_set.valid) {
+        continue;
+      }
+      ensure_sorted_coords(point_set.data);
+      ensure_cell_ranges(point_set.data);
+      if (!point_set.data.dense_valid) {
+        ensure_hash_table(point_set.data);
+      }
+    }
     std::vector<std::size_t> pending;
     for (std::size_t index = 0; index < jobs.size(); ++index) {
       if (jobs[index].set_i != jobs[index].set_j) {
         pending.push_back(index);
       }
     }
-    std::vector<std::size_t> round;
-    std::vector<std::size_t> deferred;
-    std::vector<char> busy(static_cast<std::size_t>(set_count));
-    while (!pending.empty()) {
-      round.clear();
-      deferred.clear();
-      std::fill(busy.begin(), busy.end(), 0);
-      for (std::size_t index : pending) {
-        const auto i = static_cast<std::size_t>(jobs[index].set_i);
-        const auto j = static_cast<std::size_t>(jobs[index].set_j);
-        if (busy[i] || busy[j]) {
-          deferred.push_back(index);
-          continue;
-        }
-        busy[i] = busy[j] = 1;
-        round.push_back(index);
-      }
-      tbb::parallel_for(
-          tbb::blocked_range<std::size_t>(0, round.size(), 1),
-          [&](const tbb::blocked_range<std::size_t> &range) {
-            for (std::size_t slot = range.begin(); slot < range.end();
-                 ++slot) {
-              const std::size_t index = round[slot];
-              const Job job = jobs[index];
-              Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
-                                 [static_cast<std::size_t>(job.set_j)];
-              const auto pair_start = std::chrono::steady_clock::now();
-              build_cpu_pair(pair, job.set_i, job.set_j);
-              pair_times[index] = elapsed_ms(pair_start);
-            }
-          });
-      pending.swap(deferred);
-    }
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, pending.size(), 1),
+        [&](const tbb::blocked_range<std::size_t> &range) {
+          for (std::size_t slot = range.begin(); slot < range.end(); ++slot) {
+            const std::size_t index = pending[slot];
+            const Job job = jobs[index];
+            Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
+                               [static_cast<std::size_t>(job.set_j)];
+            const auto pair_start = std::chrono::steady_clock::now();
+            build_cpu_pair(pair, job.set_i, job.set_j);
+            pair_times[index] = elapsed_ms(pair_start);
+          }
+        });
     parallel_pairs_ = false;
     last_stats_.fixed_overflows += parallel_overflows_.exchange(0);
 
