@@ -141,7 +141,7 @@ def run_bench(build: Path, cpus: str, family: str, scenes, backends,
               out: Path, extra, min_time: str, repetitions: int,
               threads: int = 8):
     pattern = (rf"^{family}/({'|'.join(backends)})/"
-               rf"({'|'.join(re.escape(s) for s in scenes)})/real_time$")
+               rf"({'|'.join(re.escape(s) for s in scenes)})/manual_time$")
     cmd = [
         "taskset", "-c", cpus,
         str(build / "bench" / "ispc_apfrnn_bench"),
@@ -162,7 +162,7 @@ def run_threads(build: Path, cpus: str, scenes, backends, out: Path,
                 min_time: str, repetitions: int):
     pattern = (rf"^Threads/({'|'.join(backends)})/"
                rf"({'|'.join(re.escape(s) for s in scenes)})/"
-               rf"[0-9]+/real_time$")
+               rf"[0-9]+/manual_time$")
     cmd = [
         "taskset", "-c", cpus,
         str(build / "bench" / "ispc_apfrnn_bench"),
@@ -194,61 +194,107 @@ def load_medians(path: Path):
     if not result:
         # A one-repetition run with aggregates enabled has no _median entry.
         for bench in data["benchmarks"]:
-            if bench["name"].endswith("/real_time"):
-                result[bench["name"].replace("/real_time",
-                                             "/real_time_median")] = bench
+            if bench["name"].endswith("/manual_time"):
+                result[bench["name"].replace("/manual_time",
+                                             "/manual_time_median")] = bench
     return result
 
 
 def expected_name(family: str, backend: str, scene: str):
-    return f"{family}/{backend}/{scene}/real_time_median"
+    return f"{family}/{backend}/{scene}/manual_time_median"
+
+
+def run_replay(args, work: Path):
+    """Runs each trace once per backend, each in its own process, so the
+    reported memory belongs to that backend alone."""
+    results = {}
+    for path in sorted(Path(args.traces).glob("*.trace")):
+        scene = path.stem.replace(".", "p")
+        results[scene] = {}
+        for backend in BACKENDS:
+            out = work / f"replay_{backend}_{scene}.json"
+            out.unlink(missing_ok=True)
+            cmd = [
+                "taskset", "-c", args.cpus,
+                str(args.build / "bench" / "ispc_apfrnn_bench"),
+                f"--benchmark_filter=^Replay/{backend}/{re.escape(scene)}/",
+                f"--benchmark_repetitions={args.replay_repetitions}",
+                "--benchmark_report_aggregates_only=true",
+                "--benchmark_format=json",
+                f"--benchmark_out={out}",
+                f"--threads={args.threads}",
+                f"--traces={args.traces}",
+            ]
+            print("+", " ".join(cmd), file=sys.stderr)
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            if not out.exists() or not out.read_text().strip():
+                continue
+            medians = load_medians(out)
+            if medians:
+                results[scene][backend] = next(iter(medians.values()))
+    (work / "replay.json").write_text(json.dumps(results, indent=1) + "\n")
 
 
 def run_matrix(args, work: Path):
     work.mkdir(parents=True, exist_ok=True)
+    wanted = set(re.findall(r"bench:([\w-]+):start",
+                            Path("README.md").read_text()))
 
-    run_bench(args.build, args.cpus, "Frame", scene_names(HEADLINE), BACKENDS,
-              work / "headline.json", [], args.min_time, args.repetitions,
-              args.threads)
-    run_bench(args.build, args.cpus, "Stress", scene_names(STRESS), BACKENDS,
-              work / "stress.json", [], args.min_time, args.repetitions,
-              args.threads)
-    run_bench(args.build, args.cpus, "Frame", scene_names(LEARNSPH), BACKENDS,
-              work / "learnsph.json",
-              [f"--learnsph_res={args.learnsph_res}"], args.min_time,
-              args.repetitions, args.threads)
-    run_bench(args.build, args.cpus, "Order",
-              [scene for row in ORDER for scene in row[1:]], BACKENDS,
-              work / "order.json", [], args.min_time, args.repetitions,
-              args.threads)
-    run_bench(args.build, args.cpus, "Dynamic",
-              [scene for row in DYNAMIC for scene in row[1:]], BACKENDS,
-              work / "dynamic.json",
-              [f"--learnsph_res={args.learnsph_res}"], args.min_time,
-              args.repetitions, args.threads)
-    if not args.no_scale:
+    if "replay" in wanted:
+        run_replay(args, work)
+    if "headline-timing" in wanted:
+        run_bench(args.build, args.cpus, "Frame", scene_names(HEADLINE),
+                  BACKENDS, work / "headline.json", [], args.min_time,
+                  args.repetitions, args.threads)
+    if "stress-timing" in wanted:
+        run_bench(args.build, args.cpus, "Stress", scene_names(STRESS),
+                  BACKENDS, work / "stress.json", [], args.min_time,
+                  args.repetitions, args.threads)
+    if "learnsph" in wanted:
+        run_bench(args.build, args.cpus, "Frame", scene_names(LEARNSPH),
+                  BACKENDS, work / "learnsph.json",
+                  [f"--learnsph_res={args.learnsph_res}"], args.min_time,
+                  args.repetitions, args.threads)
+    if "order" in wanted:
+        run_bench(args.build, args.cpus, "Order",
+                  [scene for row in ORDER for scene in row[1:]], BACKENDS,
+                  work / "order.json", [], args.min_time, args.repetitions,
+                  args.threads)
+    if "dynamic" in wanted:
+        run_bench(args.build, args.cpus, "Dynamic",
+                  [scene for row in DYNAMIC for scene in row[1:]], BACKENDS,
+                  work / "dynamic.json",
+                  [f"--learnsph_res={args.learnsph_res}"], args.min_time,
+                  args.repetitions, args.threads)
+    if "scale" in wanted and not args.no_scale:
         run_bench(args.build, args.cpus, "Scale", scene_names(SCALE), BACKENDS,
-                  work / "scale.json", ["--memory_budget_mb=8192"],
+                  work / "scale.json", [],
                   args.min_time, args.repetitions, args.threads)
-    run_bench(args.build, args.cpus, "Growing", scene_names(GROWING),
-              ["apfrnn_cpu", "tree"], work / "growing.json", [],
-              args.min_time, args.repetitions, args.threads)
-    run_threads(args.build, args.cpus, scene_names(THREADS), BACKENDS,
-                work / "threads.json", args.min_time, args.repetitions)
-    motion_scenes = {
-        family: [name for _, row_family, static, jitter in MOTION
-                 if row_family == family for name in (static, jitter)]
-        for family in ("Frame", "Stress")
-    }
-    run_bench(args.build, args.cpus, "Frame", motion_scenes["Frame"],
-              ["apfrnn_cpu"], work / "motion.json", [], args.min_time,
-              args.repetitions, args.threads)
-    run_bench(args.build, args.cpus, "Stress", motion_scenes["Stress"],
-              ["apfrnn_cpu"], work / "droplets_motion.json", [],
-              args.min_time, args.repetitions, args.threads)
+    if "growing" in wanted:
+        run_bench(args.build, args.cpus, "Growing", scene_names(GROWING),
+                  ["apfrnn_cpu", "tree"], work / "growing.json", [],
+                  args.min_time, args.repetitions, args.threads)
+    if "threads" in wanted:
+        run_threads(args.build, args.cpus, scene_names(THREADS), BACKENDS,
+                    work / "threads.json", args.min_time, args.repetitions)
+    if "motion" in wanted:
+        motion_scenes = {
+            family: [name for _, row_family, static, jitter in MOTION
+                     if row_family == family for name in (static, jitter)]
+            for family in ("Frame", "Stress")
+        }
+        run_bench(args.build, args.cpus, "Frame", motion_scenes["Frame"],
+                  ["apfrnn_cpu"], work / "motion.json", [], args.min_time,
+                  args.repetitions, args.threads)
+        run_bench(args.build, args.cpus, "Stress", motion_scenes["Stress"],
+                  ["apfrnn_cpu"], work / "droplets_motion.json", [],
+                  args.min_time, args.repetitions, args.threads)
     memory = {}
     if not args.no_memory:
-        for family, rows in (("Frame", HEADLINE), ("Stress", STRESS)):
+        for family, rows, marker in (("Frame", HEADLINE, "headline-memory"),
+                                     ("Stress", STRESS, "stress-memory")):
+            if marker not in wanted:
+                continue
             for _, scene in rows:
                 for backend in BACKENDS:
                     out = work / f"mem_{family}_{backend}_{scene}.json"
@@ -265,7 +311,7 @@ def run_matrix(args, work: Path):
                         entry.get("NeighborMB", 0.0),
                         entry.get("PeakRSSMB", 0.0),
                     ]
-        for _, scene, _ in LEARNSPH:
+        for _, scene, _ in LEARNSPH if "learnsph" in wanted else []:
             for backend in BACKENDS:
                 out = work / f"mem_Frame_{backend}_{scene}.json"
                 run_bench(args.build, args.cpus, "Frame", [scene], [backend],
@@ -296,6 +342,9 @@ def load_inputs(json_dir: Path):
             data[name] = load_medians(path)
         else:
             data[name] = {}
+    replay_path = json_dir / "replay.json"
+    data["replay"] = (json.loads(replay_path.read_text())
+                      if replay_path.exists() else {})
     memory_path = json_dir / "memory.json"
     if not memory_path.exists():
         memory_path = json_dir / "learnsph_memory.json"
@@ -362,8 +411,8 @@ def table_gpu(data):
         if len(parts) != 4:
             continue
         family, _, scene = parts[:3]
-        gpu_name = f"{family}/apfrnn_gpu/{scene}/real_time_median"
-        auto_name = f"{family}/apfrnn_auto/{scene}/real_time_median"
+        gpu_name = f"{family}/apfrnn_gpu/{scene}/manual_time_median"
+        auto_name = f"{family}/apfrnn_auto/{scene}/manual_time_median"
         if gpu_name not in data or auto_name not in data:
             continue
         gpu = data[gpu_name]
@@ -503,6 +552,50 @@ def table_dynamic(data):
     return "\n".join(lines)
 
 
+def replay_label(scene):
+    match = re.fullmatch(r"(.+)_r([0-9p]+)_t([0-9p]+)", scene)
+    if not match:
+        return scene
+    name, radius, time = match.groups()
+    return f"{name.replace('_', ' ')}, t={time.replace('p', '.')} s"
+
+
+def fmt_points(value):
+    if value >= 1e6:
+        return f"{value / 1e6:.1f}M"
+    return f"{value / 1e3:.0f}k"
+
+
+def table_replay(data):
+    rows = []
+    for scene, backends in data["replay"].items():
+        a = backends.get("apfrnn_cpu")
+        if a:
+            rows.append((a["MovingPoints"], scene, a, backends.get("tree"),
+                         backends.get("compact")))
+    lines = [
+        "| Simulation | Moving particles | Avg neighbors | ispc_apfrnn | TreeNSearch | "
+        "CompactNSearch | vs Tree | vs Compact | Memory ours / Tree / "
+        "Compact (MB) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    def cell(entry, key, fmt):
+        return fmt(entry[key]) if entry else "n/a"
+    def ratio(entry, a):
+        return fmt_ratio(entry["real_time"] / a["real_time"]) if entry else "n/a"
+    def mb(value):
+        return f"{value:.0f}"
+    for _, scene, a, t, c in sorted(rows, key=lambda row: (row[0], row[1])):
+        lines.append(
+            f"| {replay_label(scene)} | {fmt_points(a['MovingPoints'])} | "
+            f"{a['Neighbors'] / max(1, a['MovingPoints']):.0f} | "
+            f"{fmt_ms(a['real_time'])} | "
+            f"{cell(t, 'real_time', fmt_ms)} | {cell(c, 'real_time', fmt_ms)} | "
+            f"{ratio(t, a)} | {ratio(c, a)} | {mb(a['AnonMB'])} / "
+            f"{cell(t, 'AnonMB', mb)} / {cell(c, 'AnonMB', mb)} |")
+    return "\n".join(lines)
+
+
 def table_scale(data):
     scale = data["scale"]
     lines = [
@@ -579,21 +672,25 @@ def replace_block(text: str, name: str, content: str):
 
 def generate(data, memory, gpu_data=None):
     text = Path("README.md").read_text()
-    replacements = {
-        "headline-timing": table_timing(data["headline"], HEADLINE, "Frame"),
-        "headline-memory": table_memory(data["headline"], memory, HEADLINE,
-                                        "Frame"),
-        "stress-timing": table_timing(data["stress"], STRESS, "Stress"),
-        "stress-memory": table_memory(data["stress"], memory, STRESS,
-                                      "Stress"),
-        "motion": table_motion(data),
-        "learnsph": table_learnsph(data, memory),
-        "order": table_order(data),
-        "dynamic": table_dynamic(data),
-        "scale": table_scale(data),
-        "growing": table_growing(data),
-        "threads": table_threads(data),
+    tables = {
+        "replay": lambda: table_replay(data),
+        "headline-timing": lambda: table_timing(data["headline"], HEADLINE, "Frame"),
+        "headline-memory": lambda: table_memory(data["headline"], memory, HEADLINE,
+                                                "Frame"),
+        "stress-timing": lambda: table_timing(data["stress"], STRESS, "Stress"),
+        "stress-memory": lambda: table_memory(data["stress"], memory, STRESS,
+                                              "Stress"),
+        "motion": lambda: table_motion(data),
+        "learnsph": lambda: table_learnsph(data, memory),
+        "order": lambda: table_order(data),
+        "dynamic": lambda: table_dynamic(data),
+        "scale": lambda: table_scale(data),
+        "growing": lambda: table_growing(data),
+        "threads": lambda: table_threads(data),
     }
+    wanted = set(re.findall(r"bench:([\w-]+):start", text))
+    replacements = {name: table() for name, table in tables.items()
+                    if name in wanted}
     if gpu_data is not None:
         replacements["gpu"] = table_gpu(gpu_data)
     for name, content in replacements.items():
@@ -611,6 +708,8 @@ def main():
                         default=Path("build/bench-tables"))
     parser.add_argument("--min-time", default="2s")
     parser.add_argument("--repetitions", type=int, default=7)
+    parser.add_argument("--replay-repetitions", type=int, default=3)
+    parser.add_argument("--traces", default="traces")
     parser.add_argument("--threads", type=int, default=8,
                         help="worker threads for Frame/Stress/Cold runs")
     parser.add_argument("--no-scale", action="store_true",

@@ -352,6 +352,16 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   const int fluid_points = scene.points(0);
   state.SetItemsProcessed(state.iterations() * fluid_points);
   state.counters["Points"] = fluid_points;
+  // Particles that move: every set that is not static. The replay table
+  // reports these and their neighbors over all timed pairs.
+  int moving_points = 0;
+  for (int set = 0; set < static_cast<int>(scene.xyz.size()); ++set) {
+    if (set >= static_cast<int>(scene.is_static.size()) ||
+        !scene.is_static[static_cast<std::size_t>(set)]) {
+      moving_points += scene.points(set);
+    }
+  }
+  state.counters["MovingPoints"] = moving_points;
   state.counters["CpuThreads"] = thread_count;
   state.counters["Neighbors"] = static_cast<double>(validation.neighbors);
   state.counters["FalsePositives"] =
