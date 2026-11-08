@@ -1,11 +1,15 @@
 #pragma once
 
 #include "point_cloud.hpp"
+#include "apfrnn/neighbor_search.hpp"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -82,5 +86,44 @@ private:
   float r_;
   std::unordered_map<Key, std::vector<int>, KeyHash> cells_;
 };
+
+// Checks every list of pair (query, target) against the reference. Returns an
+// empty string when all lists match, or a description of the first mismatch.
+inline std::string check_pair(const NSearch &search, int query, int target,
+                              const PointCloud &query_cloud,
+                              const PointCloud &target_cloud, float radius) {
+  const GridReference reference(target_cloud, radius);
+  std::vector<int> must;
+  std::vector<int> maybe;
+  std::vector<int> got;
+  const int n = static_cast<int>(query_cloud.x.size());
+  if (search.get_n_points(query) != n) {
+    return "point count " + std::to_string(search.get_n_points(query)) +
+           " instead of " + std::to_string(n);
+  }
+  for (int i = 0; i < n; ++i) {
+    reference.query(query_cloud.x[i], query_cloud.y[i], query_cloud.z[i],
+                    query == target ? i : -1, must, maybe);
+    const NeighborList list = search.get_neighbors(query, target, i);
+    got.assign(list.begin(), list.end());
+    std::sort(got.begin(), got.end());
+    std::sort(must.begin(), must.end());
+    std::sort(maybe.begin(), maybe.end());
+    std::vector<int> extra;
+    std::set_difference(got.begin(), got.end(), must.begin(), must.end(),
+                        std::back_inserter(extra));
+    const bool has_must =
+        std::includes(got.begin(), got.end(), must.begin(), must.end());
+    const bool extra_ok =
+        std::includes(maybe.begin(), maybe.end(), extra.begin(), extra.end());
+    if (!has_must || !extra_ok) {
+      std::ostringstream out;
+      out << "point " << i << ": got " << got.size() << ", expected "
+          << must.size() << " (+" << maybe.size() << " on the radius)";
+      return out.str();
+    }
+  }
+  return {};
+}
 
 } // namespace apfrnn::support

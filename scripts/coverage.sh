@@ -22,7 +22,7 @@ llvm-profdata merge -sparse "${build_dir}"/apfrnn-*.profraw \
   -o "${build_dir}/apfrnn.profdata"
 llvm-cov export ./"${build_dir}"/tests/ispc_apfrnn_tests \
   -instr-profile="${build_dir}/apfrnn.profdata" -summary-only \
-  -ignore-filename-regex='/(support|tests)/' \
+  -ignore-filename-regex='/(support|tests|bench)/' \
   > "${build_dir}/coverage.json"
 
 line=$(jq -r '.data[0].totals.lines.percent' "${build_dir}/coverage.json")
