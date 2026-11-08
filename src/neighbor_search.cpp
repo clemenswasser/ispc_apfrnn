@@ -824,22 +824,49 @@ void NSearch::run() {
             pair_times[index] = elapsed_ms(pair_start);
           }
         });
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, jobs.size(), 1),
-        [&](const tbb::blocked_range<std::size_t> &range) {
-          for (std::size_t index = range.begin(); index < range.end();
-               ++index) {
-            const Job job = jobs[index];
-            if (job.set_i == job.set_j) {
-              continue;
+    // A cross pair lazily builds state on both of its sets (sorted
+    // coordinates, cell ranges, sweep index, range cache), so two pairs that
+    // share a set must not run at the same time. Run them in rounds in which
+    // every set appears at most once.
+    std::vector<std::size_t> pending;
+    for (std::size_t index = 0; index < jobs.size(); ++index) {
+      if (jobs[index].set_i != jobs[index].set_j) {
+        pending.push_back(index);
+      }
+    }
+    std::vector<std::size_t> round;
+    std::vector<std::size_t> deferred;
+    std::vector<char> busy(static_cast<std::size_t>(set_count));
+    while (!pending.empty()) {
+      round.clear();
+      deferred.clear();
+      std::fill(busy.begin(), busy.end(), 0);
+      for (std::size_t index : pending) {
+        const auto i = static_cast<std::size_t>(jobs[index].set_i);
+        const auto j = static_cast<std::size_t>(jobs[index].set_j);
+        if (busy[i] || busy[j]) {
+          deferred.push_back(index);
+          continue;
+        }
+        busy[i] = busy[j] = 1;
+        round.push_back(index);
+      }
+      tbb::parallel_for(
+          tbb::blocked_range<std::size_t>(0, round.size(), 1),
+          [&](const tbb::blocked_range<std::size_t> &range) {
+            for (std::size_t slot = range.begin(); slot < range.end();
+                 ++slot) {
+              const std::size_t index = round[slot];
+              const Job job = jobs[index];
+              Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
+                                 [static_cast<std::size_t>(job.set_j)];
+              const auto pair_start = std::chrono::steady_clock::now();
+              build_cpu_pair(pair, job.set_i, job.set_j);
+              pair_times[index] = elapsed_ms(pair_start);
             }
-            Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
-                               [static_cast<std::size_t>(job.set_j)];
-            const auto pair_start = std::chrono::steady_clock::now();
-            build_cpu_pair(pair, job.set_i, job.set_j);
-            pair_times[index] = elapsed_ms(pair_start);
-          }
-        });
+          });
+      pending.swap(deferred);
+    }
     parallel_pairs_ = false;
     last_stats_.fixed_overflows += parallel_overflows_.exchange(0);
 
