@@ -1705,12 +1705,20 @@ void NSearch::build_grid_same_lists(int set) {
       point_set.lists_grid_generation != point_set.grid_generation;
   point_set.lists_grid_generation = point_set.grid_generation;
   const bool block_rows_ok = first_lists || !grid_rebuilt;
-  // Every occupied cell holds at most one point, so there are no intra-cell
-  // pairs and the sorted cell-key order already indexes the 3x3x3 stencil.
-  // Merge the key array with itself instead of probing a hash 27 times per
-  // point and materializing per-cell run tables.
-  if (grid_rebuilt && data.cell_stencil == 1 && data.max_cell_points <= 1 &&
-      data.num_cells == data.num_points && data.num_cells > 0) {
+  // Cells hold at most a few points, so the sorted cell-key order indexes the
+  // 3x3x3 stencil directly. Cells with more than one point are handled by a
+  // direct scan of their neighborhood, which keeps the unique-cell walk. The
+  // cursor walk's fixed cost dominates on small sets, which keep the planned
+  // writer.
+  if (grid_rebuilt && data.cell_stencil == 1 && data.max_cell_points <= 8 &&
+      data.num_cells > 0 && data.num_points >= 2048 &&
+      static_cast<int64_t>(data.num_cells) * 4 >=
+          static_cast<int64_t>(data.num_points) * 3 &&
+      data.scratch_unique_keys.size() ==
+          static_cast<std::size_t>(data.num_cells) &&
+      (data.cell_ranges_implicit ||
+       (data.cell_starts.size() == static_cast<std::size_t>(data.num_cells) &&
+        data.cell_ends.size() == static_cast<std::size_t>(data.num_cells)))) {
     bool reuse_rows = sparse_rows_reuse;
     for (int capacity : {1, 2, 4, 8, 16, 32}) {
       int max_count = 0;

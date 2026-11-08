@@ -61,6 +61,22 @@ std::vector<std::string> selected(const char *fallback) {
 
 void run_scene(const SceneSpec &spec, int frames) {
   SceneData scene = spec.make();
+  // The benchmark moves every static scene with a small smooth flow. Replay
+  // the same motion here so late-frame state (changed cells, multi-point
+  // cells, row layouts) is exercised and checked.
+  if (!scene.trace && !scene.growing &&
+      scene.motion == apfrnn::bench::Motion::Static && scene.jitter == 0.0f &&
+      !scene.xyz.empty() && !scene.xyz[0].empty()) {
+    scene.flow = 0.02f;
+    float low = scene.xyz[0][0];
+    float high = low;
+    for (std::size_t i = 0; i < scene.xyz[0].size(); i += 3) {
+      low = std::min(low, scene.xyz[0][i]);
+      high = std::max(high, scene.xyz[0][i]);
+    }
+    scene.flow_wavenumber =
+        high > low ? 6.2831853f / (high - low) : 1.0f;
+  }
   NSearch search(scene.radius);
   const int sets = static_cast<int>(scene.xyz.size());
   for (int set = 0; set < sets; ++set) {
@@ -118,4 +134,20 @@ TEST_CASE("large sparse benchmark scenes stay exact over moving frames") {
     INFO(name);
     CHECK(found);
   }
+}
+
+TEST_CASE("sparse moving sets with multi-point cells stay exact") {
+  // A sparse cloud small enough that several cells hold two or three points.
+  // Those cells take the direct neighborhood scan around the unique-cell
+  // walk, and the flow keeps the cell membership changing.
+  SceneSpec spec{"sparse_multi_cell", [] {
+                   SceneData scene;
+                   scene.radius = 2.0f;
+                   scene.xyz = {apfrnn::bench::interleave(
+                       apfrnn::support::make_point_cloud(200000, 1000.0f, 17))};
+                   scene.is_static = {false};
+                   scene.pairs = {{0, 0}};
+                   return scene;
+                 }};
+  run_scene(spec, 6);
 }

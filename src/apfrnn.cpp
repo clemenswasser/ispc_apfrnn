@@ -802,8 +802,11 @@ bool try_incremental_sort_point_set(NeighborSearchData &data,
   // The merge wins when the grid is sparse: few cells change and the full
   // sort dominates. Dense SPH grids change a large fraction of cells and the
   // merge plus change detection loses to the radix/comparison sort, so keep
-  // those sets on the full path.
-  if (data.max_cell_points > 1) {
+  // those sets on the full path. A sparse set with a few multi-point cells
+  // still benefits, and the merge handles duplicate cell keys.
+  if (data.max_cell_points > 1 &&
+      static_cast<int64_t>(data.num_cells) * 4 <
+          static_cast<int64_t>(data.num_points) * 3) {
     return false;
   }
   auto &changed = data.incremental_changed;
@@ -2237,23 +2240,22 @@ bool build_point_grid_inplace(NeighborSearchData &data,
   if (!incremental) {
     // The merge only targets sparse grids; dense sets keep the full-sort
     // path and must not pay to capture merge state they will never use.
-    if (max_cell_points <= 1) {
+    if (max_cell_points <= 1 ||
+        static_cast<int64_t>(num_cells) * 4 >=
+            static_cast<int64_t>(data.num_points) * 3) {
       reset_incremental_state(data, x, y, z, inv_radius, interleaved);
     } else {
       data.incremental_valid = false;
     }
   }
-  if (!data.dense_valid && max_cell_points > 1) {
-    build_hash_table(unique_keys, data.hash_keys, data.hash_vals,
-                     data.empty_key, data.hash_mask, data.hash_control);
-    data.hash_valid = true;
-  } else {
-    data.hash_keys.clear();
-    data.hash_vals.clear();
-    data.hash_control.clear();
-    data.hash_mask = 0;
-    data.hash_valid = false;
-  }
+  // The hash table is only read by the writers that call ensure_hash_table(),
+  // so it is built on demand. Sparse sets use the sorted cell keys instead
+  // and never pay for it.
+  data.hash_keys.clear();
+  data.hash_vals.clear();
+  data.hash_control.clear();
+  data.hash_mask = 0;
+  data.hash_valid = false;
   // Blocks reorder points inside dense cells, so build them before the range
   // cache and neighbor rows are derived from the sorted order.
   if (max_cell_points > 32) {
@@ -2770,11 +2772,16 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
   }
   const int num_cells = data.num_cells;
   const bool implicit_cells = data.cell_ranges_implicit;
+  const bool multi_cells = !implicit_cells && data.max_cell_points > 1;
   const uint64_t *keys = data.scratch_unique_keys.data();
   const int *cell_starts = implicit_cells ? nullptr
                                           : data.cell_starts.data();
+  const int *cell_ends = implicit_cells ? nullptr : data.cell_ends.data();
   auto cell_point = [&](int cell) {
     return implicit_cells ? cell : cell_starts[cell];
+  };
+  auto unique_cell = [&](int cell) {
+    return !multi_cells || cell_ends[cell] == cell_starts[cell] + 1;
   };
   const float *sx = data.sorted_x.data();
   const float *sy = data.sorted_y.data();
@@ -2834,8 +2841,7 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
       row_values[static_cast<std::size_t>(row) * stride + slot] = value;
     }
   };
-  auto test_cell = [&](int query, int other_cell) {
-    const int other = cell_point(other_cell);
+  auto test_points = [&](int query, int other) {
     if (other == query) {
       return;
     }
@@ -2854,6 +2860,12 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
       append(query, original[other]);
       append(other, original[query]);
     }
+  };
+  auto test_cell = [&](int query, int other_cell) {
+    if (multi_cells && !unique_cell(other_cell)) {
+      return;
+    }
+    test_points(query, cell_point(other_cell));
   };
 
   constexpr int kGrain = 1 << 16;
@@ -2912,6 +2924,9 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
           }
         };
         for (int cell = begin; cell < end; ++cell) {
+          if (multi_cells && !unique_cell(cell)) {
+            continue;
+          }
           const int query = cell_point(cell);
           const uint64_t key = keys[cell];
           const int cx = unpack_coord(key, 42);
@@ -3013,6 +3028,61 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
           }
         }
       });
+  // Cells that hold several points are excluded from the unique-cell walk.
+  // They are rare in a sparse set, so scan their 27-cell neighborhood
+  // directly; every pair with a unique cell is written here because the walk
+  // above skips it, and multi-multi pairs are written by the lower cell only.
+  if (multi_cells) {
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_cells, kGrain),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int cell = range.begin(); cell < range.end(); ++cell) {
+            const int query_begin = cell_starts[cell];
+            const int query_end = cell_ends[cell];
+            if (query_end - query_begin <= 1) {
+              continue;
+            }
+            const uint64_t key = keys[cell];
+            const int cx = unpack_coord(key, 42);
+            const int cy = unpack_coord(key, 21);
+            const int cz = unpack_coord(key, 0);
+            for (int query = query_begin; query < query_end; ++query) {
+              for (int other = query + 1; other < query_end; ++other) {
+                test_points(query, other);
+              }
+              for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                  for (int dz = -1; dz <= 1; ++dz) {
+                    const int nx = cx + dx;
+                    const int ny = cy + dy;
+                    const int nz = cz + dz;
+                    if (nx < -0x100000 || nx > 0xFFFFF ||
+                        ny < -0x100000 || ny > 0xFFFFF ||
+                        nz < -0x100000 || nz > 0xFFFFF) {
+                      continue;
+                    }
+                    const uint64_t want =
+                        order_key(make_key(nx, ny, nz));
+                    const int found = lower_bound_key(want);
+                    if (found >= num_cells ||
+                        order_key(keys[found]) != want || found == cell) {
+                      continue;
+                    }
+                    if (unique_cell(found)) {
+                      test_points(query, cell_starts[found]);
+                    } else if (found > cell) {
+                      for (int other = cell_starts[found];
+                           other < cell_ends[found]; ++other) {
+                        test_points(query, other);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+  }
   // Only rows with at least one neighbor are non-zero, so the max comes from
   // the touched list; a full scan is the fallback when the list overflowed.
   if (touched_overflow) {
