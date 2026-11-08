@@ -1960,8 +1960,7 @@ bool NSearch::build_moving_block_rows(int set) {
     return false;
   }
   const std::size_t n = static_cast<std::size_t>(num_points);
-  if (!point_set.moving_caps_valid || point_set.moving_caps.size() != n) {
-    point_set.moving_caps_valid = false;
+  if (!point_set.moving_caps_valid) {
     // Decide from the last frame's counts: slot totals do not depend on the
     // row order. Sets that keep fixed rows are re-checked every 16 frames.
     if (point_set.fixed_counts.size() != n || point_set.moving_check_wait > 0) {
@@ -1989,6 +1988,23 @@ bool NSearch::build_moving_block_rows(int set) {
           }
         });
     point_set.moving_caps_valid = true;
+  } else if (point_set.moving_caps.size() != n) {
+    // A growing set keeps the capacities of its existing points. Seed the
+    // new points with the average capacity; the writer grows any that
+    // overflow, so no exact recount is needed for the resize.
+    const std::size_t old = point_set.moving_caps.size();
+    if (old > n) {
+      point_set.moving_caps.resize(n);
+    } else {
+      int64_t sum = 0;
+      for (int capacity : point_set.moving_caps) {
+        sum += capacity;
+      }
+      const int seed =
+          old > 0 ? static_cast<int>(sum / static_cast<int64_t>(old)) : 32;
+      point_set.moving_caps.resize(
+          n, round_up_to_row_align(std::max(8, seed)));
+    }
   }
   data.radius = radius_;
   point_set.row_offset.resize(n);
@@ -2312,6 +2328,31 @@ bool NSearch::build_same_block_rows(int set, int min_block, bool counts_ready) {
   point_set.fixed_capacity = 0;
   point_set.last_fixed_capacity = 0;
   point_set.same_lists_valid = true;
+  // Keep per-point capacities for the next frame when the per-point layout
+  // is the cheaper one. A growing set can then extend them for its new
+  // points instead of recounting every candidate.
+  const std::size_t point_count =
+      static_cast<std::size_t>(point_set.fixed_counts.size());
+  if (point_count != 0 &&
+      plan::prefer_block_rows(
+          plan::same_fixed_slots(point_set.fixed_counts),
+          plan::same_moving_slots(point_set.fixed_counts))) {
+    point_set.moving_caps.resize(point_count);
+    const int *original = data.original_index.data();
+    int *caps = point_set.moving_caps.data();
+    const IntBuffer &counts = point_set.fixed_counts;
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, point_count, 1 << 14),
+        [&](const tbb::blocked_range<std::size_t> &range) {
+          for (std::size_t i = range.begin(); i < range.end(); ++i) {
+            caps[static_cast<std::size_t>(original[i])] =
+                plan::moving_row_capacity(counts[i]);
+          }
+        });
+    point_set.moving_caps_valid = true;
+  } else {
+    point_set.moving_caps_valid = false;
+  }
   return true;
 }
 

@@ -155,6 +155,27 @@ TEST_CASE("moving high-degree sets stay exact with a small row budget") {
   run_scene(spec, 3, int64_t{16} << 20);
 }
 
+TEST_CASE("growing high-degree sets stay exact") {
+  // Appending points every frame resizes the set; the per-point row layout
+  // keeps the existing capacities and seeds the new points.
+  SceneSpec spec{"growing_dense", [] {
+                   SceneData scene;
+                   scene.radius = 2.0f;
+                   scene.xyz = {apfrnn::bench::interleave(
+                       apfrnn::bench::make_clustered(30000, 18.0f, 29))};
+                   scene.is_static = {false};
+                   scene.pairs = {{0, 0}};
+                   scene.growing = true;
+                   scene.grow_limit = 40000;
+                   scene.grow_per_frame = 1000;
+                   scene.grow_extent[0] = 18.0f;
+                   scene.grow_extent[1] = 18.0f;
+                   scene.grow_extent[2] = 18.0f;
+                   return scene;
+                 }};
+  run_scene(spec, 6);
+}
+
 TEST_CASE("sparse moving sets with multi-point cells stay exact") {
   // A sparse cloud small enough that several cells hold two or three points.
   // Those cells take the direct neighborhood scan around the unique-cell
