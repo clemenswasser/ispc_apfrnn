@@ -36,8 +36,6 @@ experiment log.
   because it decides which algorithms are possible.
 - The GPU backend is out of scope. Keep the code, but do not work on it.
 - The project is neighbor search only. Do not add simulation or consumer code.
-- `set_skin` stays only if it wins on all moving scenes. Otherwise remove the
-  feature entirely.
 - Tune on the local i7-12700K. Derive cache and SIMD assumptions instead of
   hardcoding them, so wins carry over to other CPUs.
 

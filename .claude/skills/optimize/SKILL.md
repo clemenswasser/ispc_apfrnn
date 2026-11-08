@@ -48,8 +48,8 @@ Floors are estimates, so refine them when evidence disagrees.
 ### 2. Algorithm search
 
 Prototype the algorithm families as throwaway versions, including grid and sort
-variants, frame-to-frame coherence, skin lists, half lists, compact list formats
-and library-owned particle reordering. Give each family enough work to be
+variants, frame-to-frame coherence, half lists, compact list formats and
+library-owned particle reordering. Give each family enough work to be
 competent, then fund the most promising and drop the rest. Prototypes do not
 need production quality, and they are not committed until they win.
 
