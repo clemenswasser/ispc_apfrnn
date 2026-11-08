@@ -1619,54 +1619,6 @@ inline void build_dense_stencil9_ranges_impl(
                  });
 }
 
-inline void build_merged_dense_cell_ranges(
-    int num_cells, const std::vector<uint64_t> &unique_keys,
-    const NeighborSearchData &target, IntBuffer &cell_num_neighbors,
-    IntBuffer &cell_neighbor_offset, IntBuffer &cell_neighbor_starts,
-    IntBuffer &cell_neighbor_ends) {
-  cell_num_neighbors.resize(num_cells);
-  cell_neighbor_offset.resize(num_cells);
-
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_cells, cell_grain(num_cells)),
-      [&](const tbb::blocked_range<int> &range) {
-        const ispc::Cells queries = key_cells(unique_keys);
-        const ispc::DenseGrid grid = dense_of(target);
-        const ispc::Cells targets = cells_of(target);
-        ispc::merge_dense_neighbor_ranges(range.begin(), range.end(),
-            &queries, &grid, &targets, cell_num_neighbors.data(), nullptr,
-            nullptr, nullptr);
-      });
-
-  int total_cell_neighbors = tbb::parallel_scan(
-      tbb::blocked_range<int>(0, num_cells), 0,
-      [&](const tbb::blocked_range<int> &range, int sum, bool is_final_scan) {
-        int temp = sum;
-        for (int i = range.begin(); i < range.end(); ++i) {
-          if (is_final_scan) {
-            cell_neighbor_offset[i] = temp;
-          }
-          temp += cell_num_neighbors[i];
-        }
-        return temp;
-      },
-      [](int left, int right) { return left + right; });
-
-  cell_neighbor_starts.resize(total_cell_neighbors);
-  cell_neighbor_ends.resize(total_cell_neighbors);
-
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, num_cells, cell_grain(num_cells)),
-      [&](const tbb::blocked_range<int> &range) {
-        const ispc::Cells queries = key_cells(unique_keys);
-        const ispc::DenseGrid grid = dense_of(target);
-        const ispc::Cells targets = cells_of(target);
-        ispc::merge_dense_neighbor_ranges(range.begin(), range.end(),
-            &queries, &grid, &targets, nullptr, cell_neighbor_offset.data(),
-            cell_neighbor_starts.data(), cell_neighbor_ends.data());
-      });
-}
-
 // One-pass 9-probe stencil runs for a hash-grid target. This is the cross-set
 // analogue of build_hash_stencil_ranges(): the source's sorted cell keys are
 // queried against the target's cell array/hash, and the merged point runs are
@@ -2455,36 +2407,6 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
             data.dense_cache_starts.data(), data.dense_cache_ends.data());
       });
   data.dense_cache_valid = true;
-}
-
-inline int find_cell_index_cpp(const NeighborSearchData &data,
-                               uint64_t key) {
-  if (data.dense_valid) {
-    const int lx = unpack_coord(key, 42) - data.dense_min_x;
-    const int ly = unpack_coord(key, 21) - data.dense_min_y;
-    const int lz = unpack_coord(key, 0) - data.dense_min_z;
-    if (lx < 0 || lx >= data.dense_nx || ly < 0 || ly >= data.dense_ny ||
-        lz < 0 || lz >= data.dense_nz) {
-      return -1;
-    }
-    const int64_t index =
-        (static_cast<int64_t>(lz) * data.dense_ny + ly) * data.dense_nx + lx;
-    return data.dense_cells[static_cast<std::size_t>(index)];
-  }
-
-  uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
-  h64 ^= h64 >> 33;
-  uint32_t h = static_cast<uint32_t>(h64) & data.hash_mask;
-  while (true) {
-    const uint64_t ht_key = data.hash_keys[h];
-    if (ht_key == key) {
-      return data.hash_vals[h];
-    }
-    if (ht_key == data.empty_key) {
-      return -1;
-    }
-    h = (h + 1) & data.hash_mask;
-  }
 }
 
 // Hash grid with the 27-cell stencil: one pass of hash_stencil_ranges writes
