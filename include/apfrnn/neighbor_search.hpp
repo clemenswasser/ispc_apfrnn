@@ -186,6 +186,10 @@ private:
                         const std::vector<bool> &needs_same_set);
   void build_same_pair(Pair &pair, int set);
   void build_cross_pair(Pair &pair, int source, int target);
+  // Writes the reverse of a built cross pair by transposing its fixed rows;
+  // the distance test is symmetric, so both lists describe the same pairs.
+  bool transpose_cross_pair(Pair &forward, Pair &reverse, PointSet &source,
+                            PointSet &target);
   void collect_memory_stats();
 
   void build_point_grid(int set);

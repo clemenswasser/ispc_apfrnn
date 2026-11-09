@@ -116,6 +116,60 @@ TEST_CASE("native multi-set search matches brute force") {
   CHECK(search.get_neighbors(emitter_id, boundary_id, 0).empty());
 }
 
+TEST_CASE("symmetric cross pairs transpose both directions") {
+  constexpr float radius = 1.5f;
+
+  auto a = apfrnn::support::make_point_cloud(640, 10.0f, 404);
+  auto b = apfrnn::support::make_point_cloud(640, 10.0f, 405);
+  auto c = apfrnn::support::make_point_cloud(640, 10.0f, 406);
+  auto a_xyz = interleave(a);
+  auto b_xyz = interleave(b);
+  auto c_xyz = interleave(c);
+
+  apfrnn::NSearch search(radius);
+  const int a_id =
+      search.add_point_set(a_xyz.data(), static_cast<int>(a.x.size()));
+  const int b_id =
+      search.add_point_set(b_xyz.data(), static_cast<int>(b.x.size()));
+  const int c_id =
+      search.add_point_set(c_xyz.data(), static_cast<int>(c.x.size()));
+  search.set_all_searches(false);
+  for (int query : {a_id, b_id, c_id}) {
+    for (int target : {a_id, b_id, c_id}) {
+      search.set_active_search(query, target, true);
+    }
+  }
+  search.run();
+  check_cross_set(search, a_id, b_id, a, b, radius);
+  check_cross_set(search, b_id, a_id, b, a, radius);
+  check_cross_set(search, a_id, c_id, a, c, radius);
+  check_cross_set(search, c_id, a_id, c, a, radius);
+  check_cross_set(search, b_id, c_id, b, c, radius);
+  check_cross_set(search, c_id, b_id, c, b, radius);
+
+  // The reverse lists are transposed from the forward ones. A second frame
+  // with every set moved must rebuild both directions exactly.
+  translate(a, 0.09f, -0.04f, 0.02f);
+  translate(b, -0.05f, 0.07f, 0.03f);
+  translate(c, 0.03f, 0.05f, -0.06f);
+  auto a_moved = interleave(a);
+  auto b_moved = interleave(b);
+  auto c_moved = interleave(c);
+  search.resize_point_set(a_id, a_moved.data(),
+                          static_cast<int>(a.x.size()));
+  search.resize_point_set(b_id, b_moved.data(),
+                          static_cast<int>(b.x.size()));
+  search.resize_point_set(c_id, c_moved.data(),
+                          static_cast<int>(c.x.size()));
+  search.run();
+  check_cross_set(search, a_id, b_id, a, b, radius);
+  check_cross_set(search, b_id, a_id, b, a, radius);
+  check_cross_set(search, a_id, c_id, a, c, radius);
+  check_cross_set(search, c_id, a_id, c, a, radius);
+  check_cross_set(search, b_id, c_id, b, c, radius);
+  check_cross_set(search, c_id, b_id, c, b, radius);
+}
+
 TEST_CASE("native search updates dynamic sets after move and resize") {
   constexpr float radius = 1.2f;
 

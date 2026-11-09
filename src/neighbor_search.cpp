@@ -755,17 +755,99 @@ void NSearch::run() {
         pending.push_back(index);
       }
     }
+    // All-to-all scenes test the same point pairs for (i,j) and (j,i). When
+    // both directions use equal-size dense sets and fixed rows, build one
+    // direction and transpose its rows into the other.
+    auto can_transpose = [&](int i, int j) {
+      const PointSet &a = sets_[static_cast<std::size_t>(i)];
+      const PointSet &b = sets_[static_cast<std::size_t>(j)];
+      if (!a.valid || !b.valid || a.use_sweep || b.use_sweep ||
+          !a.data.dense_valid || !b.data.dense_valid ||
+          a.data.cell_stencil != 1 || b.data.cell_stencil != 1 ||
+          a.data.cell_radius != b.data.cell_radius ||
+          a.data.num_points != b.data.num_points ||
+          a.data.num_points < 512 ||
+          a.data.num_points >= kCrossBlockMinPoints) {
+        return false;
+      }
+      const Pair &forward = pairs_[static_cast<std::size_t>(i)]
+                                  [static_cast<std::size_t>(j)];
+      const Pair &reverse = pairs_[static_cast<std::size_t>(j)]
+                                  [static_cast<std::size_t>(i)];
+      if (!forward.active || !reverse.active || forward.valid ||
+          reverse.valid) {
+        return false;
+      }
+      const plan::CrossPlan forward_plan = plan::cross_set(
+          a.data, a.last_fixed_capacity, b.data, forward.last_fixed_capacity,
+          memory_budget_);
+      const plan::CrossPlan reverse_plan = plan::cross_set(
+          b.data, b.last_fixed_capacity, a.data, reverse.last_fixed_capacity,
+          memory_budget_);
+      return forward_plan.fixed_rows && reverse_plan.fixed_rows &&
+             forward_plan.first_capacity > 0 &&
+             reverse_plan.first_capacity > 0;
+    };
+    std::vector<int> transpose_reverse(jobs.size(), -1);
+    std::vector<char> transposed(jobs.size(), 0);
+    {
+      std::vector<int> index(static_cast<std::size_t>(set_count) *
+                                 static_cast<std::size_t>(set_count),
+                             -1);
+      for (std::size_t k = 0; k < jobs.size(); ++k) {
+        index[static_cast<std::size_t>(jobs[k].set_i) *
+                  static_cast<std::size_t>(set_count) +
+              static_cast<std::size_t>(jobs[k].set_j)] = static_cast<int>(k);
+      }
+      for (int i = 0; i < set_count; ++i) {
+        for (int j = i + 1; j < set_count; ++j) {
+          const int forward =
+              index[static_cast<std::size_t>(i) *
+                        static_cast<std::size_t>(set_count) +
+                    static_cast<std::size_t>(j)];
+          const int reverse =
+              index[static_cast<std::size_t>(j) *
+                        static_cast<std::size_t>(set_count) +
+                    static_cast<std::size_t>(i)];
+          if (forward < 0 || reverse < 0 || !can_transpose(i, j)) {
+            continue;
+          }
+          transpose_reverse[static_cast<std::size_t>(forward)] = reverse;
+          transposed[static_cast<std::size_t>(reverse)] = 1;
+        }
+      }
+    }
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, pending.size(), 1),
         [&](const tbb::blocked_range<std::size_t> &range) {
           for (std::size_t slot = range.begin(); slot < range.end(); ++slot) {
             const std::size_t index = pending[slot];
+            if (transposed[index]) {
+              continue;
+            }
             const Job job = jobs[index];
             Pair &pair = pairs_[static_cast<std::size_t>(job.set_i)]
                                [static_cast<std::size_t>(job.set_j)];
             const auto pair_start = std::chrono::steady_clock::now();
             build_cpu_pair(pair, job.set_i, job.set_j);
             pair_times[index] = elapsed_ms(pair_start);
+            const int reverse_index = transpose_reverse[index];
+            if (reverse_index >= 0) {
+              const Job reverse_job = jobs[static_cast<std::size_t>(
+                  reverse_index)];
+              Pair &reverse = pairs_[static_cast<std::size_t>(
+                                         reverse_job.set_i)]
+                                     [static_cast<std::size_t>(
+                                         reverse_job.set_j)];
+              const auto transpose_start = std::chrono::steady_clock::now();
+              if (!transpose_cross_pair(
+                      pair, reverse, sets_[static_cast<std::size_t>(job.set_i)],
+                      sets_[static_cast<std::size_t>(job.set_j)])) {
+                build_cpu_pair(reverse, reverse_job.set_i, reverse_job.set_j);
+              }
+              pair_times[static_cast<std::size_t>(reverse_index)] =
+                  elapsed_ms(transpose_start);
+            }
           }
         });
     parallel_pairs_ = false;
@@ -2512,6 +2594,82 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   pair.cross_block_source_points = num_points;
   pair.cross_block_target_points = target.data.num_points;
   pair.cross_block_valid = true;
+  return true;
+}
+
+bool NSearch::transpose_cross_pair(Pair &forward, Pair &reverse,
+                                   PointSet &source, PointSet &target) {
+  const int n = source.data.num_points;
+  if (!forward.fixed_valid || forward.cross_block_active ||
+      forward.fixed_capacity <= 0 || forward.same_set || n == 0 ||
+      target.data.num_points != n ||
+      forward.fixed_counts.size() != static_cast<std::size_t>(n)) {
+    return false;
+  }
+  const plan::CrossPlan reverse_plan = plan::cross_set(
+      target.data, target.last_fixed_capacity, source.data,
+      reverse.last_fixed_capacity, memory_budget_);
+  if (!reverse_plan.fixed_rows || reverse_plan.first_capacity <= 0) {
+    return false;
+  }
+  const int capacity = reverse_plan.first_capacity;
+  const int reverse_stride = capacity + row_slack();
+  const std::size_t rows = static_cast<std::size_t>(n);
+  const std::size_t required =
+      rows * static_cast<std::size_t>(reverse_stride);
+  reverse.fixed_counts.resize(rows);
+  if (required > reverse.fixed_neighbors.capacity() ||
+      2 * required < reverse.fixed_neighbors.capacity()) {
+    IntBuffer().swap(reverse.fixed_neighbors);
+  }
+  reverse.fixed_neighbors.resize(required);
+  std::fill(reverse.fixed_counts.begin(), reverse.fixed_counts.end(), 0);
+  const int forward_stride = forward.fixed_capacity;
+  const int *forward_counts = forward.fixed_counts.data();
+  const int *forward_rows = forward.fixed_neighbors.data();
+  const int *source_original = source.data.original_index.data();
+  const int *target_to_sorted = target.original_to_sorted.data();
+  int *reverse_counts = reverse.fixed_counts.data();
+  int *reverse_rows = reverse.fixed_neighbors.data();
+  bool overflow = false;
+  for (int row = 0; row < n; ++row) {
+    const int count = forward_counts[row];
+    if (count <= 0) {
+      continue;
+    }
+    const int source_id = source_original[row];
+    const int *neighbors =
+        forward_rows + static_cast<std::size_t>(row) *
+                           static_cast<std::size_t>(forward_stride);
+    for (int k = 0; k < count; ++k) {
+      const int reverse_row = target_to_sorted[neighbors[k]];
+      int &filled = reverse_counts[reverse_row];
+      if (filled < capacity) {
+        reverse_rows[static_cast<std::size_t>(reverse_row) *
+                         static_cast<std::size_t>(reverse_stride) +
+                     filled] = source_id;
+      } else {
+        overflow = true;
+      }
+      ++filled;
+    }
+  }
+  if (overflow) {
+    return false;
+  }
+  int max_count = 0;
+  for (int row = 0; row < n; ++row) {
+    max_count = std::max(max_count, reverse_counts[row]);
+  }
+  reverse.fixed_max_count = max_count;
+  reverse.fixed_capacity = reverse_stride;
+  reverse.last_fixed_capacity =
+      plan::cross_fitted_capacity(max_count, capacity);
+  reverse.fixed_valid = true;
+  reverse.cross_block_active = false;
+  reverse.same_set = false;
+  reverse.valid = true;
+  reverse.cross.radius = radius_;
   return true;
 }
 
