@@ -1600,7 +1600,7 @@ inline void build_dense_stencil9_ranges_impl(
   ensure_cell_ranges(const_cast<NeighborSearchData &>(target));
   use_own_ranges(data);
   const int num_cells = data.num_cells;
-  data.cell_num_neighbors.assign(static_cast<std::size_t>(num_cells), 9);
+  data.cell_num_neighbors.resize(static_cast<std::size_t>(num_cells));
   data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
   for (int cell = 0; cell < num_cells; ++cell) {
     data.cell_neighbor_offset[static_cast<std::size_t>(cell)] = cell * 9;
@@ -1618,7 +1618,8 @@ inline void build_dense_stencil9_ranges_impl(
                    ispc::dense_stencil9_ranges(
                        begin, end, &queries, &grid, &targets,
                        data.cell_neighbor_starts.data(),
-                       data.cell_neighbor_ends.data());
+                       data.cell_neighbor_ends.data(),
+                       data.cell_num_neighbors.data());
                  });
 }
 
@@ -2392,7 +2393,7 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
     }
   }
   data.dense_cache_offsets.resize(static_cast<std::size_t>(total));
-  data.dense_cache_counts.assign(static_cast<std::size_t>(total), 9);
+  data.dense_cache_counts.resize(static_cast<std::size_t>(total));
   data.dense_cache_starts.resize(static_cast<std::size_t>(total) * 9);
   data.dense_cache_ends.resize(static_cast<std::size_t>(total) * 9);
   for (int cell = 0; cell < total; ++cell) {
@@ -2406,7 +2407,8 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
         const ispc::Cells targets = cells_of(data);
         ispc::dense_stencil9_ranges(
             range.begin(), range.end(), &queries, &grid, &targets,
-            data.dense_cache_starts.data(), data.dense_cache_ends.data());
+            data.dense_cache_starts.data(), data.dense_cache_ends.data(),
+            data.dense_cache_counts.data());
       });
   data.dense_cache_valid = true;
 }

@@ -375,7 +375,7 @@ export void dense_stencil9_ranges(
     const uniform Cells *uniform queries_in,
     const uniform DenseGrid *uniform grid_in,
     const uniform Cells *uniform targets_in, uniform int out_starts[],
-    uniform int out_ends[]) {
+    uniform int out_ends[], uniform int out_counts[]) {
   const uniform Cells queries = *queries_in;
   const uniform DenseGrid grid = *grid_in;
   const uniform Cells targets = *targets_in;
@@ -413,10 +413,15 @@ export void dense_stencil9_ranges(
           run_start = run_start < 0 ? start : min(run_start, start);
           run_end = run_end < 0 ? end : max(run_end, end);
         }
-        out_starts[base + slot] = run_start < 0 ? 0 : run_start;
-        out_ends[base + slot] = run_start < 0 ? 0 : run_end;
-        ++slot;
+        // Only occupied columns take a run slot, so the writer loops over
+        // the columns that exist instead of all nine.
+        if (run_start >= 0) {
+          out_starts[base + slot] = run_start;
+          out_ends[base + slot] = run_end;
+          ++slot;
+        }
       }
     }
+    out_counts[cell] = slot;
   }
 }
