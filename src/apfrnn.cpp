@@ -2665,9 +2665,9 @@ static inline void hash_column_runs_scalar(
   }
 }
 
-// Hash grid with the 27-cell stencil: one pass of hash_stencil_ranges writes
-// every cell's merged runs into fixed slots, instead of collecting the 27
-// neighbor cells and merging them in a count pass, a scan and a write pass.
+// Hash grid with the 27-cell stencil: one pass writes every cell's merged
+// runs into fixed slots, instead of collecting the 27 neighbor cells and
+// merging them in a count pass, a scan and a write pass.
 static void build_hash_stencil_ranges(NeighborSearchData &data) {
   ensure_cell_ranges(data);
   ensure_hash_table(data);
