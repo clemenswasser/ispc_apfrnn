@@ -1220,20 +1220,32 @@ inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
   ht_keys.assign(hash_capacity, empty_key);
   ht_vals.assign(hash_capacity, -1);
   control.assign(hash_capacity, 0x80);
-
-  for (int cell = 0; cell < static_cast<int>(unique_keys.size()); ++cell) {
-    uint64_t key = unique_keys[cell];
-    uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
-    h64 ^= h64 >> 33;
-    uint32_t h = static_cast<uint32_t>(h64) & hash_mask;
-
-    while (ht_keys[h] != empty_key) {
-      h = (h + 1) & hash_mask;
-    }
-    ht_keys[h] = key;
-    ht_vals[h] = cell;
-    control[h] = static_cast<uint8_t>(h64 >> 56) & 0x7f;
-  }
+  const int num_keys = static_cast<int>(unique_keys.size());
+  // The inserts are independent, so the chunks claim slots with a compare
+  // exchange and the probe chains overlap across threads. The table is not
+  // read until the build returns, so the value and control stores can follow
+  // the key claim without ordering.
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_keys, 4096),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int cell = range.begin(); cell < range.end(); ++cell) {
+          const uint64_t key = unique_keys[static_cast<std::size_t>(cell)];
+          uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+          h64 ^= h64 >> 33;
+          uint32_t h = static_cast<uint32_t>(h64) & hash_mask;
+          for (;;) {
+            uint64_t expected = empty_key;
+            if (__atomic_compare_exchange_n(&ht_keys[h], &expected, key, false,
+                                            __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED)) {
+              ht_vals[h] = cell;
+              control[h] = static_cast<uint8_t>(h64 >> 56) & 0x7f;
+              break;
+            }
+            h = (h + 1) & hash_mask;
+          }
+        }
+      });
 }
 
 inline void build_dense_cell_lookup(NeighborSearchData &data) {
