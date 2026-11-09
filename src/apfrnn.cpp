@@ -2554,6 +2554,114 @@ static inline void hash_cell_runs_scalar(
   out_count[cell] = runs;
 }
 
+// One (cx, cy) column group's runs, scalar. The nine probes for the group's
+// first cell seed a z chain per neighbor column; each later cell advances the
+// chain with an array successor, so a group costs one probe set instead of one
+// probe set per cell.
+static inline void hash_column_runs_scalar(
+    const ScalarHashTable &hash, const uint64_t *target_keys,
+    const int *target_starts, const int *target_ends, int num_target_cells,
+    const uint64_t *group_keys, int begin, int end, int slots,
+    int *out_starts, int *out_ends, int *out_offset, int *out_count) {
+  const uint64_t first_key = group_keys[begin];
+  const int cx = unpack_coord(first_key, 42);
+  const int cy = unpack_coord(first_key, 21);
+  uint64_t column_key[9];
+  int prev[9];
+  int cur[9];
+  int next[9];
+  for (int k = 0; k < 9; ++k) {
+    column_key[k] = make_key(cx + k / 3 - 1, cy + k % 3 - 1, 0) &
+                    ~uint64_t{0x1FFFFF};
+  }
+  auto key_at = [&](int k, int z) {
+    return column_key[k] | (static_cast<uint64_t>(z) & 0x1FFFFF);
+  };
+  auto seed = [&](int z, int cell) {
+    for (int k = 0; k < 9; ++k) {
+      uint8_t fingerprint;
+      uint64_t want = key_at(k, z);
+      uint32_t h = static_cast<uint32_t>(
+          hash_slot(want, hash.mask, fingerprint));
+      cur[k] = scalar_hash_probe(hash, want, h, fingerprint);
+      if (cur[k] >= 0) {
+        prev[k] = (cur[k] > 0 && target_keys[cur[k] - 1] == key_at(k, z - 1))
+                      ? cur[k] - 1
+                      : -1;
+        next[k] = (cur[k] + 1 < num_target_cells &&
+                   target_keys[cur[k] + 1] == key_at(k, z + 1))
+                      ? cur[k] + 1
+                      : -1;
+        continue;
+      }
+      want = key_at(k, z - 1);
+      h = static_cast<uint32_t>(hash_slot(want, hash.mask, fingerprint));
+      prev[k] = scalar_hash_probe(hash, want, h, fingerprint);
+      want = key_at(k, z + 1);
+      h = static_cast<uint32_t>(hash_slot(want, hash.mask, fingerprint));
+      next[k] = scalar_hash_probe(hash, want, h, fingerprint);
+    }
+  };
+  // Shifts the chain from z to z + 1: prev becomes the cell at z, cur the
+  // cell at z + 1 and next the cell at z + 2.
+  auto advance = [&](int z) {
+    for (int k = 0; k < 9; ++k) {
+      prev[k] = cur[k];
+      cur[k] = next[k];
+      const uint64_t want = key_at(k, z + 2);
+      if (cur[k] >= 0) {
+        const int successor = cur[k] + 1;
+        next[k] = (successor < num_target_cells &&
+                   target_keys[successor] == want)
+                      ? successor
+                      : -1;
+      } else {
+        uint8_t fingerprint;
+        const uint32_t h = static_cast<uint32_t>(
+            hash_slot(want, hash.mask, fingerprint));
+        next[k] = scalar_hash_probe(hash, want, h, fingerprint);
+      }
+    }
+  };
+  int z = unpack_coord(first_key, 0);
+  seed(z, begin);
+  for (int cell = begin; cell < end; ++cell) {
+    const int base_slot = cell * slots;
+    int runs = 0;
+    int run_start = -1;
+    int run_end = -1;
+    for (int k = 0; k < 9; ++k) {
+      const int first =
+          prev[k] >= 0 ? prev[k] : (cur[k] >= 0 ? cur[k] : next[k]);
+      const int last =
+          next[k] >= 0 ? next[k] : (cur[k] >= 0 ? cur[k] : prev[k]);
+      if (first >= 0) {
+        scalar_append_run(target_starts[first], target_ends[last], base_slot,
+                          runs, run_start, run_end, out_starts, out_ends);
+      }
+    }
+    if (run_start >= 0) {
+      out_starts[base_slot + runs] = run_start;
+      out_ends[base_slot + runs] = run_end;
+      ++runs;
+    }
+    out_offset[cell] = base_slot;
+    out_count[cell] = runs;
+    if (cell + 1 < end) {
+      const int next_z = unpack_coord(group_keys[cell + 1], 0);
+      if (next_z - z > 2) {
+        z = next_z;
+        seed(z, cell + 1);
+      } else {
+        while (z < next_z) {
+          advance(z);
+          ++z;
+        }
+      }
+    }
+  }
+}
+
 // Hash grid with the 27-cell stencil: one pass of hash_stencil_ranges writes
 // every cell's merged runs into fixed slots, instead of collecting the 27
 // neighbor cells and merging them in a count pass, a scan and a write pass.
@@ -2591,13 +2699,29 @@ static void build_hash_stencil_ranges(NeighborSearchData &data) {
   const int *starts = data.cell_starts.data();
   const int *ends = data.cell_ends.data();
   parallel_cells(0, num_cells, cell_grain(num_cells), [&](int begin, int end) {
-    for (int cell = begin; cell < end; ++cell) {
-      hash_cell_runs_scalar(hash, keys, starts, ends, num_cells, keys[cell],
-                            slots, split_z,
-                            data.cell_neighbor_starts.data(),
-                            data.cell_neighbor_ends.data(),
-                            data.cell_neighbor_offset.data(),
-                            data.cell_num_neighbors.data(), cell);
+    if (split_z) {
+      for (int cell = begin; cell < end; ++cell) {
+        hash_cell_runs_scalar(hash, keys, starts, ends, num_cells, keys[cell],
+                              slots, split_z,
+                              data.cell_neighbor_starts.data(),
+                              data.cell_neighbor_ends.data(),
+                              data.cell_neighbor_offset.data(),
+                              data.cell_num_neighbors.data(), cell);
+      }
+      return;
+    }
+    int cell = begin;
+    while (cell < end) {
+      const uint64_t column = keys[cell] >> 21;
+      int column_end = cell + 1;
+      while (column_end < end && (keys[column_end] >> 21) == column) {
+        ++column_end;
+      }
+      hash_column_runs_scalar(
+          hash, keys, starts, ends, num_cells, keys, cell, column_end, slots,
+          data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data(),
+          data.cell_neighbor_offset.data(), data.cell_num_neighbors.data());
+      cell = column_end;
     }
   });
   data.hash_range_keys = data.scratch_unique_keys;
