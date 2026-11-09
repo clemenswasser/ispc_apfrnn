@@ -28,6 +28,7 @@
     { "action": "edit", "resource": "*.githooks/*", "effect": "deny" },
     { "action": "edit", "resource": "*scripts/agent_check.py", "effect": "deny" },
     { "action": "edit", "resource": "*scripts/perf_evidence.sh", "effect": "deny" },
+    { "action": "edit", "resource": "*scripts/ab.py", "effect": "deny" },
     { "action": "edit", "resource": "*scripts/bench_tables.py", "effect": "deny" },
     { "action": "edit", "resource": "*bench/scenes.hpp", "effect": "deny" },
     { "action": "edit", "resource": "*bench/search_bench.cpp", "effect": "deny" },

@@ -73,7 +73,9 @@ scenes do not notice.
 3. Implement it generally, not for one scene.
 4. Run `scripts/perf_evidence.sh <id> after '<regex>'`. Add kernel names as extra
    arguments to get an `llvm-mca` report.
-5. Compare timing in a paired A/B, in the quiet profile, on the same scene.
+5. Compare timing with `scripts/ab.py` in the quiet profile. It builds the base
+   commit in `build-ab/` and alternates it with your build. Iterate with the
+   default quick tier or `--filter` on the target scene.
 6. Explain the result from the data, including whether the prediction held.
 7. If it lost, keep digging until you can say whether the loss is `local` (this
    implementation) or `global` (the design). A local loss is the next experiment.
@@ -81,10 +83,11 @@ scenes do not notice.
 
 ## Accepting a change
 
-- It beats noise on the target scene (at least 2 standard deviations across
-  repeated paired runs).
-- No other scene gets slower beyond noise. Check the full matrix, not a subset.
+- `scripts/ab.py` reports the target scene as `faster`.
+- `scripts/ab.py --tier full` reports no scene as `slower`. Confirm flagged
+  scenes with the command it prints before you act on them.
 - Tests and checksums pass.
+- Speed wins over memory. Report the memory change either way.
 
 The full matrix and `scripts/ci.sh` together take about an hour, so run them
 per batch, not per commit:
@@ -98,7 +101,6 @@ per batch, not per commit:
   batch and fix or revert it before starting new work.
 - Run long jobs in the background and keep working on the next experiment.
   Never wait idle for a job or a time of day.
-- Speed wins over memory. Report the memory change either way.
 
 Competitors are measured for the README and as a must-not-lose check. They are
 not the objective, because beating them is not the limit.

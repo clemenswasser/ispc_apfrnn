@@ -24,6 +24,7 @@ PROTECTED = (
     ".githooks/",
     "scripts/agent_check.py",
     "scripts/perf_evidence.sh",
+    "scripts/ab.py",
     "scripts/bench_tables.py",
     "bench/scenes.hpp",
     "bench/search_bench.cpp",
