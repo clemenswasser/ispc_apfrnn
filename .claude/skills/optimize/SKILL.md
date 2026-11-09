@@ -85,6 +85,19 @@ scenes do not notice.
   repeated paired runs).
 - No other scene gets slower beyond noise. Check the full matrix, not a subset.
 - Tests and checksums pass.
+
+The full matrix and `scripts/ci.sh` together take about an hour, so run them
+per batch, not per commit:
+
+- Per commit: `scripts/ab.py --filter` on the target scenes plus the quick
+  tier, and the Release tests.
+- Per batch (every few commits, or every few hours): `scripts/ab.py --base
+  <last verified commit> --tier full`, then `scripts/ci.sh`. A change is done
+  when its batch passes both.
+- If a batch fails, find the responsible commit with `--filter` runs over the
+  batch and fix or revert it before starting new work.
+- Run long jobs in the background and keep working on the next experiment.
+  Never wait idle for a job or a time of day.
 - Speed wins over memory. Report the memory change either way.
 
 Competitors are measured for the README and as a must-not-lose check. They are

@@ -47,7 +47,9 @@ experiment log.
 - Do not add a code path unless it earns its place by measurement. Removing a
   path that costs nothing is a win.
 - New stateful or incremental paths need multi-frame tests.
-- `scripts/ci.sh` must pass before a change is called done.
+- `scripts/ci.sh` must pass before a change is called done. It may run once
+  for a batch of commits (see the `optimize` skill); a failing batch is fixed
+  or reverted before new work starts.
 
 ## Documents
 
