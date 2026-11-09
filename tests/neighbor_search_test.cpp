@@ -1784,6 +1784,50 @@ TEST_CASE("block rows stay exact through motion and back to rest") {
   check_same_set(search, id, cloud, 1.7f);
 }
 
+TEST_CASE("budget-forced per-point rows stay exact through moving frames") {
+  // Above the fixed-row point cap with a budget that only fits per-point
+  // rows, the moving block layout must keep its per-point capacities across
+  // frames and stay exact.
+  constexpr int kPoints = 4050000;
+  constexpr float kRadius = 2.0f;
+  auto cloud = apfrnn::support::make_point_cloud(kPoints, 159.4f, 31);
+  auto xyz = interleave(cloud);
+  apfrnn::NSearch search(kRadius);
+  search.set_memory_budget(int64_t(3) << 29);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+
+  const auto compare = [&](int frame) {
+    CAPTURE(frame);
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathGridDense) != 0);
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathSameBlockRows) !=
+          0);
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathSameBlocked) == 0);
+    for (const int point : {0, kPoints / 2, kPoints - 1}) {
+      CAPTURE(point);
+      CHECK(sorted_neighbors(search.get_neighbors(id, id, point)) ==
+            apfrnn::support::exact_neighbors_for(cloud, point, kRadius));
+    }
+  };
+  search.run();
+  compare(0);
+
+  std::mt19937 generator(7);
+  std::uniform_real_distribution<float> jitter(-0.1f, 0.1f);
+  for (int frame = 1; frame <= 2; ++frame) {
+    for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+      cloud.x[i] += jitter(generator);
+      cloud.y[i] += jitter(generator);
+      cloud.z[i] += jitter(generator);
+    }
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    compare(frame);
+  }
+}
+
 TEST_CASE("hash-grid stencil ranges are exact across the zero cell layer") {
   // Cell keys store z as an unsigned 21-bit field. The radix sort (16384+
   // points) orders raw keys, so a column's z = -1 cell sorts after its

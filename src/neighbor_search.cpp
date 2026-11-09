@@ -2043,7 +2043,13 @@ bool NSearch::build_moving_block_rows(int set) {
           std::max(0, point_set.moving_check_wait - 1);
       return false;
     }
-    if (!plan::prefer_block_rows(
+    // When the budget cannot hold fixed rows, per-point rows are the only
+    // row layout the plan can use, so keep them even when their saving over
+    // the fixed layout is small.
+    const plan::SamePlan same_plan =
+        plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
+    if (same_plan.fixed_rows &&
+        !plan::prefer_block_rows(
             plan::same_fixed_slots(point_set.fixed_counts),
             plan::same_moving_slots(point_set.fixed_counts))) {
       point_set.moving_check_wait = 16;
