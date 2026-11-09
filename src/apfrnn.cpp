@@ -104,7 +104,10 @@ inline void prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
                                std::size_t num_points, int row_stride) {
   const std::size_t required = num_points * static_cast<std::size_t>(row_stride);
   counts.resize(num_points);
-  if (required > values.capacity() || 2 * required < values.capacity()) {
+  // Shrink once the waste passes a quarter of the buffer: a fitted capacity
+  // can be far below the first guess, and the old rule kept the larger
+  // buffer resident for the rest of the run.
+  if (required > values.capacity() || 4 * required < 3 * values.capacity()) {
     IntBuffer().swap(values);
   }
   values.resize(required);
