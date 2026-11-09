@@ -2413,6 +2413,135 @@ inline void build_dense_range_cache(NeighborSearchData &data) {
   data.dense_cache_valid = true;
 }
 
+// Scalar hash lookup for the range builder. The first probe loads the control
+// byte, the stored key and the value together so the nine independent column
+// probes of a cell can overlap; the ISPC gather serializes them instead.
+struct ScalarHashTable {
+  const uint64_t *keys;
+  const int *vals;
+  const uint8_t *control;
+  uint32_t mask;
+};
+
+static inline uint64_t hash_slot(uint64_t key, uint32_t mask,
+                                 uint8_t &fingerprint) {
+  uint64_t h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+  h64 ^= h64 >> 33;
+  fingerprint = static_cast<uint8_t>(h64 >> 56) & 0x7f;
+  return static_cast<uint32_t>(h64) & mask;
+}
+
+static inline int scalar_hash_probe(const ScalarHashTable &hash, uint64_t key,
+                                    uint32_t h, uint8_t fingerprint) {
+  for (;;) {
+    const uint8_t control = hash.control[h];
+    if (control == 0x80) {
+      return -1;
+    }
+    if (control == fingerprint && hash.keys[h] == key) {
+      return hash.vals[h];
+    }
+    h = (h + 1) & hash.mask;
+  }
+}
+
+static inline void scalar_append_run(int start, int end, int base, int &runs,
+                                     int &run_start, int &run_end,
+                                     int *out_starts, int *out_ends) {
+  if (start == run_end) {
+    run_end = end;
+    return;
+  }
+  if (run_start >= 0) {
+    out_starts[base + runs] = run_start;
+    out_ends[base + runs] = run_end;
+    ++runs;
+  }
+  run_start = start;
+  run_end = end;
+}
+
+// One cell's nine column runs, scalar. The nine z = cz - 1 probes are issued
+// first so their cache misses overlap.
+static inline void hash_cell_runs_scalar(
+    const ScalarHashTable &hash, const uint64_t *target_keys,
+    const int *target_starts, const int *target_ends, int num_target_cells,
+    uint64_t key, int slots, bool split_z, int *out_starts, int *out_ends,
+    int *out_offset, int *out_count, int cell) {
+  const int cx = unpack_coord(key, 42);
+  const int cy = unpack_coord(key, 21);
+  const int cz = unpack_coord(key, 0);
+  uint32_t h[9];
+  uint8_t fingerprint[9];
+  uint64_t want[9];
+  uint8_t control[9];
+  uint64_t stored[9];
+  int value[9];
+  for (int k = 0; k < 9; ++k) {
+    const int dx = k / 3 - 1;
+    const int dy = k % 3 - 1;
+    want[k] = make_key(cx + dx, cy + dy, cz - 1);
+    h[k] = static_cast<uint32_t>(hash_slot(want[k], hash.mask, fingerprint[k]));
+    control[k] = hash.control[h[k]];
+    stored[k] = hash.keys[h[k]];
+    value[k] = hash.vals[h[k]];
+  }
+  const int base = cell * slots;
+  int runs = 0;
+  int run_start = -1;
+  int run_end = -1;
+  for (int k = 0; k < 9; ++k) {
+    int first;
+    int last;
+    if (control[k] == fingerprint[k] && stored[k] == want[k]) {
+      first = value[k];
+    } else if (control[k] == 0x80) {
+      first = -1;
+    } else {
+      first = scalar_hash_probe(hash, want[k], h[k], fingerprint[k]);
+    }
+    last = first;
+    for (int dz = 0; dz <= 1; ++dz) {
+      const int z = cz + dz;
+      const uint64_t next_want =
+          make_key(cx + k / 3 - 1, cy + k % 3 - 1, z);
+      int found = -1;
+      if (last >= 0 && (!split_z || z != 0)) {
+        const int next = last + 1;
+        if (next < num_target_cells && target_keys[next] == next_want) {
+          found = next;
+        }
+      } else {
+        uint8_t next_fingerprint;
+        const uint32_t next_h = static_cast<uint32_t>(
+            hash_slot(next_want, hash.mask, next_fingerprint));
+        found = scalar_hash_probe(hash, next_want, next_h, next_fingerprint);
+      }
+      if (found >= 0) {
+        if (first >= 0 && found != last + 1) {
+          scalar_append_run(target_starts[first], target_ends[last], base,
+                            runs, run_start, run_end, out_starts, out_ends);
+          first = found;
+        } else if (first < 0) {
+          first = found;
+        }
+        last = found;
+      }
+    }
+    if (first >= 0) {
+      scalar_append_run(target_starts[first], target_ends[last], base, runs,
+                        run_start, run_end, out_starts, out_ends);
+    }
+  }
+  if (run_start >= 0) {
+    out_starts[base + runs] = run_start;
+    out_ends[base + runs] = run_end;
+    ++runs;
+  }
+  out_offset[cell] = base;
+  out_count[cell] = runs;
+}
+
 // Hash grid with the 27-cell stencil: one pass of hash_stencil_ranges writes
 // every cell's merged runs into fixed slots, instead of collecting the 27
 // neighbor cells and merging them in a count pass, a scan and a write pass.
@@ -2444,13 +2573,20 @@ static void build_hash_stencil_ranges(NeighborSearchData &data) {
   data.cell_neighbor_offset.resize(static_cast<std::size_t>(num_cells));
   data.cell_neighbor_starts.resize(total);
   data.cell_neighbor_ends.resize(total);
+  const ScalarHashTable hash{data.hash_keys.data(), data.hash_vals.data(),
+                             data.hash_control.data(), data.hash_mask};
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const int *starts = data.cell_starts.data();
+  const int *ends = data.cell_ends.data();
   parallel_cells(0, num_cells, cell_grain(num_cells), [&](int begin, int end) {
-    const ispc::Cells cells = cells_of(data);
-    const ispc::HashGrid hash = hash_of(data);
-    ispc::hash_stencil_ranges(
-        begin, end, &cells, &hash, &cells, num_cells, slots, split_z,
-        data.cell_neighbor_offset.data(), data.cell_num_neighbors.data(),
-        data.cell_neighbor_starts.data(), data.cell_neighbor_ends.data());
+    for (int cell = begin; cell < end; ++cell) {
+      hash_cell_runs_scalar(hash, keys, starts, ends, num_cells, keys[cell],
+                            slots, split_z,
+                            data.cell_neighbor_starts.data(),
+                            data.cell_neighbor_ends.data(),
+                            data.cell_neighbor_offset.data(),
+                            data.cell_num_neighbors.data(), cell);
+    }
   });
   data.hash_range_keys = data.scratch_unique_keys;
   data.cached_range_cell_starts = data.cell_starts;
