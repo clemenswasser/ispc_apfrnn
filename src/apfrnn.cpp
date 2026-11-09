@@ -4508,6 +4508,20 @@ void write_same_set_block_rows_parallel(
       return;
     }
   }
+  // A dense grid can derive each cell's candidate runs from the dense cell
+  // lookup, so block rows do not need the materialized range table.
+  if (data.dense_valid && data.cell_stencil == 1) {
+    const ispc::DenseGrid grid = dense_of(data);
+    constexpr int kSameGroup = 8;
+    write_block_rows_parallel(
+        data.num_cells, cell_grain(data.num_cells), capacity, counts, neighbors,
+        row_offset, row_capacity,
+        [&](int begin, int end, const ispc::FixedRows &rows) {
+          ispc::write_fixed_rows_dense(begin, end, kSameGroup, &cells, &grid,
+                                       &cells, &pts, &pts, true, r2, &rows);
+        });
+    return;
+  }
   // With cached block capacities nothing has built this grid's ranges yet
   // (every grid build clears them), and the cleared buffers still hold the
   // previous grid's ranges.
