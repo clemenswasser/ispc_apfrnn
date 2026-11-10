@@ -27,23 +27,27 @@
 namespace apfrnn::bench {
 
 // One density-style pass over all lists: each neighbor's position is fetched
-// and a kernel evaluated, so list layout and order affect the cost. `row(query,
-// target, point, visit)` calls visit(neighbor) for every neighbor.
-template <typename Row>
-inline double density_pass(const SceneData &scene, const Row &row) {
+// and a kernel evaluated, so list layout and order affect the cost.
+// `pair_reader(query, target)` is called once per active pair and returns a
+// reader; `reader(point, visit)` calls visit(neighbor) for every neighbor.
+// Each backend reads through its library's own per-pair access, as a
+// simulation looping over a pair's points would.
+template <typename PairReader>
+inline double density_pass(const SceneData &scene,
+                           const PairReader &pair_reader) {
   const float h2 = scene.radius * scene.radius;
   double total = 0.0;
   for (const auto &[query, target] : scene.pairs) {
     const float *q_xyz = scene.xyz[static_cast<std::size_t>(query)].data();
     const float *t_xyz = scene.xyz[static_cast<std::size_t>(target)].data();
+    const auto reader = pair_reader(query, target);
     total += tbb::parallel_reduce(
         tbb::blocked_range<int>(0, scene.points(query), 1024), 0.0,
-        [&, query = query, target = target](const tbb::blocked_range<int> &range,
-                                            double sum) {
+        [&](const tbb::blocked_range<int> &range, double sum) {
           for (int point = range.begin(); point != range.end(); ++point) {
             const float *q = q_xyz + 3 * static_cast<std::size_t>(point);
             float density = 0.0f;
-            row(query, target, point, [&](uint32_t neighbor) {
+            reader(point, [&](uint32_t neighbor) {
               const float *t = t_xyz + 3 * static_cast<std::size_t>(neighbor);
               const float dx = t[0] - q[0], dy = t[1] - q[1], dz = t[2] - q[2];
               const float w = std::max(0.0f, h2 - dx * dx - dy * dy - dz * dz);
@@ -128,11 +132,13 @@ public:
   }
 
   double read_lists(const SceneData &scene) const override {
-    return density_pass(scene, [this](int query, int target, int point,
-                                      auto &&visit) {
-      for (uint32_t neighbor : search_->get_neighbors(query, target, point)) {
-        visit(neighbor);
-      }
+    return density_pass(scene, [this](int query, int target) {
+      return [pair = search_->neighbors(query, target)](int point,
+                                                        auto &&visit) {
+        for (uint32_t neighbor : pair[point]) {
+          visit(neighbor);
+        }
+      };
     });
   }
 
@@ -208,13 +214,14 @@ public:
   }
 
   double read_lists(const SceneData &scene) const override {
-    return density_pass(scene, [this](int query, int target, int point,
-                                      auto &&visit) {
-      const tns::NeighborList list =
-          search_->get_neighborlist(query, target, point);
-      for (int k = 0; k < list.size(); ++k) {
-        visit(static_cast<uint32_t>(list[k]));
-      }
+    return density_pass(scene, [this](int query, int target) {
+      return [this, query, target](int point, auto &&visit) {
+        const tns::NeighborList list =
+            search_->get_neighborlist(query, target, point);
+        for (int k = 0; k < list.size(); ++k) {
+          visit(static_cast<uint32_t>(list[k]));
+        }
+      };
     });
   }
 
@@ -262,15 +269,16 @@ public:
   }
 
   double read_lists(const SceneData &scene) const override {
-    return density_pass(scene, [this](int query, int target, int point,
-                                      auto &&visit) {
+    return density_pass(scene, [this](int query, int target) {
       const auto &set = search_->point_set(static_cast<unsigned int>(query));
-      const auto p = static_cast<unsigned int>(point);
-      const auto t = static_cast<unsigned int>(target);
-      const unsigned int count = set.n_neighbors(t, p);
-      for (unsigned int k = 0; k < count; ++k) {
-        visit(set.neighbor(t, p, k));
-      }
+      return [&set, t = static_cast<unsigned int>(target)](int point,
+                                                           auto &&visit) {
+        const auto p = static_cast<unsigned int>(point);
+        const unsigned int count = set.n_neighbors(t, p);
+        for (unsigned int k = 0; k < count; ++k) {
+          visit(set.neighbor(t, p, k));
+        }
+      };
     });
   }
 
