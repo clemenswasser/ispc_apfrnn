@@ -194,8 +194,8 @@ bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
                            std::vector<SortPointKey> &scratch) {
   const int num_points = static_cast<int>(keys.size());
   if (num_points < kRadixMinPoints || num_points >= 8000000) {
-    // Very large sparse domains: comparison sort is faster than the
-    // multi-pass radix histogram on the 8M path (measured 347 vs 375 ms).
+    // Very large sparse domains: the comparison sort is faster than the
+    // multi-pass radix histogram there.
     // It compares sign-flipped keys, so the result is signed-coordinate
     // order, not raw key order.
     tbb::parallel_sort(keys.begin(), keys.end());
@@ -701,8 +701,7 @@ int parallel_compact(int count, int grain, Pred &&pred, Emit &&emit) {
 // by a per-bucket comparison sort beats the general comparison sort: the
 // buckets hold only a handful of keys. At larger changed counts (the 8M
 // sparse case) the buckets grow and the histogram/scatter passes stop paying,
-// so the caller keeps the parallel comparison sort (the measured 8M
-// behaviour). The per-bucket sort uses the same (key, index) order as the
+// so the caller keeps the parallel comparison sort. The per-bucket sort uses the same (key, index) order as the
 // comparison path, so the result is identical and deterministic.
 template <typename Less>
 bool bucket_sort_changed_keys(std::vector<SortPointKey> &keys,
@@ -714,9 +713,9 @@ bool bucket_sort_changed_keys(std::vector<SortPointKey> &keys,
   constexpr int kMaxSpan = 1 << 18;
   constexpr int kMinPoints = 65536;
   // Up to 4096 points per x-bucket: the per-bucket comparison sorts are then
-  // cache-resident and compare far fewer times than one global sort. The old
-  // 32-point guard sent every sparse 1M-8M changed-key sort to the global
-  // parallel_sort (measured 121.2 -> 114.0 ms at sparse 8M with 4096).
+  // cache-resident and compare far fewer times than one global sort. A much
+  // smaller limit sends large sparse changed-key sorts to the slower global
+  // parallel_sort.
   constexpr long long kMaxPointsPerBucket = 4096;
   if (num_points < kMinPoints || span <= 0 || span > kMaxSpan ||
       static_cast<long long>(num_points) >
@@ -3605,9 +3604,9 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   const float longest = std::max(extent_x, std::max(extent_y, extent_z));
   // Size the bitmap to the target (~64 blocks per point, capped at 16 MiB),
   // not to a fixed 500^3 grid. That keeps the expected occupancy of a block
-  // near 1.5%, so a query's radius-2 sphere is culled unless a target point
-  // really is nearby (the coarser 8-bits-per-point grid passed ~12% of
-  // queries and rescanned target cells for almost all of them).
+  // low, so a query's radius-2 sphere is culled unless a target point really
+  // is nearby; a coarser grid passes many queries that then rescan target
+  // cells.
   constexpr std::size_t kMaxBits = std::size_t{1} << 27;
   const std::size_t target_bits = std::min(
       kMaxBits, std::max<std::size_t>(1024, 64 * static_cast<std::size_t>(num_points)));

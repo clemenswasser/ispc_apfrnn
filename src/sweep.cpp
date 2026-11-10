@@ -158,9 +158,9 @@ bool should_use(const std::vector<float> &x, const std::vector<float> &y,
                 const std::vector<float> &z, const Bounds &bounds,
                 float radius) {
   const std::size_t num_points = x.size();
-  // Large sparse sets: the sparse grid now has an incremental order merge,
-  // a cursor stencil, and a log-time cell-range cross, so a fresh x-sort is
-  // no longer the cheaper option.
+  // Large sparse sets: the sparse grid has an incremental order merge, a
+  // cursor stencil and a log-time cell-range cross, so a fresh x-sort is not
+  // the cheaper option.
   if (num_points >= 1000000) {
     return false;
   }

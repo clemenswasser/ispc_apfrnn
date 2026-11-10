@@ -1647,7 +1647,7 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
   point_set.use_sweep = false;
   point_set.sweep.clear();
   // The sweep path replaced original_index with the identity, so any keys
-  // saved by an earlier grid build no longer describe this order.
+  // saved by an earlier grid build do not describe this order.
   point_set.data.incremental_valid = false;
   const float grid_radius = radius_;
   const float cell_radius = use_small_cells_ ? 0.5f * grid_radius : 0.0f;

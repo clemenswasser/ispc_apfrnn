@@ -235,7 +235,7 @@ struct NeighborSearchData {
   int cell_coord_min_z = 0;
   int cell_coord_max_z = 0;
   bool cell_coord_valid = false;
-  // Coarse occupancy bitmap of the set's points, used to prove that a cross
+  // Coarse occupancy bitmap of the set's points. It proves when a cross
   // query's search can be skipped. Built lazily and invalidated by a grid
   // rebuild.
   std::vector<uint8_t> occupancy_bits;
