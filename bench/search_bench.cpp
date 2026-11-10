@@ -143,8 +143,8 @@ struct Validation {
 // Every validated backend result is recorded by scene and backend. After the
 // run, the harness requires all backends of a scene to agree on the checksum
 // and, when the scene is small enough for the independent reference, to agree
-// with the reference pair set. A backend that returns nothing no longer
-// passes silently. Results are kept per run so a thread-count or family
+// with the reference pair set. A backend that returns nothing fails instead
+// of passing silently. Results are kept per run so a thread-count or family
 // variant cannot silently overwrite a disagreement.
 std::map<std::string,
          std::vector<std::pair<std::string, Validation>>> &

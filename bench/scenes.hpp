@@ -574,8 +574,8 @@ inline std::vector<SceneSpec> learnsph_scenes(const std::string &res,
   return scenes;
 }
 
-// The same scene with the input order left as generated. Used to quantify how
-// much the almost-z-sorted assumption matters to each backend.
+// The same scene with the input order left as generated. It shows how much
+// the almost-z-sorted assumption matters to each backend.
 inline SceneSpec unsorted_scene(SceneSpec spec) {
   spec.name += "_unsorted";
   spec.zsorted = false;
