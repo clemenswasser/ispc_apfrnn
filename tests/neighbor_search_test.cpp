@@ -312,6 +312,55 @@ TEST_CASE("native search can disable and re-enable a pair") {
   check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
 }
 
+TEST_CASE("inline reads follow state changes between moving frames") {
+  // get_neighbors reads through per-pair views built by run(). Every call that
+  // changes the search state drops them, so reads between such a call and the
+  // next run() must answer like the full lookup: out-of-range points and
+  // inactive pairs give empty lists, and the next run() is exact again.
+  constexpr float radius = 1.0f;
+  auto fluid = apfrnn::support::make_point_cloud(3000, 14.0f, 91);
+  auto boundary = apfrnn::support::make_point_cloud(800, 14.0f, 92);
+  auto boundary_xyz = interleave(boundary);
+
+  apfrnn::NSearch search(radius);
+  std::vector<float> fluid_xyz = interleave(fluid);
+  const int fluid_id =
+      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_id = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(false);
+  search.set_active_search(fluid_id, fluid_id, true);
+  search.set_active_search(fluid_id, boundary_id, true);
+
+  for (int frame = 0; frame < 6; ++frame) {
+    INFO("frame " << frame);
+    translate(fluid, 0.03f, -0.02f, 0.01f);
+    if (frame == 2) {
+      // Shrink without a run: points past the new size have no rows.
+      for (auto *axis : {&fluid.x, &fluid.y, &fluid.z}) {
+        axis->resize(2000);
+      }
+      fluid_xyz = interleave(fluid);
+      search.resize_point_set(fluid_id, fluid_xyz.data(),
+                              static_cast<int>(fluid.x.size()));
+      CHECK(search.get_neighbors(fluid_id, fluid_id, 2500).empty());
+      CHECK(search.get_neighbors(fluid_id, boundary_id, 2500).empty());
+    } else {
+      fluid_xyz = interleave(fluid);
+      search.resize_point_set(fluid_id, fluid_xyz.data(),
+                              static_cast<int>(fluid.x.size()));
+    }
+    if (frame == 4) {
+      search.set_active_search(fluid_id, boundary_id, false);
+      CHECK(search.get_neighbors(fluid_id, boundary_id, 0).empty());
+      search.set_active_search(fluid_id, boundary_id, true);
+    }
+    search.run();
+    check_same_set(search, fluid_id, fluid, radius);
+    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+  }
+}
+
 TEST_CASE("native search handles invalid arguments safely") {
   auto fluid = apfrnn::support::make_point_cloud(16, 5.0f, 77);
   auto fluid_xyz = interleave(fluid);

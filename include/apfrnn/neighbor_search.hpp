@@ -133,7 +133,42 @@ public:
 
   void run();
 
-  NeighborList get_neighbors(int set_i, int set_j, int point) const;
+  // run() resolves each pair's row layout into a RowView, so a read is a few
+  // loads and one layout test instead of the full lookup. Any call that
+  // changes the search state drops the views until the next run(); the full
+  // lookup then answers as before.
+  NeighborList get_neighbors(int set_i, int set_j, int point) const {
+    const unsigned sets = static_cast<unsigned>(view_sets_);
+    if (row_views_valid_ && static_cast<unsigned>(set_i) < sets &&
+        static_cast<unsigned>(set_j) < sets) {
+      const RowView &view =
+          row_views_[static_cast<std::size_t>(set_i) * sets +
+                     static_cast<unsigned>(set_j)];
+      if (view.kind == RowView::Empty) {
+        return {};
+      }
+      if (view.kind == RowView::Rows) {
+        if (static_cast<unsigned>(point) >= view.points) {
+          return {};
+        }
+        const int row =
+            view.to_sorted != nullptr ? view.to_sorted[point] : point;
+        if (view.counts == nullptr) {
+          const int begin = view.offsets[row];
+          return {reinterpret_cast<const uint32_t *>(view.data + begin),
+                  static_cast<std::size_t>(view.offsets[row + 1] - begin)};
+        }
+        const int count = view.counts[row];
+        const std::size_t start =
+            view.offsets != nullptr && count > view.fixed_limit
+                ? static_cast<std::size_t>(view.offsets[row])
+                : static_cast<std::size_t>(row) * view.stride;
+        return {reinterpret_cast<const uint32_t *>(view.data + start),
+                static_cast<std::size_t>(count)};
+      }
+    }
+    return get_neighbors_checked(set_i, set_j, point);
+  }
 
   int get_n_points(int set) const;
   int n_sets() const;
@@ -166,6 +201,29 @@ private:
   struct PointSet;
   struct Pair;
   struct GpuState;
+
+  // One pair's row layout, resolved after run(). A row index is the point,
+  // or to_sorted[point] when rows are in sorted order. Without counts the
+  // rows are CSR: offsets[row] to offsets[row + 1]. With counts, a row starts
+  // at offsets[row] when there are offsets and its count exceeds fixed_limit,
+  // and at row * stride otherwise.
+  struct RowView {
+    enum Kind : unsigned char { Full, Empty, Rows };
+    Kind kind = Full;
+    unsigned points = 0;
+    const int *data = nullptr;
+    const int *counts = nullptr;
+    const int *offsets = nullptr;
+    const int *to_sorted = nullptr;
+    std::size_t stride = 0;
+    int fixed_limit = -1;
+  };
+  NeighborList get_neighbors_checked(int set_i, int set_j, int point) const;
+  void run_frame();
+  void build_row_views();
+  std::vector<RowView> row_views_;
+  int view_sets_ = 0;
+  bool row_views_valid_ = false;
 
   bool valid_set(int set) const;
   // True when this grid set is only ever a source (never a cross target) and

@@ -324,6 +324,7 @@ int NSearch::add_point_set(const double *xyz, int n, bool is_static) {
 
 int NSearch::add_source(const void *xyz, bool is_double, int n,
                         bool is_static) {
+  row_views_valid_ = false;
   if (n < 0 || (n > 0 && xyz == nullptr)) {
     return -1;
   }
@@ -357,6 +358,7 @@ void NSearch::resize_point_set(int set, const double *xyz, int n) {
 }
 
 void NSearch::resize_source(int set, const void *xyz, bool is_double, int n) {
+  row_views_valid_ = false;
   if (!valid_set(set) || n < 0 || (n > 0 && xyz == nullptr)) {
     return;
   }
@@ -382,6 +384,7 @@ void NSearch::resize_source(int set, const void *xyz, bool is_double, int n) {
 }
 
 void NSearch::set_point_set_static(int set, bool is_static) {
+  row_views_valid_ = false;
   if (!valid_set(set)) {
     return;
   }
@@ -397,6 +400,7 @@ void NSearch::set_point_set_static(int set, bool is_static) {
 }
 
 void NSearch::set_active_search(int set_i, int set_j, bool active) {
+  row_views_valid_ = false;
   if (!valid_set(set_i) || !valid_set(set_j)) {
     return;
   }
@@ -407,6 +411,7 @@ void NSearch::set_active_search(int set_i, int set_j, bool active) {
 }
 
 void NSearch::set_all_searches(bool active) {
+  row_views_valid_ = false;
   for (auto &row : pairs_) {
     for (Pair &pair : row) {
       pair.active = active;
@@ -415,6 +420,7 @@ void NSearch::set_all_searches(bool active) {
 }
 
 void NSearch::update_point_sets() {
+  row_views_valid_ = false;
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     if (!sets_[static_cast<std::size_t>(set)].is_static) {
       sets_[static_cast<std::size_t>(set)].dirty = true;
@@ -462,6 +468,12 @@ const char *NSearch::path_name(uint64_t path) {
 }
 
 void NSearch::run() {
+  row_views_valid_ = false;
+  run_frame();
+  build_row_views();
+}
+
+void NSearch::run_frame() {
   last_stats_ = RunStats{};
   skipped_position_sync_ = false;
   path_bits_.store(0, std::memory_order_relaxed);
@@ -1458,7 +1470,8 @@ void NSearch::collect_memory_stats() {
   }
 }
 
-NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
+NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
+                                            int point) const {
   if (!valid_set(set_i) || !valid_set(set_j)) {
     return {};
   }
@@ -1567,6 +1580,73 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
           static_cast<std::size_t>(end - begin)};
 }
 
+// Mirrors get_neighbors_checked() for every pair: the same layout tests in
+// the same order, so the inline reader returns the same rows.
+void NSearch::build_row_views() {
+  const int set_count = static_cast<int>(sets_.size());
+  row_views_.assign(static_cast<std::size_t>(set_count) *
+                        static_cast<std::size_t>(set_count),
+                    RowView{});
+  view_sets_ = set_count;
+  for (int set_i = 0; set_i < set_count; ++set_i) {
+    const PointSet &source = sets_[static_cast<std::size_t>(set_i)];
+    for (int set_j = 0; set_j < set_count; ++set_j) {
+      const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                               [static_cast<std::size_t>(set_j)];
+      RowView &view = row_views_[static_cast<std::size_t>(set_i) *
+                                     static_cast<std::size_t>(set_count) +
+                                 static_cast<std::size_t>(set_j)];
+      if (!pair.active || !pair.valid) {
+        view.kind = RowView::Empty;
+        continue;
+      }
+      if (pair.gpu_rows) {
+        continue; // the full lookup waits for the device
+      }
+      view.kind = RowView::Rows;
+      view.points = static_cast<unsigned>(source.x.size());
+      if (pair.same_set && source.fixed_valid &&
+          source.sparse_rows_by_original) {
+        view.data = source.fixed_neighbors.data();
+        view.counts = source.fixed_counts.data();
+        view.stride = static_cast<std::size_t>(source.fixed_capacity);
+        continue;
+      }
+      view.to_sorted = source.original_to_sorted.data();
+      if (pair.same_set && source.fixed_valid) {
+        view.data = source.fixed_neighbors.data();
+        view.counts = source.fixed_counts.data();
+        if (source.block_rows) {
+          view.offsets = source.row_offset.data();
+        } else {
+          view.stride = static_cast<std::size_t>(source.fixed_capacity);
+        }
+        continue;
+      }
+      if (!pair.same_set && pair.fixed_valid) {
+        view.data = pair.fixed_neighbors.data();
+        view.counts = pair.fixed_counts.data();
+        if (pair.cross_hybrid_active) {
+          view.offsets = pair.cross_hybrid_offset.data();
+          view.fixed_limit = pair.cross_hybrid_base;
+          view.stride = static_cast<std::size_t>(pair.cross_hybrid_base +
+                                                 row_slack());
+        } else if (pair.cross_block_active) {
+          view.offsets = pair.cross_row_offset.data();
+        } else {
+          view.stride = static_cast<std::size_t>(pair.fixed_capacity);
+        }
+        continue;
+      }
+      view.data = pair.same_set ? source.data.col_idx.data()
+                                : pair.cross.col_idx.data();
+      view.offsets = pair.same_set ? source.data.row_ptr.data()
+                                   : pair.cross.row_ptr.data();
+    }
+  }
+  row_views_valid_ = true;
+}
+
 int NSearch::get_n_points(int set) const {
   if (!valid_set(set)) {
     return 0;
@@ -1575,6 +1655,7 @@ int NSearch::get_n_points(int set) const {
 }
 
 void NSearch::set_radius(float radius) {
+  row_views_valid_ = false;
   if (radius == radius_) {
     return;
   }
@@ -1597,6 +1678,7 @@ bool NSearch::gpu_available() const {
 }
 
 bool NSearch::set_search_backend(SearchBackend backend) {
+  row_views_valid_ = false;
   if (backend == SearchBackend::GpuExact && !gpu_available()) {
     return false;
   }
@@ -1673,6 +1755,7 @@ void NSearch::ensure_grid(PointSet &point_set, const Pair *building) {
 }
 
 void NSearch::set_memory_budget(int64_t bytes) {
+  row_views_valid_ = false;
   memory_budget_ = std::max<int64_t>(0, bytes);
 }
 
