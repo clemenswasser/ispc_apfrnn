@@ -3,8 +3,8 @@
 build, on our backend only.
 
 Rounds alternate the two builds (base first on even rounds, candidate first on
-odd ones), so drift in clock, temperature or background load hits both. Each
-scene's result is the mean of the per-round candidate/base log ratios. A scene
+odd ones), so drift in clock, temperature or background load hits both. Every
+scene runs in its own process. Each scene's result is the mean of the per-round candidate/base log ratios. A scene
 counts as faster or slower only when a paired t-test rejects no change at 95%
 and the change is at least 1%; the +- column is that 95% interval. Every run checks its lists against the reference and the script
 stops on a mismatch. The benchmark times a fixed window of frames per scene
@@ -136,27 +136,29 @@ def list_scenes(bench, regex, select, traces):
 
 
 def bench_once(bench, names, args, traces):
-    parts = []
+    """Times every scene in its own process, so no scene runs after another
+    scene's allocations and a small scene is not measured in a large one's
+    memory state."""
+    times = {}
     for name in names:
         family, scene = name.split("/", 1)
-        parts.append(f"{family}/{BACKEND}/{re.escape(scene)}/")
-    with tempfile.NamedTemporaryFile(suffix=".json") as out:
-        cmd = ["taskset", "-c", args.cpus, str(bench),
-               "--benchmark_filter=^(" + "|".join(parts) + ")",
-               "--benchmark_format=json", f"--benchmark_out={out.name}",
-               f"--threads={args.threads}", f"--traces={traces}"]
-        result = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            sys.exit(f"benchmark failed ({result.returncode}) in {bench}:\n"
-                     + result.stderr[-2000:])
-        data = json.loads(Path(out.name).read_text())
-    times = {}
-    for entry in data["benchmarks"]:
-        family, _, scene = entry["run_name"].split("/")[:3]
-        memory = entry.get("NeighborMB", 0.0) + entry.get("GridMB", 0.0)
-        times[f"{family}/{scene}"] = (entry["real_time"], memory,
-                                      entry.get("Frames", 0.0))
+        pattern = f"^{family}/{BACKEND}/{re.escape(scene)}/"
+        with tempfile.NamedTemporaryFile(suffix=".json") as out:
+            cmd = ["taskset", "-c", args.cpus, str(bench),
+                   f"--benchmark_filter={pattern}",
+                   "--benchmark_format=json", f"--benchmark_out={out.name}",
+                   f"--threads={args.threads}", f"--traces={traces}"]
+            result = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                sys.exit(f"benchmark failed ({result.returncode}) in {bench} "
+                         f"on {name}:\n" + result.stderr[-2000:])
+            data = json.loads(Path(out.name).read_text())
+        for entry in data["benchmarks"]:
+            run_family, _, run_scene = entry["run_name"].split("/")[:3]
+            memory = entry.get("NeighborMB", 0.0) + entry.get("GridMB", 0.0)
+            times[f"{run_family}/{run_scene}"] = (entry["real_time"], memory,
+                                                  entry.get("Frames", 0.0))
     return times
 
 
