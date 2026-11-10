@@ -20,6 +20,70 @@ struct NeighborList {
   bool empty() const { return count == 0; }
 };
 
+namespace detail {
+
+// One pair's row layout, resolved after run(). A row index is the point, or
+// to_sorted[point] when rows are in sorted order. Without counts the rows are
+// CSR: offsets[row] to offsets[row + 1]. With counts, a row starts at
+// offsets[row] when there are offsets and its count exceeds fixed_limit, and
+// at row * stride otherwise. Full means the layout needs the full lookup.
+struct RowView {
+  enum Kind : unsigned char { Full, Empty, Rows };
+  Kind kind = Full;
+  unsigned points = 0;
+  const int *data = nullptr;
+  const int *counts = nullptr;
+  const int *offsets = nullptr;
+  const int *to_sorted = nullptr;
+  std::size_t stride = 0;
+  int fixed_limit = -1;
+};
+
+// Reads one row of a Rows view; points outside the query set are empty.
+inline NeighborList read_row(const RowView &view, int point) {
+  if (static_cast<unsigned>(point) >= view.points) {
+    return {};
+  }
+  const int row = view.to_sorted != nullptr ? view.to_sorted[point] : point;
+  if (view.counts == nullptr) {
+    const int begin = view.offsets[row];
+    return {reinterpret_cast<const uint32_t *>(view.data + begin),
+            static_cast<std::size_t>(view.offsets[row + 1] - begin)};
+  }
+  const int count = view.counts[row];
+  const std::size_t start =
+      view.offsets != nullptr && count > view.fixed_limit
+          ? static_cast<std::size_t>(view.offsets[row])
+          : static_cast<std::size_t>(row) * view.stride;
+  return {reinterpret_cast<const uint32_t *>(view.data + start),
+          static_cast<std::size_t>(count)};
+}
+
+} // namespace detail
+
+class NSearch;
+
+// The neighbor lists of one active pair after run(): operator[](point) gives
+// the neighbors in the target set of a point of the query set. The pair's
+// layout is resolved once, so a loop over the points pays no per-call pair
+// lookup. Like a NeighborList, it is valid until the next call that changes
+// the search state (adding or resizing sets, activation, radius, backend,
+// memory budget or run()).
+class PairNeighbors {
+public:
+  PairNeighbors() = default;
+  inline NeighborList operator[](int point) const;
+  // Points in the query set.
+  inline int size() const;
+
+private:
+  friend class NSearch;
+  detail::RowView view_;
+  const NSearch *search_ = nullptr;
+  int set_i_ = 0;
+  int set_j_ = 0;
+};
+
 // The default backend can be preselected with APFRNN_BACKEND=cpu|gpu|auto.
 enum class SearchBackend {
   CpuExact,
@@ -133,7 +197,7 @@ public:
 
   void run();
 
-  // run() resolves each pair's row layout into a RowView, so a read is a few
+  // run() resolves each pair's row layout into a view, so a read is a few
   // loads and one layout test instead of the full lookup. Any call that
   // changes the search state drops the views until the next run(); the full
   // lookup then answers as before.
@@ -141,33 +205,32 @@ public:
     const unsigned sets = static_cast<unsigned>(view_sets_);
     if (row_views_valid_ && static_cast<unsigned>(set_i) < sets &&
         static_cast<unsigned>(set_j) < sets) {
-      const RowView &view =
+      const detail::RowView &view =
           row_views_[static_cast<std::size_t>(set_i) * sets +
                      static_cast<unsigned>(set_j)];
-      if (view.kind == RowView::Empty) {
+      if (view.kind == detail::RowView::Empty) {
         return {};
       }
-      if (view.kind == RowView::Rows) {
-        if (static_cast<unsigned>(point) >= view.points) {
-          return {};
-        }
-        const int row =
-            view.to_sorted != nullptr ? view.to_sorted[point] : point;
-        if (view.counts == nullptr) {
-          const int begin = view.offsets[row];
-          return {reinterpret_cast<const uint32_t *>(view.data + begin),
-                  static_cast<std::size_t>(view.offsets[row + 1] - begin)};
-        }
-        const int count = view.counts[row];
-        const std::size_t start =
-            view.offsets != nullptr && count > view.fixed_limit
-                ? static_cast<std::size_t>(view.offsets[row])
-                : static_cast<std::size_t>(row) * view.stride;
-        return {reinterpret_cast<const uint32_t *>(view.data + start),
-                static_cast<std::size_t>(count)};
+      if (view.kind == detail::RowView::Rows) {
+        return detail::read_row(view, point);
       }
     }
     return get_neighbors_checked(set_i, set_j, point);
+  }
+
+  // All lists of the pair (set_i searched in set_j); see PairNeighbors.
+  PairNeighbors neighbors(int set_i, int set_j) const {
+    PairNeighbors pair;
+    pair.search_ = this;
+    pair.set_i_ = set_i;
+    pair.set_j_ = set_j;
+    const unsigned sets = static_cast<unsigned>(view_sets_);
+    if (row_views_valid_ && static_cast<unsigned>(set_i) < sets &&
+        static_cast<unsigned>(set_j) < sets) {
+      pair.view_ = row_views_[static_cast<std::size_t>(set_i) * sets +
+                              static_cast<unsigned>(set_j)];
+    }
+    return pair;
   }
 
   int get_n_points(int set) const;
@@ -202,26 +265,10 @@ private:
   struct Pair;
   struct GpuState;
 
-  // One pair's row layout, resolved after run(). A row index is the point,
-  // or to_sorted[point] when rows are in sorted order. Without counts the
-  // rows are CSR: offsets[row] to offsets[row + 1]. With counts, a row starts
-  // at offsets[row] when there are offsets and its count exceeds fixed_limit,
-  // and at row * stride otherwise.
-  struct RowView {
-    enum Kind : unsigned char { Full, Empty, Rows };
-    Kind kind = Full;
-    unsigned points = 0;
-    const int *data = nullptr;
-    const int *counts = nullptr;
-    const int *offsets = nullptr;
-    const int *to_sorted = nullptr;
-    std::size_t stride = 0;
-    int fixed_limit = -1;
-  };
   NeighborList get_neighbors_checked(int set_i, int set_j, int point) const;
   void run_frame();
   void build_row_views();
-  std::vector<RowView> row_views_;
+  std::vector<detail::RowView> row_views_;
   int view_sets_ = 0;
   bool row_views_valid_ = false;
 
@@ -294,5 +341,22 @@ private:
   // Path bits of the current run; pairs and set builds may run in parallel.
   std::atomic<uint64_t> path_bits_{0};
 };
+
+inline NeighborList PairNeighbors::operator[](int point) const {
+  if (view_.kind == detail::RowView::Rows) {
+    return detail::read_row(view_, point);
+  }
+  if (view_.kind == detail::RowView::Full && search_ != nullptr) {
+    return search_->get_neighbors(set_i_, set_j_, point);
+  }
+  return {};
+}
+
+inline int PairNeighbors::size() const {
+  if (view_.kind == detail::RowView::Rows) {
+    return static_cast<int>(view_.points);
+  }
+  return search_ != nullptr ? search_->get_n_points(set_i_) : 0;
+}
 
 } // namespace apfrnn

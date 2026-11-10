@@ -361,6 +361,56 @@ TEST_CASE("inline reads follow state changes between moving frames") {
   }
 }
 
+TEST_CASE("pair views match per-point reads across moving frames") {
+  // neighbors(i, j)[point] must return the same row as get_neighbors for every
+  // point and pair: after each run, in fixed-row and in CSR layouts (a tiny
+  // memory budget forces CSR), and through the fallback after a state change.
+  constexpr float radius = 1.0f;
+  auto fluid = apfrnn::support::make_point_cloud(3000, 14.0f, 93);
+  auto boundary = apfrnn::support::make_point_cloud(800, 14.0f, 94);
+  auto boundary_xyz = interleave(boundary);
+
+  apfrnn::NSearch search(radius);
+  std::vector<float> fluid_xyz = interleave(fluid);
+  const int fluid_id =
+      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_id = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(true);
+
+  auto check_views = [&] {
+    for (int query : {fluid_id, boundary_id}) {
+      for (int target : {fluid_id, boundary_id}) {
+        const apfrnn::PairNeighbors pair = search.neighbors(query, target);
+        CHECK(pair.size() == search.get_n_points(query));
+        for (int point = -1; point <= search.get_n_points(query); ++point) {
+          const apfrnn::NeighborList row = pair[point];
+          const apfrnn::NeighborList expected =
+              search.get_neighbors(query, target, point);
+          REQUIRE(row.size() == expected.size());
+          CHECK(row.data == expected.data);
+        }
+      }
+    }
+  };
+
+  for (int frame = 0; frame < 6; ++frame) {
+    INFO("frame " << frame);
+    translate(fluid, 0.03f, -0.02f, 0.01f);
+    fluid_xyz = interleave(fluid);
+    search.resize_point_set(fluid_id, fluid_xyz.data(),
+                            static_cast<int>(fluid.x.size()));
+    check_views(); // views dropped by the resize: the fallback answers
+    if (frame == 3) {
+      search.set_memory_budget(1);
+    }
+    search.run();
+    check_views();
+    check_same_set(search, fluid_id, fluid, radius);
+    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+  }
+}
+
 TEST_CASE("native search handles invalid arguments safely") {
   auto fluid = apfrnn::support::make_point_cloud(16, 5.0f, 77);
   auto fluid_xyz = interleave(fluid);

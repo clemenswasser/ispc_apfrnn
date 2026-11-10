@@ -1586,24 +1586,25 @@ void NSearch::build_row_views() {
   const int set_count = static_cast<int>(sets_.size());
   row_views_.assign(static_cast<std::size_t>(set_count) *
                         static_cast<std::size_t>(set_count),
-                    RowView{});
+                    detail::RowView{});
   view_sets_ = set_count;
   for (int set_i = 0; set_i < set_count; ++set_i) {
     const PointSet &source = sets_[static_cast<std::size_t>(set_i)];
     for (int set_j = 0; set_j < set_count; ++set_j) {
       const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
                                [static_cast<std::size_t>(set_j)];
-      RowView &view = row_views_[static_cast<std::size_t>(set_i) *
-                                     static_cast<std::size_t>(set_count) +
-                                 static_cast<std::size_t>(set_j)];
+      detail::RowView &view =
+          row_views_[static_cast<std::size_t>(set_i) *
+                         static_cast<std::size_t>(set_count) +
+                     static_cast<std::size_t>(set_j)];
       if (!pair.active || !pair.valid) {
-        view.kind = RowView::Empty;
+        view.kind = detail::RowView::Empty;
         continue;
       }
       if (pair.gpu_rows) {
         continue; // the full lookup waits for the device
       }
-      view.kind = RowView::Rows;
+      view.kind = detail::RowView::Rows;
       view.points = static_cast<unsigned>(source.x.size());
       if (pair.same_set && source.fixed_valid &&
           source.sparse_rows_by_original) {
