@@ -16,7 +16,7 @@ cmake --build "${build_dir}" -j 8
 
 rm -f "${build_dir}"/apfrnn-*.profraw
 LLVM_PROFILE_FILE="${build_dir}/apfrnn-%p.profraw" \
-  ./"${build_dir}"/tests/ispc_apfrnn_tests >/dev/null
+  ./scripts/run_tests.sh ./"${build_dir}"/tests/ispc_apfrnn_tests >/dev/null
 
 llvm-profdata merge -sparse "${build_dir}"/apfrnn-*.profraw \
   -o "${build_dir}/apfrnn.profdata"

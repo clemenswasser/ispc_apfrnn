@@ -12,7 +12,7 @@ cmake -S . -B "${release_build}" -G Ninja \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DAPFRNN_BUILD_BASELINES=OFF
 cmake --build "${release_build}" -j 8
-ctest --test-dir "${release_build}" --output-on-failure
+./scripts/run_tests.sh "${release_build}/tests/ispc_apfrnn_tests"
 
 # Gang-width matrix: no kernel or host code may assume the 8 lanes of the
 # AVX2 default. Both targets run on any AVX2 host (avx2-i32x16 double-pumps
@@ -31,7 +31,7 @@ for target in sse4-i32x4:4 avx2-i32x16:16; do
     -DAPFRNN_BUILD_BASELINES=OFF
   cmake --build "${release_build}-${isa}" -j 8
   APFRNN_EXPECT_GANG_WIDTH="${width}" \
-    ctest --test-dir "${release_build}-${isa}" --output-on-failure
+    ./scripts/run_tests.sh "${release_build}-${isa}/tests/ispc_apfrnn_tests"
 done
 
 cmake -S . -B "${asan_build}" -G Ninja \
@@ -46,7 +46,7 @@ cmake --build "${asan_build}" -j 8
 # pointers. The fuzz test runs fewer seeds here (correctness only; the
 # Release run above checks that its seeds reach every code path).
 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ASAN_OPTIONS=detect_leaks=1 \
-  APFRNN_FUZZ_SEEDS=24 "./${asan_build}/tests/ispc_apfrnn_tests"
+  APFRNN_FUZZ_SEEDS=24 ./scripts/run_tests.sh "./${asan_build}/tests/ispc_apfrnn_tests"
 
 # TSan is intentionally not part of the gate: the current oneTBB build reports
 # races inside its work-stealing partitioner. Re-enable after a TSan-compatible
