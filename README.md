@@ -33,6 +33,10 @@ for (uint32_t j : search.get_neighbors(fluid, boundary, i)) {
   changes size, call `resize_point_set` with the new pointer.
 - `run()` re-reads dynamic sets every time. Static sets are cached until they
   are resized or toggled with `set_point_set_static`.
+- To read many lists of one pair, take `auto pair = search.neighbors(fluid,
+  boundary);` once and read `pair[i]`. It skips the per-call pair lookup of
+  `get_neighbors` and, like the returned lists, stays valid until the next
+  call that changes the search or `run()`.
 - `set_memory_budget(bytes)` caps one row allocation (default 3 GiB). When a
   fixed-row table does not fit, the cross writer uses a compact per-row block
   layout before falling back to CSR rows.
