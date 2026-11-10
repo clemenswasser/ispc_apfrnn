@@ -130,6 +130,9 @@ struct NSearch::PointSet {
   IntBuffer original_to_sorted;
   IntBuffer fixed_neighbors;
   IntBuffer fixed_counts;
+  // Sparse same-set rows are indexed by original point, so get_neighbors
+  // skips the sorted mapping. Every other row layout keeps the sorted index.
+  bool sparse_rows_by_original = false;
   // Max row count of the fixed rows, known from the writer; -1 forces the
   // stats pass to rescan (paths that do not track it).
   int fixed_max_count = -1;
@@ -1456,6 +1459,17 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
             static_cast<std::size_t>(end - begin)};
   }
 
+  if (pair.same_set && source.fixed_valid &&
+      source.sparse_rows_by_original) {
+    const int count = source.fixed_counts[static_cast<std::size_t>(point)];
+    const int *neighbors =
+        source.fixed_neighbors.data() +
+        static_cast<std::size_t>(point) *
+            static_cast<std::size_t>(source.fixed_capacity);
+    return {reinterpret_cast<const uint32_t *>(neighbors),
+            static_cast<std::size_t>(count)};
+  }
+
   // The source's sorted mapping is rebuilt by every grid build (and is the
   // identity for sweep sets), so it is valid for same-set and cross rows.
   const int sorted_index =
@@ -1763,6 +1777,7 @@ void NSearch::build_grid_same_lists(int set) {
   // in case an earlier writer changed it.
   data.radius = radius_;
   point_set.fixed_valid = false;
+  point_set.sparse_rows_by_original = false;
   point_set.fixed_max_count = -1;
   // Whether the counts buffer still holds only this writer's rows from the
   // previous frame; every other layout leaves it false.
@@ -1807,6 +1822,7 @@ void NSearch::build_grid_same_lists(int set) {
       }
       point_set.incremental_rows_owned = true;
       point_set.fixed_max_count = max_count;
+      point_set.sparse_rows_by_original = true;
       point_set.block_rows = false;
       point_set.fixed_capacity = capacity;
       point_set.last_fixed_capacity =
@@ -2695,6 +2711,7 @@ bool NSearch::build_sweep_same_lists(int set) {
   point_set.fixed_capacity = row_stride;
   point_set.last_fixed_capacity = row_stride;
   point_set.fixed_valid = true;
+  point_set.sparse_rows_by_original = false;
   point_set.same_lists_valid = true;
   return true;
 }

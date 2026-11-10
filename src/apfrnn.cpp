@@ -3143,8 +3143,12 @@ bool write_sparse_same_rows(NeighborSearchData &data, int capacity,
     const float dy = oy - qy_;
     const float dz = oz - qz_;
     if (dx * dx + dy * dy + dz * dz <= r2) {
-      append(query, original[other]);
-      append(other, original[query]);
+      // Rows are indexed by original point so the read side can skip the
+      // sorted mapping; the values are original ids either way.
+      const int query_original = original[query];
+      const int other_original = original[other];
+      append(query_original, other_original);
+      append(other_original, query_original);
     }
   };
   auto test_cell = [&](int query, int other_cell) {

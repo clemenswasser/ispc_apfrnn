@@ -1828,6 +1828,51 @@ TEST_CASE("budget-forced per-point rows stay exact through moving frames") {
   }
 }
 
+TEST_CASE("sparse same-set rows stay exact through moving frames") {
+  // Sparse rows are written by original point so the read side can skip the
+  // sorted mapping. Every moving frame rebuilds the grid and changes that
+  // mapping, so the row index and the reported ids must stay aligned.
+  constexpr int kPoints = 5000;
+  constexpr float kRadius = 78.0f;
+  auto cloud = apfrnn::support::make_point_cloud(kPoints, 2000.0f, 41);
+  auto xyz = interleave(cloud);
+  apfrnn::NSearch search(kRadius);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+
+  bool saw_neighbors = false;
+  const auto compare = [&](int frame) {
+    CAPTURE(frame);
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathSameSparseKeys) !=
+          0);
+    for (int point = 0; point < kPoints; point += 37) {
+      CAPTURE(point);
+      const apfrnn::NeighborList list = search.get_neighbors(id, id, point);
+      saw_neighbors = saw_neighbors || !list.empty();
+      CHECK(sorted_neighbors(list) ==
+            apfrnn::support::exact_neighbors_for(cloud, point, kRadius));
+    }
+  };
+  search.run();
+  compare(0);
+
+  std::mt19937 generator(13);
+  std::uniform_real_distribution<float> jitter(-20.0f, 20.0f);
+  for (int frame = 1; frame <= 3; ++frame) {
+    for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+      cloud.x[i] += jitter(generator);
+      cloud.y[i] += jitter(generator);
+      cloud.z[i] += jitter(generator);
+    }
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    compare(frame);
+  }
+  CHECK(saw_neighbors);
+}
+
 TEST_CASE("hash-grid stencil ranges are exact across the zero cell layer") {
   // Cell keys store z as an unsigned 21-bit field. The radix sort (16384+
   // points) orders raw keys, so a column's z = -1 cell sorts after its
