@@ -5005,6 +5005,39 @@ void write_cross_neighbors_target_major_csr_parallel(
   query_data.num_points = num_source;
 }
 
+// Pass 2 of a hybrid cross layout: rewrite the listed rows (sorted source
+// indices and their cells) with per-row offsets and capacities.
+void write_cross_hybrid_rows_parallel(
+    const CrossNeighborSearchData &query_data,
+    const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data, const std::vector<int> &queries,
+    const std::vector<int> &query_cells, IntBuffer &counts,
+    IntBuffer &neighbors, const IntBuffer &row_offset,
+    const IntBuffer &row_capacity) {
+  const int num_queries = static_cast<int>(queries.size());
+  if (num_queries == 0) {
+    return;
+  }
+  const ispc::Cells source_cells = cells_of(source_data);
+  const ispc::DenseGrid grid = dense_of(target_data);
+  const ispc::Cells target_cells = cells_of(target_data);
+  const ispc::Points qpts = points_of(source_data);
+  const ispc::Points tpts = points_of(target_data);
+  const float r2 = query_data.radius * query_data.radius;
+  const int max_capacity = max_row_count(counts);
+  const ispc::FixedRows rows =
+      block_rows(max_capacity, nullptr, counts, neighbors, row_offset,
+                 row_capacity);
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_queries, 64),
+      [&](const tbb::blocked_range<int> &range) {
+        ispc::write_listed_rows_dense(
+            range.begin(), range.end(), queries.data(), query_cells.data(),
+            &source_cells, &grid, &target_cells, &qpts, &tpts, false, r2,
+            &rows);
+      });
+}
+
 void write_cross_neighbors_fixed_query_pair_dense_parallel(
     CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
     const NeighborSearchData &target_data, int capacity,

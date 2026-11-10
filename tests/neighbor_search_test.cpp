@@ -1873,6 +1873,69 @@ TEST_CASE("sparse same-set rows stay exact through moving frames") {
   CHECK(saw_neighbors);
 }
 
+TEST_CASE("hybrid cross rows stay exact across moving frames") {
+  // Most source points see none of the dense target blob; a few see many.
+  // The hybrid fixed base plus per-row overflow rows must stay exact while
+  // the source moves.
+  constexpr int kSourcePoints = 132000;
+  constexpr float kRadius = 1.7f;
+  auto source = apfrnn::support::make_point_cloud(kSourcePoints, 46.0f, 71);
+  auto target = apfrnn::support::make_point_cloud(1700, 16.0f, 72);
+  std::mt19937 generator(73);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  for (int k = 0; k < 20;) {
+    const float x = unit(generator);
+    const float y = unit(generator);
+    const float z = unit(generator);
+    if (x * x + y * y + z * z > 1.0f) {
+      continue;
+    }
+    target.x.push_back(9.0f + 1.2f * x);
+    target.y.push_back(9.0f + 1.2f * y);
+    target.z.push_back(9.0f + 1.2f * z);
+    ++k;
+  }
+  auto source_xyz = interleave(source);
+  auto target_xyz = interleave(target);
+  apfrnn::NSearch search(kRadius);
+  const int source_id =
+      search.add_point_set(source_xyz.data(), kSourcePoints);
+  const int target_id =
+      search.add_point_set(target_xyz.data(), static_cast<int>(target.x.size()),
+                           true);
+  search.set_all_searches(false);
+  search.set_active_search(source_id, target_id, true);
+
+  std::mt19937 jitter_generator(7);
+  std::uniform_real_distribution<float> jitter(-0.2f, 0.2f);
+  for (int frame = 0; frame < 3; ++frame) {
+    CAPTURE(frame);
+    if (frame > 0) {
+      for (std::size_t i = 0; i < source.x.size(); ++i) {
+        source.x[i] += jitter(jitter_generator);
+        source.y[i] += jitter(jitter_generator);
+        source.z[i] += jitter(jitter_generator);
+      }
+      source_xyz = interleave(source);
+      search.resize_point_set(source_id, source_xyz.data(), kSourcePoints);
+    }
+    search.run();
+    CAPTURE(search.last_stats().paths);
+    // The first frame writes the fixed rows and seeds the layout; the hybrid
+    // writer takes over from the next frame.
+    if (frame > 0) {
+      CHECK((search.last_stats().paths & apfrnn::NSearch::kPathCrossBlocked) !=
+            0);
+    }
+    for (int point = 0; point < kSourcePoints; point += kSourcePoints / 40) {
+      CAPTURE(point);
+      CHECK(sorted_neighbors(search.get_neighbors(source_id, target_id, point)) ==
+            apfrnn::support::exact_cross_neighbors_for(source, point, target,
+                                                       kRadius));
+    }
+  }
+}
+
 TEST_CASE("hash-grid stencil ranges are exact across the zero cell layer") {
   // Cell keys store z as an unsigned 21-bit field. The radix sort (16384+
   // points) orders raw keys, so a column's z = -1 cell sorts after its

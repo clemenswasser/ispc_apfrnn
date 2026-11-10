@@ -205,6 +205,11 @@ private:
                               bool pair_queries, bool dense_ranges);
   bool remember_cross_block_rows(Pair &pair, PointSet &source,
                                  PointSet &target, int capacity);
+  // Hybrid cross rows: a fixed base capacity for most rows and per-row
+  // capacities for the rows above it.
+  void seed_cross_hybrid(Pair &pair, PointSet &source);
+  bool build_cross_hybrid_rows(Pair &pair, PointSet &source, PointSet &target,
+                               bool pair_queries, bool dense_ranges);
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
   static bool cell_range_cross_candidate(const PointSet &source,
                                          const PointSet &target);

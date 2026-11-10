@@ -31,6 +31,9 @@ constexpr int kPairParallelMaxPoints = 32768;
 // Below this, the per-row offset/capacity loads cost more than the padding
 // they save, so tiny cross pairs keep the plain fixed layout.
 constexpr int kCrossBlockMinPoints = 4096;
+// Below this size the fixed cross rows are small enough that the hybrid's
+// per-frame layout scan costs more than the padding it removes.
+constexpr int kCrossHybridMinPoints = 1 << 17;
 
 SearchBackend search_backend_from_env() {
   const char *backend = std::getenv("APFRNN_BACKEND");
@@ -211,6 +214,17 @@ struct NSearch::Pair {
   int cross_block_target_points = 0;
   IntBuffer cross_row_offset;
   IntBuffer cross_row_capacity;
+  // Hybrid cross rows: rows up to the base capacity use a fixed stride, rows
+  // above it get a per-row offset past the base area. This removes the
+  // padding to the global maximum without a per-row load on common rows.
+  bool cross_hybrid_valid = false;
+  bool cross_hybrid_active = false;
+  int cross_hybrid_base = 0;
+  IntBuffer cross_hybrid_offset;
+  IntBuffer cross_hybrid_capacity;
+  // Frames to wait before re-testing a pair whose counts did not fit a
+  // hybrid base; the scan is wasted on geometry that cannot use it.
+  int cross_hybrid_check_wait = 0;
 };
 
 // GPU backend state of one NSearch (device buffers, result slots, cached
@@ -1308,9 +1322,17 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
                                dense_ranges)) {
       return;
     }
+    if (block_supported &&
+        build_cross_hybrid_rows(pair, source, target, pair_queries,
+                                dense_ranges)) {
+      return;
+    }
     if (try_fixed(cross_plan.first_capacity)) {
       remember_cross_block_rows(pair, source, target,
                                 cross_plan.first_capacity);
+      if (cross_plan.writer == plan::CrossWriter::PairDense) {
+        seed_cross_hybrid(pair, source);
+      }
       return;
     }
     // The failed fixed write still counted every row exactly, so its counts
@@ -1334,6 +1356,9 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       note_path(kPathCrossGrown);
       if (try_fixed(grown)) {
         remember_cross_block_rows(pair, source, target, grown);
+        if (cross_plan.writer == plan::CrossWriter::PairDense) {
+          seed_cross_hybrid(pair, source);
+        }
         return;
       }
     }
@@ -1412,6 +1437,11 @@ void NSearch::collect_memory_stats() {
         last_stats_.neighbor_bytes +=
             pair.fixed_neighbors.capacity() * sizeof(int) +
             pair.fixed_counts.capacity() * sizeof(int);
+        if (pair.cross_hybrid_valid) {
+          last_stats_.neighbor_bytes +=
+              pair.cross_hybrid_offset.capacity() * sizeof(int) +
+              pair.cross_hybrid_capacity.capacity() * sizeof(int);
+        }
         const int known = pair.fixed_max_count;
         last_stats_.max_neighbors = std::max(
             last_stats_.max_neighbors,
@@ -1497,24 +1527,32 @@ NeighborList NSearch::get_neighbors(int set_i, int set_j, int point) const {
             static_cast<std::size_t>(count)};
   }
 
-  if (!pair.same_set && pair.fixed_valid && pair.cross_block_active) {
-    const int count =
-        pair.fixed_counts[static_cast<std::size_t>(sorted_index)];
-    const int *neighbors =
-        pair.fixed_neighbors.data() +
-        static_cast<std::size_t>(
-            pair.cross_row_offset[static_cast<std::size_t>(sorted_index)]);
-    return {reinterpret_cast<const uint32_t *>(neighbors),
-            static_cast<std::size_t>(count)};
-  }
-
   if (!pair.same_set && pair.fixed_valid) {
     const int count =
         pair.fixed_counts[static_cast<std::size_t>(sorted_index)];
-    const int *neighbors =
-        pair.fixed_neighbors.data() +
-        static_cast<std::size_t>(sorted_index) *
-            static_cast<std::size_t>(pair.fixed_capacity);
+    const int *neighbors;
+    if (pair.cross_hybrid_active) {
+      if (count <= pair.cross_hybrid_base) {
+        neighbors = pair.fixed_neighbors.data() +
+                    static_cast<std::size_t>(sorted_index) *
+                        static_cast<std::size_t>(pair.cross_hybrid_base +
+                                                 row_slack());
+      } else {
+        neighbors = pair.fixed_neighbors.data() +
+                    static_cast<std::size_t>(
+                        pair.cross_hybrid_offset[
+                            static_cast<std::size_t>(sorted_index)]);
+      }
+    } else if (pair.cross_block_active) {
+      neighbors = pair.fixed_neighbors.data() +
+                  static_cast<std::size_t>(
+                      pair.cross_row_offset[
+                          static_cast<std::size_t>(sorted_index)]);
+    } else {
+      neighbors = pair.fixed_neighbors.data() +
+                  static_cast<std::size_t>(sorted_index) *
+                      static_cast<std::size_t>(pair.fixed_capacity);
+    }
     return {reinterpret_cast<const uint32_t *>(neighbors),
             static_cast<std::size_t>(count)};
   }
@@ -2619,6 +2657,203 @@ bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
   return true;
 }
 
+// Chooses the base capacity of a hybrid cross layout from the exact row
+// counts of a fixed write. Most rows fit the base; the longer rows get
+// per-row capacities past the base area.
+void NSearch::seed_cross_hybrid(Pair &pair, PointSet &source) {
+  pair.cross_hybrid_valid = false;
+  pair.cross_hybrid_active = false;
+  if (pair.cross_hybrid_check_wait > 0) {
+    --pair.cross_hybrid_check_wait;
+    return;
+  }
+  const int num_points = source.data.num_points;
+  if (num_points < kCrossHybridMinPoints ||
+      pair.fixed_counts.size() != static_cast<std::size_t>(num_points) ||
+      pair.fixed_capacity <= 0) {
+    return;
+  }
+  // Very wide fixed rows are already read as one contiguous run per query;
+  // the base/overflow indirection costs more than the padding it removes.
+  if (pair.fixed_capacity >= 64) {
+    pair.cross_hybrid_check_wait = 16;
+    return;
+  }
+  const IntBuffer &counts = pair.fixed_counts;
+  int max_count = 0;
+  for (int count : counts) {
+    max_count = std::max(max_count, count);
+  }
+  constexpr int kMaxCount = 4096;
+  if (max_count > kMaxCount) {
+    return;
+  }
+  std::vector<int64_t> histogram(static_cast<std::size_t>(max_count) + 1, 0);
+  for (int count : counts) {
+    ++histogram[static_cast<std::size_t>(count)];
+  }
+  const int align = row_align();
+  const int slack = row_slack();
+  const int64_t fixed_bytes =
+      static_cast<int64_t>(num_points) * pair.fixed_capacity;
+  int chosen = 0;
+  for (int base = align; base <= max_count; base += align) {
+    int64_t overflow_rows = 0;
+    int64_t overflow_slots = 0;
+    for (int count = base + 1; count <= max_count; ++count) {
+      const int64_t rows = histogram[static_cast<std::size_t>(count)];
+      if (rows == 0) {
+        continue;
+      }
+      overflow_rows += rows;
+      const int cap =
+          round_up_to_row_align(count + std::max(8, count / 8));
+      overflow_slots += rows * (cap + slack);
+    }
+    // The overflow rows are rewritten by a second pass; keep them rare so
+    // that pass never shows up in the frame time.
+    if (overflow_rows * 128 > num_points) {
+      continue;
+    }
+    const int64_t slots = static_cast<int64_t>(num_points) * (base + slack) +
+                          overflow_slots;
+    // Only take the hybrid when it halves the row table; smaller savings do
+    // not pay for the extra overflow metadata.
+    if (slots * 4 <= fixed_bytes * 3) {
+      chosen = base;
+      break;
+    }
+  }
+  if (chosen == 0) {
+    pair.cross_hybrid_check_wait = 16;
+    return;
+  }
+  pair.cross_hybrid_base = chosen;
+  pair.cross_hybrid_offset.resize(static_cast<std::size_t>(num_points));
+  pair.cross_hybrid_capacity.resize(static_cast<std::size_t>(num_points));
+  pair.cross_hybrid_valid = true;
+}
+
+bool NSearch::build_cross_hybrid_rows(Pair &pair, PointSet &source,
+                                      PointSet &target, bool pair_queries,
+                                      bool dense_ranges) {
+  const int num_points = source.data.num_points;
+  if (!pair.cross_hybrid_valid || !dense_ranges || !pair_queries ||
+      num_points < kCrossBlockMinPoints ||
+      pair.cross_hybrid_offset.size() !=
+          static_cast<std::size_t>(num_points) ||
+      pair.cross_hybrid_capacity.size() !=
+          static_cast<std::size_t>(num_points)) {
+    return false;
+  }
+  const int base = pair.cross_hybrid_base;
+  const int base_stride = base + row_slack();
+  const int64_t base_slots = static_cast<int64_t>(num_points) * base_stride;
+  // Pass 1 writes every row at the base capacity and counts it exactly; rows
+  // above the base are truncated and rewritten by pass 2 past the base area.
+  write_cross_neighbors_fixed_query_pair_dense_parallel(
+      pair.cross, source.data, target.data, base, pair.fixed_neighbors,
+      pair.fixed_counts);
+  const IntBuffer &counts = pair.fixed_counts;
+  const int64_t overflow_slots = tbb::parallel_scan(
+      tbb::blocked_range<int>(0, num_points, 1 << 14), int64_t{0},
+      [&](const tbb::blocked_range<int> &range, int64_t sum, bool final) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const int count = counts[static_cast<std::size_t>(i)];
+          if (count > base) {
+            const int cap =
+                round_up_to_row_align(count + std::max(8, count / 8));
+            pair.cross_hybrid_capacity[static_cast<std::size_t>(i)] = cap;
+            if (final) {
+              pair.cross_hybrid_offset[static_cast<std::size_t>(i)] =
+                  static_cast<int>(base_slots + sum);
+            }
+            sum += cap + row_slack();
+          }
+        }
+        return sum;
+      },
+      [](int64_t a, int64_t b) { return a + b; });
+  const int64_t total = base_slots + overflow_slots;
+  int64_t budget = memory_budget_;
+  if (memory_budget_ >= static_cast<int64_t>(64) << 20) {
+    const int64_t exact_neighbors = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, num_points, 1 << 14), int64_t{0},
+        [&](const tbb::blocked_range<int> &range, int64_t acc) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            acc += counts[static_cast<std::size_t>(i)];
+          }
+          return acc;
+        },
+        [](int64_t a, int64_t b) { return a + b; });
+    budget = std::max(budget, plan::block_output_budget(exact_neighbors,
+                                                        num_points));
+  }
+  if (total > INT_MAX || total * 4 > budget) {
+    pair.cross_hybrid_valid = false;
+    return false;
+  }
+  IntBuffer &values = pair.fixed_neighbors;
+  // Pass 1 already sized and filled the base area; only grow from here so
+  // the base rows survive.
+  if (values.capacity() < static_cast<std::size_t>(total)) {
+    values.reserve(static_cast<std::size_t>(total + total / 8));
+  }
+  values.resize(static_cast<std::size_t>(total));
+  // Pass 2 rewrites the rows above the base into their own slots.
+  const int overflow_rows = static_cast<int>(tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, num_points, 1 << 14), 0,
+      [&](const tbb::blocked_range<int> &range, int acc) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          acc += counts[static_cast<std::size_t>(i)] > base ? 1 : 0;
+        }
+        return acc;
+      },
+      [](int a, int b) { return a + b; }));
+  if (overflow_rows > 0) {
+    std::vector<int> queries(static_cast<std::size_t>(overflow_rows));
+    tbb::parallel_scan(
+        tbb::blocked_range<int>(0, num_points, 1 << 14), 0,
+        [&](const tbb::blocked_range<int> &range, int sum, bool final) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            if (counts[static_cast<std::size_t>(i)] > base) {
+              if (final) {
+                queries[static_cast<std::size_t>(sum)] = i;
+              }
+              ++sum;
+            }
+          }
+          return sum;
+        },
+        [](int a, int b) { return a + b; });
+    const IntBuffer &cell_starts = source.data.cell_starts;
+    std::vector<int> query_cells(static_cast<std::size_t>(overflow_rows));
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, overflow_rows, 64),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int k = range.begin(); k < range.end(); ++k) {
+            query_cells[static_cast<std::size_t>(k)] = static_cast<int>(
+                std::upper_bound(cell_starts.begin(), cell_starts.end(),
+                                 queries[static_cast<std::size_t>(k)]) -
+                cell_starts.begin()) - 1;
+          }
+        });
+    write_cross_hybrid_rows_parallel(
+        pair.cross, source.data, target.data, queries, query_cells,
+        pair.fixed_counts, values, pair.cross_hybrid_offset,
+        pair.cross_hybrid_capacity);
+  }
+  note_path(kPathCrossBlocked);
+  pair.cross_block_active = false;
+  pair.cross_block_valid = false;
+  pair.cross_hybrid_active = true;
+  pair.fixed_valid = true;
+  pair.fixed_max_count = max_row_count(counts);
+  pair.fixed_capacity = 0;
+  pair.last_fixed_capacity = base + row_slack();
+  return true;
+}
+
 bool NSearch::transpose_cross_pair(Pair &forward, Pair &reverse,
                                    PointSet &source, PointSet &target) {
   const int n = source.data.num_points;
@@ -2924,6 +3159,7 @@ void NSearch::clear_pair(Pair &pair) {
   pair.same_set = false;
   pair.fixed_valid = false;
   pair.cross_block_active = false;
+  pair.cross_hybrid_active = false;
   pair.gpu_rows = false;
   pair.gpu_neighbors = nullptr;
   pair.gpu_offsets = nullptr;

@@ -383,6 +383,43 @@ static inline uniform int dense_runs(const uniform DenseGrid &grid,
   return num_runs;
 }
 
+// Rows of listed queries against a dense target. Each query's cell index is
+// given; used for the rows above a hybrid layout's base capacity.
+export void write_listed_rows_dense(
+    uniform int begin, uniform int end, uniform const int queries[],
+    uniform const int query_cells[],
+    const uniform Cells *uniform cells_in,
+    const uniform DenseGrid *uniform grid_in,
+    const uniform Cells *uniform targets_in,
+    const uniform Points *uniform qpts_in,
+    const uniform Points *uniform tpts_in, uniform bool same_set,
+    uniform float r2, const uniform FixedRows *uniform rows_in) {
+  const uniform Cells cells = *cells_in;
+  const uniform DenseGrid grid = *grid_in;
+  const uniform Cells targets = *targets_in;
+  const uniform Points qpts = *qpts_in;
+  const uniform Points tpts = *tpts_in;
+  const uniform FixedRows rows = *rows_in;
+  uniform int run_start[DENSE_MAX_RUNS];
+  uniform int run_end[DENSE_MAX_RUNS];
+  for (uniform int k = begin; k < end; ++k) {
+    const uniform int query = queries[k];
+    const uniform int cell = query_cells[k];
+    const uniform int num_runs =
+        dense_runs(grid, targets, cells.keys[cell], run_start, run_end);
+    if (same_set) {
+      rows_single(query, query + 1, run_start, run_end, num_runs, qpts, tpts,
+                  true, r2, rows);
+    } else {
+      rows_single(query, query + 1, run_start, run_end, num_runs, qpts, tpts,
+                  false, r2, rows);
+    }
+  }
+  if (rows.scratch != NULL) {
+    memory_barrier();
+  }
+}
+
 // Candidate runs from precomputed per-cell ranges; one query at a time.
 // Handles any row length, with optional staging (rows.scratch).
 export void write_fixed_rows(
