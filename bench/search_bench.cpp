@@ -10,8 +10,11 @@
 // Benchmarks are named Frame/<backend>/<scene>, Stress/<backend>/<scene>,
 // Threads/<backend>/<scene>/<threads>, Cold/<backend>/<scene> and
 // Api/<scenario>/<scene>, so --benchmark_filter selects by family, backend or
-// scene. Each Frame run times frames after two warm-up frames. The second one
-// is validated (see validate()), so plans that change after the first frame
+// scene. Each run times a fixed window of frames after two warm-up frames
+// (see measured_frames()), so every backend and every tool times the same
+// frames whatever --benchmark_min_time is; the reported time is per frame.
+// The second warm-up frame is validated (see validate()), so plans that change
+// after the first frame
 // are covered: the label carries a checksum of the neighbor pairs clearly
 // within the radius, which must be equal for all backends on a scene, and
 // FalsePositives must be 0. Stress holds the regimes outside the headline
@@ -272,6 +275,38 @@ void advance_scene(SceneData &scene, Backend &backend, int step) {
   }
 }
 
+// Frames timed per run. The window depends only on the scene, so every backend
+// and every tool (README tables, paired A/B runs) times the same frames: the
+// motion and the decay of memory order depend on how many frames ran, and a
+// growing set's size depends on it directly. The window holds about 2^29 units
+// of work, where a point costs 16 units and a neighbor pair one, rounded down
+// to a power of two between 4 and 256 frames. A growing scene runs until it
+// reaches its limit and 8 frames beyond. A replay runs whole forward and
+// backward passes, enough of them to fill the window.
+int measured_frames(const SceneData &scene, int64_t neighbors) {
+  int64_t points = 0;
+  for (std::size_t set = 0; set < scene.xyz.size(); ++set) {
+    points += scene.points(static_cast<int>(set));
+  }
+  const double work = 16.0 * static_cast<double>(points) +
+                      static_cast<double>(std::max<int64_t>(0, neighbors));
+  int frames = 4;
+  while (frames < 256 && 2.0 * frames * work <= double(1 << 29)) {
+    frames *= 2;
+  }
+  if (scene.trace) {
+    const int cycle = scene.trace->cycle();
+    return std::max(1, (frames + cycle - 1) / cycle) * cycle;
+  }
+  if (scene.growing && scene.grow_per_frame > 0) {
+    const int remaining = std::max(0, scene.grow_limit - scene.points(0));
+    frames = std::max(frames,
+                      (remaining + scene.grow_per_frame - 1) /
+                              scene.grow_per_frame + 8);
+  }
+  return frames;
+}
+
 void frames(benchmark::State &state, const SceneSpec &spec,
             const BackendSpec &backend_spec, int threads) {
   SceneData scene = cached_scene(spec);
@@ -324,32 +359,46 @@ void frames(benchmark::State &state, const SceneSpec &spec,
     }
   }
 
+  // The exact reference count when there is one, so the window does not
+  // depend on the backend; larger scenes use the validated count.
+  const int window = measured_frames(
+      scene, reference_summary.complete
+                 ? reference_summary.exact_pairs + reference_summary.band_pairs
+                 : validation.neighbors);
   int step = 2;
   double run_seconds = 0.0;
   double read_seconds = 0.0;
   double read_sum = 0.0;
   for (auto _ : state) {
-    advance_scene(scene, *backend, step++);
-    perf_region("enable\n");
-    const auto start = std::chrono::steady_clock::now();
-    backend->run();
-    const auto built = std::chrono::steady_clock::now();
-    read_sum += backend->read_lists(scene);
-    const auto done = std::chrono::steady_clock::now();
-    perf_region("disable\n");
-    const double run_time = std::chrono::duration<double>(built - start).count();
-    const double read_time = std::chrono::duration<double>(done - built).count();
-    run_seconds += run_time;
-    read_seconds += read_time;
-    state.SetIterationTime(run_time + read_time);
+    double window_seconds = 0.0;
+    for (int frame = 0; frame < window; ++frame) {
+      advance_scene(scene, *backend, step++);
+      perf_region("enable\n");
+      const auto start = std::chrono::steady_clock::now();
+      backend->run();
+      const auto built = std::chrono::steady_clock::now();
+      read_sum += backend->read_lists(scene);
+      const auto done = std::chrono::steady_clock::now();
+      perf_region("disable\n");
+      const double run_time =
+          std::chrono::duration<double>(built - start).count();
+      const double read_time =
+          std::chrono::duration<double>(done - built).count();
+      run_seconds += run_time;
+      read_seconds += read_time;
+      window_seconds += run_time + read_time;
+    }
+    state.SetIterationTime(window_seconds / window);
   }
   benchmark::DoNotOptimize(read_sum);
-  const double frame_count = std::max<double>(1.0, state.iterations());
+  const double frame_count =
+      static_cast<double>(window) * std::max<double>(1.0, state.iterations());
   state.counters["RunMs"] = 1000.0 * run_seconds / frame_count;
   state.counters["ReadMs"] = 1000.0 * read_seconds / frame_count;
+  state.counters["Frames"] = window;
 
   const int fluid_points = scene.points(0);
-  state.SetItemsProcessed(state.iterations() * fluid_points);
+  state.SetItemsProcessed(state.iterations() * window * fluid_points);
   state.counters["Points"] = fluid_points;
   // Particles that move: every set that is not static. The replay table
   // reports these and their neighbors over all timed pairs.
@@ -548,18 +597,18 @@ int main(int argc, char **argv) {
             std::string(family) + "/" + backend.name + "/" + scene.name, frames,
             scene, backend, 0)
             ->Unit(benchmark::kMillisecond)
-            ->UseManualTime();
+            ->UseManualTime()
+            ->Iterations(1);
       }
     }
   };
-  // Replay measures exactly one forward and backward pass, so every backend
-  // times the same searches.
+  // Replay measures whole forward and backward passes (see measured_frames()),
+  // so every backend times the same searches.
   for (const SceneSpec &scene : apfrnn::bench::trace_scenes(traces)) {
     const SceneData &data = cached_scene(scene);
     if (!data.trace) {
       continue;
     }
-    const int frames_per_run = data.trace->cycle();
     const bool resizes = data.trace->resizes();
     for (const BackendSpec &backend : backends) {
       if (resizes && !backend.supports_growing) {
@@ -569,7 +618,7 @@ int main(int argc, char **argv) {
                                    frames, scene, backend, 0)
           ->Unit(benchmark::kMillisecond)
           ->UseManualTime()
-          ->Iterations(frames_per_run);
+          ->Iterations(1);
       benchmark::RegisterBenchmark("Verify/" + backend.name + "/" + scene.name,
                                    verify_frames, scene, backend)
           ->Unit(benchmark::kMillisecond)
@@ -644,7 +693,8 @@ int main(int argc, char **argv) {
                                          std::to_string(threads),
                                      frames, scaling_scene, backend, threads)
             ->Unit(benchmark::kMillisecond)
-            ->UseManualTime();
+            ->UseManualTime()
+            ->Iterations(1);
       }
     }
   }

@@ -67,8 +67,10 @@ ctest --test-dir build --output-on-failure
 
 ## Performance
 
-Time for one search plus one density pass over the neighbor lists, i7-12700K,
-8 threads, library defaults. Lower is better.
+Time per frame for one search plus one density pass over the neighbor lists,
+over the same fixed window of moving frames for every library; i7-12700K,
+8 threads, library defaults. Lower is better. "vs Tree (search)" compares the
+search alone, without the density pass.
 
 ### Simulation replays
 

@@ -21,7 +21,10 @@ with --gpu-json to regenerate the separate GPU table.
 
 Runs use a Morton-sorted scene order by default (TreeNSearch's documented
 fast path), 8 worker threads for both TBB and OpenMP, and verify every backend
-against an independent reference checksum. --threads changes the shared
+against an independent reference checksum. Every scene and backend runs in its
+own process, so no run inherits another scene's memory state. The benchmark
+times a fixed window of frames per scene (its Frames counter), so
+--min-time does not change what is measured. --threads changes the shared
 worker count; --no-scale skips the 175k..8M dense/sparse run.
 """
 
@@ -140,29 +143,44 @@ def scene_names(rows):
 def run_bench(build: Path, cpus: str, family: str, scenes, backends,
               out: Path, extra, min_time: str, repetitions: int,
               threads: int = 8):
-    pattern = (rf"^{family}/({'|'.join(backends)})/"
-               rf"({'|'.join(re.escape(s) for s in scenes)})/manual_time$")
-    cmd = [
-        "taskset", "-c", cpus,
-        str(build / "bench" / "ispc_apfrnn_bench"),
-        f"--benchmark_filter={pattern}",
-        f"--benchmark_min_time={min_time}",
-        f"--benchmark_repetitions={repetitions}",
-        "--benchmark_report_aggregates_only=true",
-        "--benchmark_format=json",
-        f"--benchmark_out={out}",
-        f"--threads={threads}",
-        *extra,
-    ]
-    print("+", " ".join(cmd), file=sys.stderr)
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+    """Runs every scene and backend in its own process and merges the JSON
+    into out."""
+    merged = None
+    for scene in scenes:
+        for backend in backends:
+            part = out.with_name(f"{out.stem}.{backend}.{scene}.json")
+            part.unlink(missing_ok=True)
+            pattern = (rf"^{family}/{backend}/{re.escape(scene)}/"
+                       rf"(iterations:[0-9]+/)?manual_time$")
+            cmd = [
+                "taskset", "-c", cpus,
+                str(build / "bench" / "ispc_apfrnn_bench"),
+                f"--benchmark_filter={pattern}",
+                f"--benchmark_min_time={min_time}",
+                f"--benchmark_repetitions={repetitions}",
+                "--benchmark_report_aggregates_only=true",
+                "--benchmark_format=json",
+                f"--benchmark_out={part}",
+                f"--threads={threads}",
+                *extra,
+            ]
+            print("+", " ".join(cmd), file=sys.stderr)
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            if not part.exists() or not part.read_text().strip():
+                continue
+            data = json.loads(part.read_text())
+            if merged is None:
+                merged = data
+            else:
+                merged["benchmarks"].extend(data["benchmarks"])
+    out.write_text(json.dumps(merged or {"benchmarks": []}, indent=1) + "\n")
 
 
 def run_threads(build: Path, cpus: str, scenes, backends, out: Path,
                 min_time: str, repetitions: int):
     pattern = (rf"^Threads/({'|'.join(backends)})/"
                rf"({'|'.join(re.escape(s) for s in scenes)})/"
-               rf"[0-9]+/manual_time$")
+               rf"[0-9]+/(iterations:[0-9]+/)?manual_time$")
     cmd = [
         "taskset", "-c", cpus,
         str(build / "bench" / "ispc_apfrnn_bench"),
@@ -183,6 +201,8 @@ def load_medians(path: Path):
     result = {}
     stddev = {}
     for bench in data["benchmarks"]:
+        # A fixed iteration count adds /iterations:N to the name.
+        bench["name"] = re.sub(r"/iterations:[0-9]+", "", bench["name"])
         if bench["name"].endswith("_median"):
             result[bench["name"]] = bench
         elif bench["name"].endswith("_stddev"):
@@ -434,10 +454,17 @@ def table_gpu(data):
     return "\n".join(lines)
 
 
+def search_ratio(other, ours):
+    """Ratio of the search time alone (run(), without the density pass)."""
+    if not other or not other.get("RunMs") or not ours.get("RunMs"):
+        return "n/a"
+    return fmt_ratio(other["RunMs"] / ours["RunMs"])
+
+
 def table_timing(data, rows, family):
     lines = [
-        "| Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for label, scene in rows:
         a = get(data, family, "apfrnn_cpu", scene)
@@ -447,7 +474,7 @@ def table_timing(data, rows, family):
         lines.append(
             f"| {label} | {a['AvgNeighbors']:.0f} | {fmt_ms(ta)} | "
             f"{fmt_ms(tt)} | {fmt_ms(tc)} | {fmt_ratio(tt/ta)} | "
-            f"{fmt_ratio(tc/ta)} |")
+            f"{search_ratio(t, a)} | {fmt_ratio(tc/ta)} |")
     return "\n".join(lines)
 
 
@@ -575,9 +602,9 @@ def table_replay(data):
                          backends.get("compact")))
     lines = [
         "| Simulation | Moving particles | Avg neighbors | ispc_apfrnn | TreeNSearch | "
-        "CompactNSearch | vs Tree | vs Compact | Memory ours / Tree / "
-        "Compact (MB) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "CompactNSearch | vs Tree | vs Tree (search) | vs Compact | "
+        "Memory ours / Tree / Compact (MB) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     def cell(entry, key, fmt):
         return fmt(entry[key]) if entry else "n/a"
@@ -591,7 +618,8 @@ def table_replay(data):
             f"{a['Neighbors'] / max(1, a['MovingPoints']):.0f} | "
             f"{fmt_ms(a['real_time'])} | "
             f"{cell(t, 'real_time', fmt_ms)} | {cell(c, 'real_time', fmt_ms)} | "
-            f"{ratio(t, a)} | {ratio(c, a)} | {mb(a['AnonMB'])} / "
+            f"{ratio(t, a)} | {search_ratio(t, a)} | {ratio(c, a)} | "
+            f"{mb(a['AnonMB'])} / "
             f"{cell(t, 'AnonMB', mb)} / {cell(c, 'AnonMB', mb)} |")
     return "\n".join(lines)
 
@@ -599,8 +627,8 @@ def table_replay(data):
 def table_scale(data):
     scale = data["scale"]
     lines = [
-        "| Distribution | Points | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Compact |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Distribution | Points | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for distribution, scene in SCALE:
         if not available(scale, "Scale", "tree", scene):
@@ -616,6 +644,7 @@ def table_scale(data):
             f"{fmt_ms(a['real_time'])} | {fmt_ms(t['real_time'])} | "
             f"{fmt_ms(c['real_time'])} | "
             f"{fmt_ratio(t['real_time'] / a['real_time'])} | "
+            f"{search_ratio(t, a)} | "
             f"{fmt_ratio(c['real_time'] / a['real_time'])} |")
     return "\n".join(lines)
 
@@ -623,8 +652,8 @@ def table_scale(data):
 def table_growing(data):
     growing = data["growing"]
     lines = [
-        "| Scene | ispc_apfrnn | TreeNSearch | vs Tree |",
-        "|---|---:|---:|---:|",
+        "| Scene | ispc_apfrnn | TreeNSearch | vs Tree | vs Tree (search) |",
+        "|---|---:|---:|---:|---:|",
     ]
     for label, scene in GROWING:
         if not available(growing, "Growing", "tree", scene):
@@ -634,7 +663,8 @@ def table_growing(data):
         lines.append(
             f"| {label} | {fmt_ms(a['real_time'])} | "
             f"{fmt_ms(t['real_time'])} | "
-            f"{fmt_ratio(t['real_time'] / a['real_time'])} |")
+            f"{fmt_ratio(t['real_time'] / a['real_time'])} | "
+            f"{search_ratio(t, a)} |")
     return "\n".join(lines)
 
 

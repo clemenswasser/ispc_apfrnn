@@ -7,7 +7,9 @@ odd ones), so drift in clock, temperature or background load hits both. Each
 scene's result is the mean of the per-round candidate/base log ratios. A scene
 counts as faster or slower only when a paired t-test rejects no change at 95%
 and the change is at least 1%; the +- column is that 95% interval. Every run checks its lists against the reference and the script
-stops on a mismatch.
+stops on a mismatch. The benchmark times a fixed window of frames per scene
+(its Frames counter), the same window the README tables time; a scene whose
+window differs between the builds is reported instead of compared.
 
 Usage:
   scripts/ab.py [--base REF] [--candidate DIR] [--tier quick|full]
@@ -141,7 +143,6 @@ def bench_once(bench, names, args, traces):
     with tempfile.NamedTemporaryFile(suffix=".json") as out:
         cmd = ["taskset", "-c", args.cpus, str(bench),
                "--benchmark_filter=^(" + "|".join(parts) + ")",
-               f"--benchmark_min_time={args.min_time}",
                "--benchmark_format=json", f"--benchmark_out={out.name}",
                f"--threads={args.threads}", f"--traces={traces}"]
         result = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
@@ -154,7 +155,8 @@ def bench_once(bench, names, args, traces):
     for entry in data["benchmarks"]:
         family, _, scene = entry["run_name"].split("/")[:3]
         memory = entry.get("NeighborMB", 0.0) + entry.get("GridMB", 0.0)
-        times[f"{family}/{scene}"] = (entry["real_time"], memory)
+        times[f"{family}/{scene}"] = (entry["real_time"], memory,
+                                      entry.get("Frames", 0.0))
     return times
 
 
@@ -175,7 +177,10 @@ def summarize(name, base, cand):
     mean = sum(logs) / n
     sd = math.sqrt(sum((x - mean) ** 2 for x in logs) / (n - 1)) if n > 1 else 0.0
     half = t95(n - 1) * sd / math.sqrt(n) if n > 1 else math.inf
-    if n < 3 or abs(mean) <= half or abs(mean) < math.log1p(MIN_EFFECT):
+    windows = {sample[2] for sample in base} | {sample[2] for sample in cand}
+    if len(windows) > 1:
+        verdict = "window"
+    elif n < 3 or abs(mean) <= half or abs(mean) < math.log1p(MIN_EFFECT):
         verdict = "noise"
     else:
         verdict = "faster" if mean < 0 else "slower"
@@ -209,7 +214,6 @@ def main():
     parser.add_argument("--tier", choices=["quick", "full"], default="quick")
     parser.add_argument("--filter")
     parser.add_argument("--rounds", type=int)
-    parser.add_argument("--min-time", default="0.3s")
     parser.add_argument("--cpus", default="0-15")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--traces", type=Path, default=None)
@@ -262,7 +266,13 @@ def main():
     geomean = math.exp(sum(math.log(row["speedup"]) for row in rows) / len(rows))
     print(f"faster {counts['faster']}, slower {counts['slower']}, "
           f"noise {counts['noise']}, geomean speedup {geomean:.3f}x")
-    flagged = [row["scene"] for row in rows if row["verdict"] != "noise"]
+    for row in rows:
+        if row["verdict"] == "window":
+            print(f"warning: {row['scene']} times a different frame window in "
+                  "the two builds (its neighbor count or the benchmark changed); "
+                  "compare it by hand", file=sys.stderr)
+    flagged = [row["scene"] for row in rows
+               if row["verdict"] in ("faster", "slower")]
     if flagged and len(rows) > len(flagged):
         # Each scene is tested on its own, so about one scene in twenty is flagged
         # by chance.
