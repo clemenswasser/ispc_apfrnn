@@ -370,7 +370,9 @@ inline bool sort_point_set(
   // For bounded domains, a dense counting sort by cell is O(N + cells) and
   // avoids the comparison sort. Fall back to parallel_sort for large/sparse
   // domains.
-  constexpr int64_t kCountingCellLimit = 2 * 1024 * 1024;
+  // The cells-per-point test below bounds the work; this only keeps the cell
+  // counters of a very large domain to a few hundred MB.
+  constexpr int64_t kCountingCellLimit = int64_t{1} << 26;
   const int min_cx = bounds.min_cx;
   const int min_cy = bounds.min_cy;
   const int min_cz = bounds.min_cz;
