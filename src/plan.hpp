@@ -82,6 +82,16 @@ int same_exact_capacity(int max_count, int num_points, int64_t memory_budget);
 // to the maximum, and per-block rows (build_same_block_rows) with `block`
 // points per block, each row sized to its block's maximum plus 8 headroom,
 // including the per-row offset and capacity block rows also store.
+// True when a table of per-point rows of `row_bytes` should be laid out in
+// the caller's point order. That layout costs an extra pass over the points
+// per frame; a table within one core's L2 cache is read from cache in any
+// order, so the pass would only cost time there. Fixed rows need no such
+// pass and are always placed.
+bool place_rows_by_point(int64_t row_bytes);
+// The table size above which per-point rows are placed: the L2 cache size of
+// this machine. Tests lower it so their small sets take the placed layout.
+int64_t &row_placement_min_bytes();
+
 int64_t same_fixed_slots(const IntBuffer &counts);
 int64_t same_block_slots(const IntBuffer &counts, int block);
 

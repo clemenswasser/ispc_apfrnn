@@ -3,6 +3,8 @@
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_reduce.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstddef>
 
@@ -159,6 +161,23 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
     plan.writer = CrossWriter::Active2;
   }
   return plan;
+}
+
+int64_t &row_placement_min_bytes() {
+  static int64_t l2_bytes = [] {
+#ifdef _SC_LEVEL2_CACHE_SIZE
+    const long size = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    if (size > 0) {
+      return static_cast<int64_t>(size);
+    }
+#endif
+    return static_cast<int64_t>(1) << 20;
+  }();
+  return l2_bytes;
+}
+
+bool place_rows_by_point(int64_t row_bytes) {
+  return row_bytes > row_placement_min_bytes();
 }
 
 int64_t block_output_budget(int64_t exact_neighbors, int num_points) {

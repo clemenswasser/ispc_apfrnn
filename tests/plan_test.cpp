@@ -107,6 +107,27 @@ TEST_CASE("cross plan uses ranges and active2 outside the pair regime") {
   CHECK(plan.first_capacity == line_capacity(4096));
 }
 
+TEST_CASE("per-point rows are placed only when the table exceeds a cache") {
+  // A table of a few rows is read from cache in any order; one of a gigabyte
+  // is not. The test binary lowers the limit (see below), so set one here.
+  int64_t &limit = apfrnn::plan::row_placement_min_bytes();
+  const int64_t saved = limit;
+  limit = int64_t{1} << 20;
+  CHECK_FALSE(apfrnn::plan::place_rows_by_point(0));
+  CHECK_FALSE(apfrnn::plan::place_rows_by_point(4096));
+  CHECK(apfrnn::plan::place_rows_by_point(int64_t{1} << 30));
+  limit = saved;
+}
+
+namespace {
+// Most tests use sets far smaller than a cache. Placing per-point rows for
+// every table size makes the whole test binary run that layout on reused
+// buffers, next to the sorted layout every newly allocated buffer still gets.
+const struct PlaceRowsInTests {
+  PlaceRowsInTests() { apfrnn::plan::row_placement_min_bytes() = 0; }
+} place_rows_in_tests;
+} // namespace
+
 TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(10, 128) == 32);
   CHECK(apfrnn::plan::same_fitted_capacity(70, 128) == 80);

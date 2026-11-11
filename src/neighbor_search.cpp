@@ -142,6 +142,8 @@ struct NSearch::PointSet {
   // sorted order for the layout decisions.
   bool rows_by_original = false;
   IntBuffer slot_counts;
+  // Row starts by original point for placed per-point rows (block_rows).
+  IntBuffer point_offset;
   // Max row count of the fixed rows, known from the writer; -1 forces the
   // stats pass to rescan (paths that do not track it).
   int fixed_max_count = -1;
@@ -1421,7 +1423,8 @@ void NSearch::collect_memory_stats() {
         source.data.dense_cells.capacity() * sizeof(int) +
         source.fixed_neighbors.capacity() * sizeof(int) +
         source.fixed_counts.capacity() * sizeof(int) +
-        source.slot_counts.capacity() * sizeof(int);
+        source.slot_counts.capacity() * sizeof(int) +
+        source.point_offset.capacity() * sizeof(int);
 
     for (int set_j = 0; set_j < set_count; ++set_j) {
       const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
@@ -1515,10 +1518,13 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
     const IntBuffer &counts = source.rows_by_original ? source.slot_counts
                                                       : source.fixed_counts;
     const int count = counts[static_cast<std::size_t>(point)];
-    const int *neighbors =
-        source.fixed_neighbors.data() +
-        static_cast<std::size_t>(point) *
-            static_cast<std::size_t>(source.fixed_capacity);
+    const std::size_t start =
+        source.rows_by_original && source.block_rows
+            ? static_cast<std::size_t>(
+                  source.point_offset[static_cast<std::size_t>(point)])
+            : static_cast<std::size_t>(point) *
+                  static_cast<std::size_t>(source.fixed_capacity);
+    const int *neighbors = source.fixed_neighbors.data() + start;
     return {reinterpret_cast<const uint32_t *>(neighbors),
             static_cast<std::size_t>(count)};
   }
@@ -1621,7 +1627,11 @@ void NSearch::build_row_views() {
         view.data = source.fixed_neighbors.data();
         view.counts = source.rows_by_original ? source.slot_counts.data()
                                               : source.fixed_counts.data();
-        view.stride = static_cast<std::size_t>(source.fixed_capacity);
+        if (source.rows_by_original && source.block_rows) {
+          view.offsets = source.point_offset.data();
+        } else {
+          view.stride = static_cast<std::size_t>(source.fixed_capacity);
+        }
         continue;
       }
       view.to_sorted = source.original_to_sorted.data();
@@ -1900,6 +1910,26 @@ void NSearch::build_same_lists(int set) {
   build_grid_same_lists(set);
 }
 
+namespace {
+
+// Counts by original point from counts by sorted row, written front to back.
+void gather_slot_counts(const IntBuffer &counts, const IntBuffer &to_sorted,
+                        IntBuffer &slot_counts) {
+  const int num_points = static_cast<int>(counts.size());
+  slot_counts.resize(counts.size());
+  tbb::parallel_for(tbb::blocked_range<int>(0, num_points, 1 << 15),
+                    [&](const tbb::blocked_range<int> &range) {
+                      for (int point = range.begin(); point != range.end();
+                           ++point) {
+                        slot_counts[static_cast<std::size_t>(point)] =
+                            counts[static_cast<std::size_t>(to_sorted[
+                                static_cast<std::size_t>(point)])];
+                      }
+                    });
+}
+
+} // namespace
+
 void NSearch::build_grid_same_lists(int set) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
   if (!point_set.valid) {
@@ -2100,17 +2130,8 @@ void NSearch::build_grid_same_lists(int set) {
     // them front to back; storing them from the writer would add a scattered
     // store per row.
     if (placed) {
-      point_set.slot_counts.resize(static_cast<std::size_t>(data.num_points));
-      const int *to_sorted = point_set.original_to_sorted.data();
-      const int *counts = point_set.fixed_counts.data();
-      int *slot_counts = point_set.slot_counts.data();
-      tbb::parallel_for(
-          tbb::blocked_range<int>(0, data.num_points, 1 << 15),
-          [&](const tbb::blocked_range<int> &range) {
-            for (int point = range.begin(); point != range.end(); ++point) {
-              slot_counts[point] = counts[to_sorted[point]];
-            }
-          });
+      gather_slot_counts(point_set.fixed_counts, point_set.original_to_sorted,
+                         point_set.slot_counts);
     }
     point_set.rows_by_original = placed;
     point_set.fixed_valid = true;
@@ -2289,51 +2310,102 @@ bool NSearch::build_moving_block_rows(int set) {
   // Attempt 0 lays out and writes every row; if its overflowed rows do not
   // fit in the buffer's headroom, attempt 1 lays out again with their grown
   // capacities.
+  bool placed = false;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    // Capacities into sorted order, then offsets by an exclusive scan.
-    const int max_capacity = tbb::parallel_reduce(
-        tbb::blocked_range<int>(0, num_points, 1 << 14), 0,
-        [&](const tbb::blocked_range<int> &range, int acc) {
-          for (int i = range.begin(); i < range.end(); ++i) {
-            const int capacity = point_set.moving_caps[static_cast<std::size_t>(
-                data.original_index[i])];
-            point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
-            acc = std::max(acc, capacity);
-          }
-          return acc;
-        },
-        [](int a, int b) { return std::max(a, b); });
-    const int64_t total = tbb::parallel_scan(
-        tbb::blocked_range<int>(0, num_points, 1 << 14), int64_t{0},
-        [&](const tbb::blocked_range<int> &range, int64_t sum, bool final) {
-          for (int i = range.begin(); i < range.end(); ++i) {
-            if (final) {
-              point_set.row_offset[static_cast<std::size_t>(i)] =
-                  static_cast<int>(sum);
+    IntBuffer &values = point_set.fixed_neighbors;
+    // Rows go in point order when the table is large enough for the order to
+    // matter (judged by the buffer in use; a new buffer is never placed).
+    const bool eligible = plan::place_rows_by_point(
+        static_cast<int64_t>(values.capacity()) * 4);
+    // Capacities, and with `offsets` the row starts, into sorted order for
+    // the writer.
+    auto gather_layout = [&](bool offsets) {
+      return tbb::parallel_reduce(
+          tbb::blocked_range<int>(0, num_points, 1 << 14), 0,
+          [&](const tbb::blocked_range<int> &range, int acc) {
+            for (int i = range.begin(); i < range.end(); ++i) {
+              const std::size_t point =
+                  static_cast<std::size_t>(data.original_index[i]);
+              const int capacity = point_set.moving_caps[point];
+              point_set.row_capacity[static_cast<std::size_t>(i)] = capacity;
+              if (offsets) {
+                point_set.row_offset[static_cast<std::size_t>(i)] =
+                    point_set.point_offset[point];
+              }
+              acc = std::max(acc, capacity);
             }
-            sum += point_set.row_capacity[static_cast<std::size_t>(i)] +
-                   row_slack();
-          }
-          return sum;
-        },
-        [](int64_t a, int64_t b) { return a + b; });
-    const int64_t bytes = total * 4 + static_cast<int64_t>(num_points) * 2 * 4;
+            return acc;
+          },
+          [](int a, int b) { return std::max(a, b); });
+    };
+    // Row starts in sorted order by an exclusive scan; returns the slots.
+    auto scan_sorted = [&] {
+      return tbb::parallel_scan(
+          tbb::blocked_range<int>(0, num_points, 1 << 14), int64_t{0},
+          [&](const tbb::blocked_range<int> &range, int64_t sum, bool final) {
+            for (int i = range.begin(); i < range.end(); ++i) {
+              if (final) {
+                point_set.row_offset[static_cast<std::size_t>(i)] =
+                    static_cast<int>(sum);
+              }
+              sum += point_set.row_capacity[static_cast<std::size_t>(i)] +
+                     row_slack();
+            }
+            return sum;
+          },
+          [](int64_t a, int64_t b) { return a + b; });
+    };
+    int max_capacity = 0;
+    int64_t total = 0;
+    if (eligible) {
+      // Row starts in point order: the caller reads rows by its own points,
+      // so rows laid out in that order are read front to back.
+      point_set.point_offset.resize(n);
+      total = tbb::parallel_scan(
+          tbb::blocked_range<std::size_t>(0, n, 1 << 14), int64_t{0},
+          [&](const tbb::blocked_range<std::size_t> &range, int64_t sum,
+              bool final) {
+            for (std::size_t point = range.begin(); point < range.end();
+                 ++point) {
+              if (final) {
+                point_set.point_offset[point] = static_cast<int>(sum);
+              }
+              sum += point_set.moving_caps[point] + row_slack();
+            }
+            return sum;
+          },
+          [](int64_t a, int64_t b) { return a + b; });
+    } else {
+      max_capacity = gather_layout(false);
+      total = scan_sorted();
+    }
+    const int64_t bytes = total * 4 + static_cast<int64_t>(num_points) *
+                                          (eligible ? 3 : 2) * 4;
     if (total > INT_MAX || bytes > row_budget) {
       point_set.moving_caps_valid = false;
       return false;
     }
     const std::size_t slots = static_cast<std::size_t>(total);
-    IntBuffer &values = point_set.fixed_neighbors;
     // Keep at least 1/16 headroom for overflowed rows: once the growing
     // capacities ate it, every frame fell back to a full relayout.
-    if (values.capacity() < slots + slots / 16 ||
-        values.capacity() > 2 * slots) {
+    const bool fresh = values.capacity() < slots + slots / 16 ||
+                       values.capacity() > 2 * slots;
+    if (fresh) {
       // Headroom, so the next frames' small growth reuses the buffer.
-      IntBuffer fresh;
-      fresh.reserve(slots + slots / 8);
-      values.swap(fresh);
+      IntBuffer replacement;
+      replacement.reserve(slots + slots / 8);
+      values.swap(replacement);
     }
     values.resize(slots);
+    // A new buffer is laid out in sorted order, so the writer faults its
+    // pages in address order (see prepare_fixed_rows).
+    placed = eligible && !fresh;
+    if (eligible) {
+      max_capacity = gather_layout(placed);
+      if (!placed) {
+        scan_sorted();
+      }
+    }
     write_same_set_block_rows_parallel(
         data, max_capacity, point_set.fixed_counts, values,
         point_set.row_offset, point_set.row_capacity);
@@ -2383,6 +2455,10 @@ bool NSearch::build_moving_block_rows(int set) {
           const int capacity = point_set.moving_caps[static_cast<std::size_t>(
               data.original_index[row])];
           point_set.row_offset[static_cast<std::size_t>(row)] = offset;
+          if (placed) {
+            point_set.point_offset[static_cast<std::size_t>(
+                data.original_index[row])] = offset;
+          }
           point_set.row_capacity[static_cast<std::size_t>(row)] = capacity;
           offset += capacity + row_slack();
         }
@@ -2395,6 +2471,12 @@ bool NSearch::build_moving_block_rows(int set) {
       }
     }
     if (complete) {
+      if (placed) {
+        gather_slot_counts(point_set.fixed_counts,
+                           point_set.original_to_sorted,
+                           point_set.slot_counts);
+      }
+      point_set.rows_by_original = placed;
       point_set.block_rows = true;
       point_set.block_caps_valid = false;
       point_set.block_layout_valid = false;
