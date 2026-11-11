@@ -3697,7 +3697,7 @@ void ensure_occupancy(NeighborSearchData &data, const Bounds *known) {
   data.occupancy_valid = true;
 }
 
-inline // Cell-aligned coarse occupancy built straight from the sorted unique cell
+// Cell-aligned coarse occupancy built straight from the sorted unique cell
 // keys. The block edge is a power-of-two number of cells, so block ids are
 // monotonic in the sorted key order; partitioning the fill by bitmap byte
 // range lets every worker write its own bytes with plain ORs, avoiding the
