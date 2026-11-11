@@ -427,6 +427,42 @@ void NSearch::set_all_searches(bool active) {
   }
 }
 
+void NSearch::prepare_zsort() {
+  row_views_valid_ = false;
+  zsort_order_.assign(sets_.size(), {});
+  for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
+    PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+    const IntBuffer &order = point_set.data.original_index;
+    const std::size_t n = static_cast<std::size_t>(point_set.source_count);
+    if (!point_set.valid || point_set.use_sweep || n == 0 ||
+        order.size() != n) {
+      continue;
+    }
+    bool in_order = true;
+    for (std::size_t i = 0; i < n && in_order; ++i) {
+      in_order = order[i] == static_cast<int>(i);
+    }
+    if (in_order) {
+      continue;
+    }
+    zsort_order_[static_cast<std::size_t>(set)].assign(order.begin(),
+                                                       order.end());
+    // The caller is about to permute this set's points: every position
+    // changes, also for a static set, and lists by the old indices are void.
+    point_set.dirty = true;
+    point_set.valid = false;
+    invalidate_pairs_for_set(set);
+    // Per-point capacities follow their points.
+    if (point_set.moving_caps.size() == n) {
+      IntBuffer moved(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        moved[i] = point_set.moving_caps[static_cast<std::size_t>(order[i])];
+      }
+      point_set.moving_caps.swap(moved);
+    }
+  }
+}
+
 void NSearch::update_point_sets() {
   row_views_valid_ = false;
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {

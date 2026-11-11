@@ -252,12 +252,34 @@ public:
 
   RunStats last_stats() const { return last_stats_; }
 
-  // Compatibility shims for the learnsph adapter. APFRNN always keeps an
-  // internal cell order and maps results back to the caller's order, so these
-  // are intentionally no-ops.
-  void zsort() {}
-  void prepare_zsort() {}
-  template <typename T> void apply_zsort(int, T *) {}
+  // Reordering for callers that keep their points in the grid's order, which
+  // makes the rows and the caller's own per-point data sequential in memory.
+  // prepare_zsort() records, for every set, the grid order of the last run();
+  // apply_zsort() then permutes one per-point array of the caller into it
+  // (`stride` values per point, 3 for interleaved xyz). Apply it to the
+  // positions and to every other per-point array of the set, then call
+  // run(): point indices change, so lists from before the sort are void.
+  // A set without a grid order (no run() yet, or a sweep set) or already in
+  // order is left alone. Worth calling every few dozen frames, not every
+  // frame.
+  void prepare_zsort();
+  void zsort() { prepare_zsort(); }
+  template <typename T>
+  void apply_zsort(int set, T *data, int stride = 1) const {
+    if (set < 0 || static_cast<std::size_t>(set) >= zsort_order_.size() ||
+        data == nullptr || stride < 1) {
+      return;
+    }
+    const std::vector<int> &order = zsort_order_[static_cast<std::size_t>(set)];
+    const std::size_t width = static_cast<std::size_t>(stride);
+    const std::vector<T> old(data, data + order.size() * width);
+    for (std::size_t point = 0; point < order.size(); ++point) {
+      const std::size_t from = static_cast<std::size_t>(order[point]) * width;
+      for (std::size_t k = 0; k < width; ++k) {
+        data[point * width + k] = old[from + k];
+      }
+    }
+  }
 
 private:
   // Defined in neighbor_search.cpp; they hold the internal grid types.
@@ -269,6 +291,8 @@ private:
   void run_frame();
   void build_row_views();
   std::vector<detail::RowView> row_views_;
+  // Per set: the original point that moves to each position (empty: keep).
+  std::vector<std::vector<int>> zsort_order_;
   int view_sets_ = 0;
   bool row_views_valid_ = false;
 

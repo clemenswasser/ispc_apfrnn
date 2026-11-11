@@ -11,6 +11,7 @@
 #include <memory>
 #include <random>
 #include <tuple>
+#include <numeric>
 #include <vector>
 
 namespace {
@@ -408,6 +409,89 @@ TEST_CASE("pair views match per-point reads across moving frames") {
     check_views();
     check_same_set(search, fluid_id, fluid, radius);
     check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+  }
+}
+
+TEST_CASE("zsort reorders the caller's points and stays exact") {
+  // A caller that reorders its points with prepare_zsort()/apply_zsort()
+  // every few frames: the positions and every other per-point array follow
+  // the permutation, a static set is re-read, and the lists of the next
+  // run() are exact for the new indices.
+  constexpr float radius = 1.0f;
+  auto fluid = apfrnn::support::make_point_cloud(4000, 14.0f, 95);
+  auto boundary = apfrnn::support::make_point_cloud(900, 14.0f, 96);
+  std::vector<float> fluid_xyz = interleave(fluid);
+  std::vector<float> boundary_xyz = interleave(boundary);
+  // The caller's own per-point data: which generated point each one is.
+  std::vector<int> fluid_id(fluid.x.size());
+  std::iota(fluid_id.begin(), fluid_id.end(), 0);
+  const auto original = fluid;
+
+  apfrnn::NSearch search(radius);
+  const int fluid_set =
+      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_set = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(false);
+  search.set_active_search(fluid_set, fluid_set, true);
+  search.set_active_search(fluid_set, boundary_set, true);
+  search.set_active_search(boundary_set, fluid_set, true);
+
+  // Before any run() there is no grid order: nothing moves.
+  search.prepare_zsort();
+  search.apply_zsort(fluid_set, fluid_id.data());
+  CHECK(fluid_id[17] == 17);
+
+  auto sort_cloud = [&](int set, apfrnn::support::PointCloud &cloud,
+                        std::vector<float> &xyz) {
+    search.apply_zsort(set, xyz.data(), 3);
+    search.apply_zsort(set, cloud.x.data());
+    search.apply_zsort(set, cloud.y.data());
+    search.apply_zsort(set, cloud.z.data());
+  };
+  float shift = 0.0f;
+  for (int frame = 0; frame < 9; ++frame) {
+    INFO("frame " << frame);
+    translate(fluid, 0.04f, -0.03f, 0.02f);
+    shift += 1.0f;
+    fluid_xyz = interleave(fluid);
+    search.resize_point_set(fluid_set, fluid_xyz.data(),
+                            static_cast<int>(fluid.x.size()));
+    search.run();
+    check_same_set(search, fluid_set, fluid, radius);
+    check_cross_set(search, fluid_set, boundary_set, fluid, boundary, radius);
+    check_cross_set(search, boundary_set, fluid_set, boundary, fluid, radius);
+    if (frame % 3 == 1) {
+      search.prepare_zsort();
+      sort_cloud(fluid_set, fluid, fluid_xyz);
+      search.apply_zsort(fluid_set, fluid_id.data());
+      sort_cloud(boundary_set, boundary, boundary_xyz);
+      // The lists are void until the next run(), which must see the new
+      // order of both sets.
+      search.run();
+      check_same_set(search, fluid_set, fluid, radius);
+      check_cross_set(search, fluid_set, boundary_set, fluid, boundary,
+                      radius);
+      check_cross_set(search, boundary_set, fluid_set, boundary, fluid,
+                      radius);
+      // In grid order now: a second sort has nothing to move.
+      const std::vector<int> before = fluid_id;
+      search.prepare_zsort();
+      search.apply_zsort(fluid_set, fluid_id.data());
+      CHECK(fluid_id == before);
+      // (the second prepare marked nothing; lists stay valid)
+      check_same_set(search, fluid_set, fluid, radius);
+    }
+  }
+  // The id array is still a permutation, and each point carries its data.
+  std::vector<int> seen = fluid_id;
+  std::sort(seen.begin(), seen.end());
+  for (std::size_t i = 0; i < seen.size(); ++i) {
+    REQUIRE(seen[i] == static_cast<int>(i));
+  }
+  for (std::size_t i = 0; i < fluid_id.size(); ++i) {
+    const std::size_t id = static_cast<std::size_t>(fluid_id[i]);
+    CHECK(fluid.x[i] == doctest::Approx(original.x[id] + 0.04f * shift));
   }
 }
 
