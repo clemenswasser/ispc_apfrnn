@@ -136,6 +136,12 @@ struct NSearch::PointSet {
   // Sparse same-set rows are indexed by original point, so get_neighbors
   // skips the sorted mapping. Every other row layout keeps the sorted index.
   bool sparse_rows_by_original = false;
+  // Fixed rows placed by original point: row p of fixed_neighbors belongs to
+  // the caller's point p and slot_counts[p] is its count, so a caller walking
+  // its points in order reads the table front to back. fixed_counts stays in
+  // sorted order for the layout decisions.
+  bool rows_by_original = false;
+  IntBuffer slot_counts;
   // Max row count of the fixed rows, known from the writer; -1 forces the
   // stats pass to rescan (paths that do not track it).
   int fixed_max_count = -1;
@@ -1414,7 +1420,8 @@ void NSearch::collect_memory_stats() {
         source.data.hash_vals.capacity() * sizeof(int) +
         source.data.dense_cells.capacity() * sizeof(int) +
         source.fixed_neighbors.capacity() * sizeof(int) +
-        source.fixed_counts.capacity() * sizeof(int);
+        source.fixed_counts.capacity() * sizeof(int) +
+        source.slot_counts.capacity() * sizeof(int);
 
     for (int set_j = 0; set_j < set_count; ++set_j) {
       const Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
@@ -1430,7 +1437,8 @@ void NSearch::collect_memory_stats() {
           }
           last_stats_.neighbor_bytes +=
               source.fixed_neighbors.capacity() * sizeof(int) +
-              source.fixed_counts.capacity() * sizeof(int);
+              source.fixed_counts.capacity() * sizeof(int) +
+              source.slot_counts.capacity() * sizeof(int);
           const int known = source.fixed_max_count;
           last_stats_.max_neighbors =
               std::max(last_stats_.max_neighbors,
@@ -1503,8 +1511,10 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
   }
 
   if (pair.same_set && source.fixed_valid &&
-      source.sparse_rows_by_original) {
-    const int count = source.fixed_counts[static_cast<std::size_t>(point)];
+      (source.sparse_rows_by_original || source.rows_by_original)) {
+    const IntBuffer &counts = source.rows_by_original ? source.slot_counts
+                                                      : source.fixed_counts;
+    const int count = counts[static_cast<std::size_t>(point)];
     const int *neighbors =
         source.fixed_neighbors.data() +
         static_cast<std::size_t>(point) *
@@ -1607,9 +1617,10 @@ void NSearch::build_row_views() {
       view.kind = detail::RowView::Rows;
       view.points = static_cast<unsigned>(source.x.size());
       if (pair.same_set && source.fixed_valid &&
-          source.sparse_rows_by_original) {
+          (source.sparse_rows_by_original || source.rows_by_original)) {
         view.data = source.fixed_neighbors.data();
-        view.counts = source.fixed_counts.data();
+        view.counts = source.rows_by_original ? source.slot_counts.data()
+                                              : source.fixed_counts.data();
         view.stride = static_cast<std::size_t>(source.fixed_capacity);
         continue;
       }
@@ -1900,6 +1911,7 @@ void NSearch::build_grid_same_lists(int set) {
   data.radius = radius_;
   point_set.fixed_valid = false;
   point_set.sparse_rows_by_original = false;
+  point_set.rows_by_original = false;
   point_set.fixed_max_count = -1;
   // Whether the counts buffer still holds only this writer's rows from the
   // previous frame; every other layout leaves it false.
@@ -2045,11 +2057,17 @@ void NSearch::build_grid_same_lists(int set) {
   }
 
   auto try_fixed = [&](int capacity) {
+    // Rows go to their original point's slot: the caller reads rows in its
+    // own point order, which is unrelated to the grid's sorted order once
+    // the points have moved.
+    const RowPlacement placement{data.original_index.data()};
+    bool placed = false;
     switch (same_plan.writer) {
     case plan::SameWriter::PairDense:
       note_path(kPathSamePairDense);
-      write_neighbors_fixed_query_pair_dense_parallel(
-          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
+      placed = write_neighbors_fixed_query_pair_dense_parallel(
+          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts,
+          placement);
       break;
     case plan::SameWriter::Blocked:
       note_path(kPathSameBlocked);
@@ -2058,13 +2076,15 @@ void NSearch::build_grid_same_lists(int set) {
       break;
     case plan::SameWriter::QueryOct:
       note_path(kPathSameQueryOct);
-      write_neighbors_fixed_query_oct_parallel(
-          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
+      placed = write_neighbors_fixed_query_oct_parallel(
+          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts,
+          placement);
       break;
     case plan::SameWriter::Active2:
       note_path(kPathSameActive2);
-      write_neighbors_fixed_query_active2_parallel(
-          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts);
+      placed = write_neighbors_fixed_query_active2_parallel(
+          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts,
+          placement);
       break;
     }
     const int max_count = max_row_count(point_set.fixed_counts);
@@ -2076,6 +2096,23 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.last_fixed_capacity =
         plan::same_fitted_capacity(max_count, capacity);
     point_set.block_rows = false;
+    // Counts in slot order for the reader. A gather over the points writes
+    // them front to back; storing them from the writer would add a scattered
+    // store per row.
+    if (placed) {
+      point_set.slot_counts.resize(static_cast<std::size_t>(data.num_points));
+      const int *to_sorted = point_set.original_to_sorted.data();
+      const int *counts = point_set.fixed_counts.data();
+      int *slot_counts = point_set.slot_counts.data();
+      tbb::parallel_for(
+          tbb::blocked_range<int>(0, data.num_points, 1 << 15),
+          [&](const tbb::blocked_range<int> &range) {
+            for (int point = range.begin(); point != range.end(); ++point) {
+              slot_counts[point] = counts[to_sorted[point]];
+            }
+          });
+    }
+    point_set.rows_by_original = placed;
     point_set.fixed_valid = true;
     point_set.same_lists_valid = true;
     return true;
@@ -3031,6 +3068,7 @@ bool NSearch::build_sweep_same_lists(int set) {
   point_set.last_fixed_capacity = row_stride;
   point_set.fixed_valid = true;
   point_set.sparse_rows_by_original = false;
+  point_set.rows_by_original = false;
   point_set.same_lists_valid = true;
   return true;
 }

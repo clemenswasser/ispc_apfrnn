@@ -100,19 +100,26 @@ inline void hint_huge_pages(void *data, std::size_t bytes) {
 #endif
 }
 
-inline void prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
+// Returns true when the row buffer was newly allocated. Its pages are then
+// faulted in by the writer, so the writer should go through it in address
+// order: threads that fault fresh huge pages back to back saturate the memory
+// bandwidth with page clearing instead of overlapping it with their work.
+inline bool prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
                                std::size_t num_points, int row_stride) {
   const std::size_t required = num_points * static_cast<std::size_t>(row_stride);
   counts.resize(num_points);
   // Shrink once the waste passes a quarter of the buffer: a fitted capacity
   // can be far below the first guess, and the old rule kept the larger
   // buffer resident for the rest of the run.
-  if (required > values.capacity() || 4 * required < 3 * values.capacity()) {
+  const bool fresh =
+      required > values.capacity() || 4 * required < 3 * values.capacity();
+  if (fresh) {
     IntBuffer().swap(values);
   }
   values.resize(required);
   hint_huge_pages(values.data(),
                   values.size() * static_cast<std::size_t>(sizeof(int)));
+  return fresh;
 }
 
 // Sizes the block-row buffers. The layout has already been computed in
@@ -1465,9 +1472,12 @@ ispc::Blocks blocks_of(const NeighborSearchData &data) {
 
 // `scratch` is one staging row for the _nt writers, nullptr otherwise.
 ispc::FixedRows fixed_rows(int capacity, int *scratch, IntBuffer &counts,
-                           IntBuffer &neighbors) {
-  return {capacity, neighbor_permutation_table(), scratch, counts.data(),
-          neighbors.data(), nullptr, nullptr};
+                           IntBuffer &neighbors,
+                           RowPlacement placement = {}) {
+  return {capacity,         neighbor_permutation_table(),
+          scratch,          counts.data(),
+          neighbors.data(), nullptr,
+          nullptr,          placement.slot};
 }
 
 // Per-query block layout: row q starts at neighbors[row_offset[q]] and has
@@ -1476,7 +1486,8 @@ ispc::FixedRows block_rows(int capacity, int *scratch, IntBuffer &counts,
                            IntBuffer &neighbors, const IntBuffer &row_offset,
                            const IntBuffer &row_capacity) {
   return {capacity, neighbor_permutation_table(), scratch, counts.data(),
-          neighbors.data(), row_offset.data(), row_capacity.data()};
+          neighbors.data(), row_offset.data(), row_capacity.data(),
+          nullptr};
 }
 
 // Runs write(begin, end, rows) over chunks of [0, num_items). With
@@ -1486,7 +1497,8 @@ ispc::FixedRows block_rows(int capacity, int *scratch, IntBuffer &counts,
 template <typename Write>
 void write_rows_parallel(int num_items, int grain, int capacity,
                          bool allow_staging, IntBuffer &counts,
-                         IntBuffer &neighbors, Write write) {
+                         IntBuffer &neighbors, Write write,
+                         RowPlacement placement = {}) {
   const int stride = capacity + row_slack();
   const bool staged =
       allow_staging && capacity >= 256 && capacity % row_align() == 0;
@@ -1506,7 +1518,7 @@ void write_rows_parallel(int num_items, int grain, int capacity,
       scratch_row = scratch.data() + static_cast<std::size_t>(tid) * stride;
     }
     const ispc::FixedRows rows =
-        fixed_rows(capacity, scratch_row, counts, neighbors);
+        fixed_rows(capacity, scratch_row, counts, neighbors, placement);
     write(begin, end, rows);
   });
 }
@@ -2952,15 +2964,18 @@ void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,
   data.col_idx.resize(total_neighbors);
 }
 
-void write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
+bool write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
                                                   int capacity,
                                                   IntBuffer &fixed_neighbors,
-                                                  IntBuffer &counts) {
-  prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points),
-                     capacity + row_slack());
+                                                  IntBuffer &counts,
+    RowPlacement placement) {
+  if (prepare_fixed_rows(fixed_neighbors, counts,
+                         static_cast<std::size_t>(data.num_points),
+                         capacity + row_slack())) {
+    placement = {};
+  }
   if (data.num_points == 0) {
-    return;
+    return false;
   }
   const ispc::Cells cells = cells_of(data);
   const ispc::CellRanges ranges = ranges_of(data);
@@ -2971,21 +2986,26 @@ void write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
       fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
         ispc::write_fixed_rows(begin, end, &cells, &ranges, &pts, &pts, true,
                                r2, &rows);
-      });
+      },
+      placement);
+  return placement.slot != nullptr;
 }
 
 
 
 
-void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
+bool write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
                                                int capacity,
                                                IntBuffer &fixed_neighbors,
-                                               IntBuffer &counts) {
-  prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points),
-                     capacity + row_slack());
+                                               IntBuffer &counts,
+    RowPlacement placement) {
+  if (prepare_fixed_rows(fixed_neighbors, counts,
+                         static_cast<std::size_t>(data.num_points),
+                         capacity + row_slack())) {
+    placement = {};
+  }
   if (data.num_points == 0) {
-    return;
+    return false;
   }
   const ispc::Cells cells = cells_of(data);
   const ispc::CellRanges ranges = ranges_of(data);
@@ -2996,18 +3016,23 @@ void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
       fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
         ispc::write_fixed_rows_pair(begin, end, &cells, &ranges, &pts, &pts,
                                     true, r2, &rows);
-      });
+      },
+      placement);
+  return placement.slot != nullptr;
 }
 
-void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
+bool write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
                                               int capacity,
                                               IntBuffer &fixed_neighbors,
-                                              IntBuffer &counts) {
-  prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points),
-                     capacity + row_slack());
+                                              IntBuffer &counts,
+    RowPlacement placement) {
+  if (prepare_fixed_rows(fixed_neighbors, counts,
+                         static_cast<std::size_t>(data.num_points),
+                         capacity + row_slack())) {
+    placement = {};
+  }
   if (data.num_points == 0) {
-    return;
+    return false;
   }
   const ispc::Cells cells = cells_of(data);
   const ispc::CellRanges ranges = ranges_of(data);
@@ -3018,7 +3043,9 @@ void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
       fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
         ispc::write_fixed_rows_oct(begin, end, &cells, &ranges, &pts, &pts,
                                    true, r2, &rows);
-      });
+      },
+      placement);
+  return placement.slot != nullptr;
 }
 
 // Same-set rows for a grid where every cell holds at most one point. The
@@ -4868,14 +4895,17 @@ void write_cross_neighbors_target_major_parallel(
 
 }
 
-void write_neighbors_fixed_query_pair_dense_parallel(
+bool write_neighbors_fixed_query_pair_dense_parallel(
     NeighborSearchData &data, int capacity, IntBuffer &fixed_neighbors,
-    IntBuffer &counts) {
-  prepare_fixed_rows(fixed_neighbors, counts,
-                     static_cast<std::size_t>(data.num_points),
-                     capacity + row_slack());
+    IntBuffer &counts,
+    RowPlacement placement) {
+  if (prepare_fixed_rows(fixed_neighbors, counts,
+                         static_cast<std::size_t>(data.num_points),
+                         capacity + row_slack())) {
+    placement = {};
+  }
   if (data.num_points == 0) {
-    return;
+    return false;
   }
   const ispc::Cells cells = cells_of(data);
   const ispc::DenseGrid grid = dense_of(data);
@@ -4889,7 +4919,9 @@ void write_neighbors_fixed_query_pair_dense_parallel(
       fixed_neighbors, [&](int begin, int end, const ispc::FixedRows &rows) {
         ispc::write_fixed_rows_dense(begin, end, kSameGroup, &cells, &grid,
                                      &cells, &pts, &pts, true, r2, &rows);
-      });
+      },
+      placement);
+  return placement.slot != nullptr;
 }
 
 

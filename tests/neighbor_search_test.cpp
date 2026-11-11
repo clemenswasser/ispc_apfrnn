@@ -995,6 +995,65 @@ TEST_CASE("query-major fixed writers match brute force") {
   verify_rows(values, counts, capacity + apfrnn::row_slack());
 }
 
+TEST_CASE("fixed rows placed by original point match brute force") {
+  // With a placement, every writer puts point p's row in slot p once the row
+  // buffer is reused, while counts stays in sorted order.
+  constexpr int num_points = 400;
+  constexpr float radius = 1.4f;
+  constexpr int capacity = 128;
+
+  auto cloud = apfrnn::support::make_point_cloud(num_points, 16.0f, 93);
+  apfrnn::NeighborSearchData data;
+  apfrnn::build_point_grid_inplace(data, cloud.x, cloud.y, cloud.z, radius);
+  apfrnn::build_same_set_cell_ranges_inplace(data);
+
+  apfrnn::IntBuffer values;
+  apfrnn::IntBuffer counts;
+  const apfrnn::RowPlacement placement{data.original_index.data()};
+  const std::size_t stride =
+      static_cast<std::size_t>(capacity + apfrnn::row_slack());
+
+  auto verify_rows = [&] {
+    REQUIRE(counts.size() == static_cast<std::size_t>(num_points));
+    for (int point = 0; point < num_points; ++point) {
+      const int sorted_index = apfrnn::support::sorted_index_for(data, point);
+      const int count = counts[static_cast<std::size_t>(sorted_index)];
+      REQUIRE(count <= capacity);
+      const int *row = values.data() + static_cast<std::size_t>(point) * stride;
+      std::vector<int> neighbors(row, row + count);
+      std::sort(neighbors.begin(), neighbors.end());
+      CHECK(neighbors ==
+            apfrnn::support::exact_neighbors_for(cloud, point, radius));
+    }
+  };
+
+  // A newly allocated buffer is written in query order: the placement is
+  // ignored and the writer says so.
+  CHECK_FALSE(apfrnn::write_neighbors_fixed_query_pair_parallel(
+      data, capacity, values, counts, placement));
+  for (int point = 0; point < num_points; ++point) {
+    const int sorted_index = apfrnn::support::sorted_index_for(data, point);
+    const int *row =
+        values.data() + static_cast<std::size_t>(sorted_index) * stride;
+    std::vector<int> neighbors(
+        row, row + counts[static_cast<std::size_t>(sorted_index)]);
+    std::sort(neighbors.begin(), neighbors.end());
+    CHECK(neighbors ==
+          apfrnn::support::exact_neighbors_for(cloud, point, radius));
+  }
+
+  // The buffer is reused from here on, so rows are placed.
+  CHECK(apfrnn::write_neighbors_fixed_query_pair_parallel(
+      data, capacity, values, counts, placement));
+  verify_rows();
+  CHECK(apfrnn::write_neighbors_fixed_query_active2_parallel(
+      data, capacity, values, counts, placement));
+  verify_rows();
+  CHECK(apfrnn::write_neighbors_fixed_query_oct_parallel(
+      data, capacity, values, counts, placement));
+  verify_rows();
+}
+
 TEST_CASE("native search handles empty cross-set directions") {
   constexpr float radius = 1.0f;
   auto fluid = apfrnn::support::make_point_cloud(16, 5.0f, 777);

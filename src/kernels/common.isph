@@ -101,6 +101,9 @@ struct FixedRows {
   // neighbors[row_offset[q]] and has row_capacity[q] slots.
   const uniform int *uniform row_offset;
   const uniform int *uniform row_capacity;
+  // Optional row placement for the fixed layout. When set, query q's row is
+  // row row_slot[q] of the table. Counts stay indexed by query.
+  const uniform int *uniform row_slot;
 };
 
 // Compaction strategy (APFRNN_COMPACT_TABLE overrides it on 8-wide builds):

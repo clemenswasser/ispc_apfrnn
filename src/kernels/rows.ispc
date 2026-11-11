@@ -24,7 +24,8 @@ static inline uniform int *uniform row_of(const uniform FixedRows &rows,
   if (rows.row_offset != NULL) {
     return rows.neighbors + (uniform int64)rows.row_offset[query];
   }
-  return rows.neighbors + (uniform int64)query * (rows.capacity + programCount);
+  const uniform int slot = rows.row_slot != NULL ? rows.row_slot[query] : query;
+  return rows.neighbors + (uniform int64)slot * (rows.capacity + programCount);
 }
 
 // Appends the active lanes of `value` at `out` (see store_compacted; the

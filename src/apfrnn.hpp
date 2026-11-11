@@ -419,20 +419,37 @@ void build_same_set_neighbor_lists_inplace(NeighborSearchData &data,
 
 // Query-major ISPC writer using packed_store_active2. Rows have capacity +
 // row_slack() slots so a full-gang store can overshoot the capacity.
-void write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
+// Where a fixed-row writer puts each query's row. By default row q of the
+// table belongs to sorted query q. With `slot`, it goes to row slot[q];
+// `counts` stays in query order. Rows placed by original point let a caller
+// that walks its points in its own order read the table front to back.
+struct RowPlacement {
+  const int *slot = nullptr;
+};
+
+// The same-set fixed-row writers that take a placement return whether they
+// used it. They ignore it when the row buffer was newly allocated and write
+// that frame in query order (see prepare_fixed_rows). The blocked writer takes
+// none: its rows are long enough to be read as a stream of their own, so
+// their order in the table does not matter to a reader.
+
+bool write_neighbors_fixed_query_active2_parallel(NeighborSearchData &data,
                                                   int capacity,
                                                   IntBuffer &fixed_neighbors,
-                                                  IntBuffer &counts);
+                                                  IntBuffer &counts,
+    RowPlacement placement = {});
 
-void write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
+bool write_neighbors_fixed_query_pair_parallel(NeighborSearchData &data,
                                                int capacity,
                                                IntBuffer &fixed_neighbors,
-                                               IntBuffer &counts);
+                                               IntBuffer &counts,
+    RowPlacement placement = {});
 
-void write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
+bool write_neighbors_fixed_query_oct_parallel(NeighborSearchData &data,
                                               int capacity,
                                               IntBuffer &fixed_neighbors,
-                                              IntBuffer &counts);
+                                              IntBuffer &counts,
+    RowPlacement placement = {});
 
 // Same-set rows for a grid with at most one point per cell. Enumerates the
 // 3x3x3 cell stencil by merging the sorted cell keys at constant key offsets,
@@ -567,9 +584,10 @@ void write_cross_neighbors_target_major_csr_parallel(
 
 // Same-set writer that builds the merged cell runs on the fly from the
 // set's own dense cell map, skipping the per-frame global range build.
-void write_neighbors_fixed_query_pair_dense_parallel(
+bool write_neighbors_fixed_query_pair_dense_parallel(
     NeighborSearchData &data, int capacity,
-    IntBuffer &fixed_neighbors, IntBuffer &counts);
+    IntBuffer &fixed_neighbors, IntBuffer &counts,
+    RowPlacement placement = {});
 
 // Cross writer that builds the merged target-cell runs on the fly from the
 // target's dense cell map, skipping the per-frame global range build.
