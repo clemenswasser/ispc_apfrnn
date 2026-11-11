@@ -37,6 +37,11 @@ for (uint32_t j : search.get_neighbors(fluid, boundary, i)) {
   boundary);` once and read `pair[i]`. It skips the per-call pair lookup of
   `get_neighbors` and, like the returned lists, stays valid until the next
   call that changes the search or `run()`.
+- For large moving sets, keep your particles in the search's order: every
+  few dozen steps call `search.prepare_zsort()`, then
+  `search.apply_zsort(set, data, stride)` on the positions (`stride` 3 for
+  interleaved xyz) and every other per-point array of the set, then `run()`.
+  Point indices change, so earlier lists no longer apply.
 - `set_memory_budget(bytes)` caps one row allocation (default 3 GiB). When a
   fixed-row table does not fit, the cross writer uses a compact per-row block
   layout before falling back to CSR rows.

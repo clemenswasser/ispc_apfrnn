@@ -2,7 +2,8 @@
 // stress scenes, plus the NSearch-API scenarios (Api/...).
 //
 // Replay/<backend>/<trace> is the headline family: it replays searches captured
-// from a simulation, one forward and backward pass per run. Verify/ runs the
+// from a simulation, in whole forward and backward passes, and reorders the
+// particles with each backend's z-sort every 32 frames (timed). Verify/ runs the
 // same frames untimed and checks the lists against an independent reference.
 // All timed families measure run() plus one density pass over the lists. Scene
 // updates are not timed.
@@ -184,7 +185,7 @@ Validation validate(const Backend &backend, const SceneData &scene) {
     for (int point = 0; point < scene.points(query); ++point) {
       backend.neighbors(query, target, point, row);
       const uint64_t key = mix((static_cast<uint64_t>(pair) << 32) |
-                               static_cast<uint32_t>(point));
+                               scene.trace_id(query, point));
       const float *q = q_xyz + 3 * static_cast<std::size_t>(point);
       for (uint32_t neighbor : row) {
         const float *t = t_xyz + 3 * static_cast<std::size_t>(neighbor);
@@ -192,7 +193,8 @@ Validation validate(const Backend &backend, const SceneData &scene) {
                      dz = double(t[2]) - q[2];
         const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
         if (d < r - band) {
-          result.checksum += mix(key ^ neighbor);
+          result.checksum +=
+              mix(key ^ scene.trace_id(target, static_cast<int>(neighbor)));
         } else if (d > r + band) {
           ++result.false_positives;
         }
@@ -315,9 +317,19 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   const ThreadLimit limit(thread_count);
   std::unique_ptr<Backend> backend = backend_spec.make();
   backend->setup(scene);
+  // A replay reorders its particles with the backend's z-sort on the first
+  // timed frame and every kZsortInterval frames after it, as a simulation
+  // keeps its particles in the search's order. The reordering is timed with
+  // the search. Traces whose sets change size keep the trace's order.
+  constexpr int kZsortInterval = 32;
+  const bool reorder = scene.trace && !scene.trace->resizes();
   // Two warm-up frames. Row capacities and some plans adapt after the first
-  // frame, so the second one is the one validated.
+  // frame, so the second one is the one validated. A replay reorders in
+  // between, so the validated lists are those of reordered points.
   backend->run();
+  if (reorder) {
+    backend->zsort(scene);
+  }
   advance_scene(scene, *backend, 1);
   backend->run();
 
@@ -366,8 +378,10 @@ void frames(benchmark::State &state, const SceneSpec &spec,
                  ? reference_summary.exact_pairs + reference_summary.band_pairs
                  : validation.neighbors);
   int step = 2;
+  int timed_frames = 0;
   double run_seconds = 0.0;
   double read_seconds = 0.0;
+  double zsort_seconds = 0.0;
   double read_sum = 0.0;
   for (auto _ : state) {
     double window_seconds = 0.0;
@@ -375,6 +389,12 @@ void frames(benchmark::State &state, const SceneSpec &spec,
       advance_scene(scene, *backend, step++);
       perf_region("enable\n");
       const auto start = std::chrono::steady_clock::now();
+      if (reorder && timed_frames++ % kZsortInterval == 0) {
+        backend->zsort(scene);
+        zsort_seconds += std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+      }
       backend->run();
       const auto built = std::chrono::steady_clock::now();
       read_sum += backend->read_lists(scene);
@@ -395,6 +415,7 @@ void frames(benchmark::State &state, const SceneSpec &spec,
       static_cast<double>(window) * std::max<double>(1.0, state.iterations());
   state.counters["RunMs"] = 1000.0 * run_seconds / frame_count;
   state.counters["ReadMs"] = 1000.0 * read_seconds / frame_count;
+  state.counters["ZsortMs"] = 1000.0 * zsort_seconds / frame_count;
   state.counters["Frames"] = window;
 
   const int fluid_points = scene.points(0);

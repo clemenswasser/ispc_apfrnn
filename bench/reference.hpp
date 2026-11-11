@@ -152,7 +152,7 @@ inline ReferenceSummary reference_summary(const SceneData &scene,
       const float *q = q_xyz.data() + 3 * static_cast<std::size_t>(point);
       const uint64_t key =
           reference_detail::mix((static_cast<uint64_t>(pair_index) << 32) |
-                                static_cast<uint32_t>(point));
+                                scene.trace_id(query, point));
       const reference_detail::Cell center = grid.cell_of(q);
       for (int64_t dx = -1; dx <= 1; ++dx) {
         for (int64_t dy = -1; dy <= 1; ++dy) {
@@ -172,8 +172,8 @@ inline ReferenceSummary reference_summary(const SceneData &scene,
               const double ez = double(t[2]) - q[2];
               const double distance = std::sqrt(ex * ex + ey * ey + ez * ez);
               if (distance < radius - band) {
-                summary.checksum +=
-                    reference_detail::mix(key ^ static_cast<uint32_t>(neighbor));
+                summary.checksum += reference_detail::mix(
+                    key ^ scene.trace_id(target, neighbor));
                 ++summary.exact_pairs;
               } else if (distance <= radius + band) {
                 ++summary.band_pairs;

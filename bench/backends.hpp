@@ -12,11 +12,13 @@
 #include <tbb/parallel_reduce.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
+#include <array>
 #include <vector>
 
 #ifdef APFRNN_BENCH_BASELINES
@@ -72,6 +74,10 @@ public:
   // Pointer/count changes for a growing point set. Called between frames when
   // SceneData::growing is set.
   virtual void resize(int set, const float *xyz, int n) = 0;
+  // Reorders every set's points into the library's own order with its z-sort
+  // interface, as a simulation does every few dozen steps: permutes
+  // scene.xyz in place and scene.trace_index with it.
+  virtual void zsort(SceneData &scene) = 0;
   // Neighbors of `point` of set `query` in set `target`, in any order.
   virtual void neighbors(int query, int target, int point,
                          std::vector<uint32_t> &out) const = 0;
@@ -80,6 +86,28 @@ public:
   // Backend-specific counters, recorded after the timed frames.
   virtual void add_counters(benchmark::State &) const {}
 };
+
+// Runs apply(set, data, stride) on the positions and the trace index of every
+// set; `apply` permutes one per-point array into the backend's order.
+template <typename Apply>
+inline void reorder_scene(SceneData &scene, const Apply &apply) {
+  scene.trace_index.resize(scene.xyz.size());
+  for (std::size_t set = 0; set < scene.xyz.size(); ++set) {
+    const int n = scene.points(static_cast<int>(set));
+    std::vector<int> &index = scene.trace_index[set];
+    if (index.size() != static_cast<std::size_t>(n)) {
+      index.resize(static_cast<std::size_t>(n));
+      for (int i = 0; i < n; ++i) {
+        index[static_cast<std::size_t>(i)] = i;
+      }
+    }
+    if (n == 0) {
+      continue;
+    }
+    apply(static_cast<int>(set), scene.xyz[set].data(), 3);
+    apply(static_cast<int>(set), index.data(), 1);
+  }
+}
 
 struct BackendSpec {
   std::string name;
@@ -120,6 +148,13 @@ public:
   }
 
   void run() override { search_->run(); }
+
+  void zsort(SceneData &scene) override {
+    search_->prepare_zsort();
+    reorder_scene(scene, [this](int set, auto *data, int stride) {
+      search_->apply_zsort(set, data, stride);
+    });
+  }
 
   void resize(int set, const float *xyz, int n) override {
     search_->resize_point_set(set, xyz, n);
@@ -199,6 +234,13 @@ public:
 
   void run() override { search_->run(); }
 
+  void zsort(SceneData &scene) override {
+    search_->prepare_zsort();
+    reorder_scene(scene, [this](int set, auto *data, int stride) {
+      search_->apply_zsort(set, data, stride);
+    });
+  }
+
   void resize(int set, const float *xyz, int n) override {
     search_->resize_point_set(set, xyz, n);
   }
@@ -249,6 +291,18 @@ public:
   }
 
   void run() override { search_->find_neighbors(); }
+
+  void zsort(SceneData &scene) override {
+    search_->z_sort();
+    reorder_scene(scene, [this](int set, auto *data, int stride) {
+      const auto &points = search_->point_set(static_cast<unsigned int>(set));
+      if (stride == 3) {
+        points.sort_field(reinterpret_cast<std::array<float, 3> *>(data));
+      } else {
+        points.sort_field(data);
+      }
+    });
+  }
 
   void resize(int set, const float *xyz, int n) override {
     search_->resize_point_set(

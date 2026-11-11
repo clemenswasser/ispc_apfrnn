@@ -46,6 +46,10 @@ struct SceneData {
   float flow_wavenumber = 1.0f;
   // When set, every set follows this captured trace instead of the fields above.
   std::shared_ptr<const Trace> trace;
+  // Per set: the trace point each current point is, once a backend has
+  // reordered the points (see Backend::zsort). Empty: the trace's own order.
+  // It also stands in for the other per-point arrays a simulation reorders.
+  std::vector<std::vector<int>> trace_index;
   // Sets whose point count or storage changed in the last advance().
   std::vector<int> resized;
   // Fountain-like growth: set 0 gains grow_per_frame points per frame until
@@ -61,6 +65,16 @@ struct SceneData {
 
   int points(int set) const {
     return static_cast<int>(xyz[static_cast<std::size_t>(set)].size() / 3);
+  }
+
+  // The trace point that point `i` of `set` is (i itself when the points
+  // keep the trace's order). Checksums use it, so they do not depend on how
+  // a backend reordered the points.
+  uint32_t trace_id(int set, int i) const {
+    const std::size_t s = static_cast<std::size_t>(set);
+    return s < trace_index.size() && !trace_index[s].empty()
+               ? static_cast<uint32_t>(trace_index[s][static_cast<std::size_t>(i)])
+               : static_cast<uint32_t>(i);
   }
 
   void grow(int step) {
@@ -107,7 +121,19 @@ struct SceneData {
           (resized.empty() || resized.back() != static_cast<int>(set))) {
         resized.push_back(static_cast<int>(set));
       }
-      if (values != 0) {
+      const std::vector<int> *order =
+          set < trace_index.size() && !trace_index[set].empty() &&
+                  trace_index[set].size() ==
+                      static_cast<std::size_t>(points.count)
+              ? &trace_index[set]
+              : nullptr;
+      if (order != nullptr) {
+        for (std::size_t i = 0; i < order->size(); ++i) {
+          std::memcpy(target.data() + 3 * i,
+                      points.xyz + 3 * static_cast<std::size_t>((*order)[i]),
+                      3 * sizeof(float));
+        }
+      } else if (values != 0) {
         std::memcpy(target.data(), points.xyz, values * sizeof(float));
       }
     }
