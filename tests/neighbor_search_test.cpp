@@ -495,6 +495,35 @@ TEST_CASE("zsort reorders the caller's points and stays exact") {
   }
 }
 
+TEST_CASE("sparse sets across zero sort by box offsets and stay exact") {
+  // Two dense blobs on either side of the origin: too sparse a box for the
+  // counting sort, so the cell keys go through the radix sort, and their
+  // coordinates span zero, which takes the box-relative packed keys. The
+  // blobs drift for several frames so the cells keep changing.
+  constexpr float radius = 1.0f;
+  auto cloud = apfrnn::support::make_point_cloud(24000, 9.0f, 97);
+  for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+    const float side = i % 2 == 0 ? -45.0f : 36.0f;
+    cloud.x[i] += side;
+    cloud.y[i] += side * 0.5f;
+    cloud.z[i] -= side;
+  }
+  std::vector<float> xyz = interleave(cloud);
+  apfrnn::NSearch search(radius);
+  const int set =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(false);
+  search.set_active_search(set, set, true);
+  for (int frame = 0; frame < 4; ++frame) {
+    INFO("frame " << frame);
+    translate(cloud, 0.37f, -0.21f, 0.29f);
+    xyz = interleave(cloud);
+    search.resize_point_set(set, xyz.data(), static_cast<int>(cloud.x.size()));
+    search.run();
+    check_same_set(search, set, cloud, radius);
+  }
+}
+
 TEST_CASE("native search handles invalid arguments safely") {
   auto fluid = apfrnn::support::make_point_cloud(16, 5.0f, 77);
   auto fluid_xyz = interleave(fluid);

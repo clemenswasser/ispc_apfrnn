@@ -218,26 +218,88 @@ bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
   SortPointKey *dst = scratch.data();
   // A pass whose digit is the same in every key leaves the order unchanged:
   // skip it. The digits that vary are those where the OR and AND of all keys
-  // differ, which one reduction finds.
+  // differ, which one reduction finds, together with each coordinate's range.
   struct Bits {
     uint64_t any = 0;
     uint64_t all = ~uint64_t{0};
+    int lo[3] = {INT_MAX, INT_MAX, INT_MAX};
+    int hi[3] = {INT_MIN, INT_MIN, INT_MIN};
   };
+  // The signed coordinate in the 21-bit field at `shift` (see make_key).
+  auto field = [](uint64_t key, int shift) {
+    const int value = static_cast<int>((key >> shift) & 0x1FFFFF);
+    return (value ^ 0x100000) - 0x100000;
+  };
+  constexpr int kShift[3] = {42, 21, 0};
   const Bits bits = tbb::parallel_reduce(
       tbb::blocked_range<int>(0, num_points, 1 << 14), Bits{},
       [&](const tbb::blocked_range<int> &range, Bits acc) {
         for (int i = range.begin(); i < range.end(); ++i) {
-          acc.any |= src[i].key;
-          acc.all &= src[i].key;
+          const uint64_t key = src[i].key;
+          acc.any |= key;
+          acc.all &= key;
+          for (int axis = 0; axis < 3; ++axis) {
+            const int value = field(key, kShift[axis]);
+            acc.lo[axis] = std::min(acc.lo[axis], value);
+            acc.hi[axis] = std::max(acc.hi[axis], value);
+          }
         }
         return acc;
       },
       [](Bits a, const Bits &b) {
         a.any |= b.any;
         a.all &= b.all;
+        for (int axis = 0; axis < 3; ++axis) {
+          a.lo[axis] = std::min(a.lo[axis], b.lo[axis]);
+          a.hi[axis] = std::max(a.hi[axis], b.hi[axis]);
+        }
         return a;
       });
-  const uint64_t varying_bits = bits.any ^ bits.all;
+  uint64_t varying_bits = bits.any ^ bits.all;
+  // Each coordinate is a 21-bit two's-complement field, so a set that spans
+  // a zero coordinate varies in every bit of that field and needs nearly
+  // every pass. Offsets from the set's lowest cell, packed tightly, need only
+  // as many bits as the cell box is wide. Sorting those packed keys gives the
+  // signed (x, y, z) order, which callers handle as the comparison sort's.
+  int width[3];
+  int total_width = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const uint32_t span = static_cast<uint32_t>(bits.hi[axis] - bits.lo[axis]);
+    width[axis] = 0;
+    while (width[axis] < 21 && (span >> width[axis]) != 0) {
+      ++width[axis];
+    }
+    total_width += width[axis];
+  }
+  auto passes = [](uint64_t varying) {
+    int count = 0;
+    for (int pass = 0; pass < 8; ++pass) {
+      count += ((varying >> (pass * kRadixBits)) & (kRadixBuckets - 1)) != 0;
+    }
+    return count;
+  };
+  const uint64_t packed_varying =
+      total_width >= 64 ? ~uint64_t{0} : (uint64_t{1} << total_width) - 1;
+  // Packing and unpacking cost about one pass each.
+  const bool packed = passes(packed_varying) + 2 <= passes(varying_bits);
+  const int shift_y = width[2];
+  const int shift_x = width[1] + width[2];
+  if (packed) {
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 1 << 14),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const uint64_t key = src[i].key;
+            src[i].key =
+                (static_cast<uint64_t>(field(key, 42) - bits.lo[0])
+                 << shift_x) |
+                (static_cast<uint64_t>(field(key, 21) - bits.lo[1])
+                 << shift_y) |
+                static_cast<uint64_t>(field(key, 0) - bits.lo[2]);
+          }
+        });
+    varying_bits = packed_varying;
+  }
   for (int pass = 0; pass < 8; ++pass) {
     if (((varying_bits >> (pass * kRadixBits)) & (kRadixBuckets - 1)) == 0) {
       continue;
@@ -289,6 +351,23 @@ bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
   }
   if (src != keys.data()) {
     std::copy(src, src + num_points, keys.data());
+  }
+  if (packed) {
+    const uint64_t mask_y = (uint64_t{1} << width[1]) - 1;
+    const uint64_t mask_z = (uint64_t{1} << width[2]) - 1;
+    SortPointKey *out = keys.data();
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 1 << 14),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            const uint64_t key = out[i].key;
+            out[i].key = make_key(
+                static_cast<int>(key >> shift_x) + bits.lo[0],
+                static_cast<int>((key >> shift_y) & mask_y) + bits.lo[1],
+                static_cast<int>(key & mask_z) + bits.lo[2]);
+          }
+        });
+    return true;
   }
   return false;
 }
