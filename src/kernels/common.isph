@@ -32,8 +32,9 @@ struct Cells {
   const uniform uint64 *uniform keys;
 };
 
-// Dense cell lookup: cells[(z * ny + y) * nx + x] is a cell index or -1,
-// with x/y/z relative to (min_x, min_y, min_z).
+// Dense cell lookup: cells[(x * ny + y) * nz + z] is a cell index or -1,
+// with x/y/z relative to (min_x, min_y, min_z). z varies fastest, as in the
+// cell key order, so consecutive cells read neighboring lookup entries.
 struct DenseGrid {
   const uniform int *uniform cells;
   uniform int nx, ny, nz;

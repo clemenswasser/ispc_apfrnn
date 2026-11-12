@@ -1493,7 +1493,6 @@ inline void build_dense_cell_lookup(NeighborSearchData &data) {
   if (data.cell_ranges_implicit) {
     ensure_cell_ranges(data);
   }
-  data.dense_cells.assign(static_cast<std::size_t>(total_cells), -1);
   data.dense_nx = static_cast<int>(nx);
   data.dense_ny = static_cast<int>(ny);
   data.dense_nz = static_cast<int>(nz);
@@ -1501,16 +1500,34 @@ inline void build_dense_cell_lookup(NeighborSearchData &data) {
   data.dense_min_y = min_y;
   data.dense_min_z = min_z;
 
-  for (int cell = 0; cell < data.num_cells; ++cell) {
-    const uint64_t key =
-        data.scratch_unique_keys[static_cast<std::size_t>(cell)];
-    const int lx = unpack_coord(key, 42) - min_x;
-    const int ly = unpack_coord(key, 21) - min_y;
-    const int lz = unpack_coord(key, 0) - min_z;
-    const int64_t index =
-        (static_cast<int64_t>(lz) * data.dense_ny + ly) * data.dense_nx + lx;
-    data.dense_cells[static_cast<std::size_t>(index)] = cell;
+  // The lookup is rebuilt every frame over the whole cell box; both passes
+  // run in parallel. Every occupied cell owns its slot, so the scatter needs
+  // no synchronization.
+  int *lookup = nullptr;
+  {
+    data.dense_cells.resize(static_cast<std::size_t>(total_cells));
+    lookup = data.dense_cells.data();
+    constexpr int64_t kFillGrain = 1 << 16;
+    tbb::parallel_for(tbb::blocked_range<int64_t>(0, total_cells, kFillGrain),
+                      [&](const tbb::blocked_range<int64_t> &range) {
+                        std::fill(lookup + range.begin(), lookup + range.end(),
+                                  -1);
+                      });
   }
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const int64_t row = nz;
+  const int64_t plane = ny * nz;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, data.num_cells, 1 << 14),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int cell = range.begin(); cell < range.end(); ++cell) {
+          const uint64_t key = keys[cell];
+          const int64_t lx = unpack_coord(key, 42) - min_x;
+          const int64_t ly = unpack_coord(key, 21) - min_y;
+          const int64_t lz = unpack_coord(key, 0) - min_z;
+          lookup[lx * plane + ly * row + lz] = cell;
+        }
+      });
   data.dense_valid = true;
 }
 
@@ -5044,7 +5061,7 @@ void write_cross_neighbors_target_major_parallel(
                   continue;
                 }
                 const int cell = dense_cells[static_cast<std::size_t>(
-                    (lz * ny + ly) * nx + lx)];
+                    (lx * ny + ly) * nz + lz)];
                 if (cell < 0) {
                   continue;
                 }

@@ -64,7 +64,7 @@ export void collect_neighbor_cells_dense(
               (lz >= 0) && (lz < grid.nz);
 
           if (in_bounds) {
-            varying int dense_index = (lz * grid.ny + ly) * grid.nx + lx;
+            varying int dense_index = (lx * grid.ny + ly) * grid.nz + lz;
             varying int neighbor_cell = grid.cells[dense_index];
             if (neighbor_cell != -1) {
               varying int write_index = cell * stride + count;
@@ -180,7 +180,7 @@ export void merge_dense_neighbor_ranges(
           if (lx >= 0 && lx < grid.nx && ly >= 0 && ly < grid.ny && lz >= 0 &&
               lz < grid.nz) {
             const varying int neighbor =
-                grid.cells[(lz * grid.ny + ly) * grid.nx + lx];
+                grid.cells[(lx * grid.ny + ly) * grid.nz + lz];
             if (neighbor != -1) {
               merge_range(targets.starts[neighbor], targets.ends[neighbor],
                           run_start, run_end, runs, slot, write, out_starts,
@@ -336,8 +336,8 @@ export void dense_stencil9_ranges(
           const varying int safe_lz = inside ? lz : 0;
           const varying int neighbor =
               inside
-                  ? grid.cells[(safe_lz * grid.ny + safe_ly) * grid.nx +
-                               safe_lx]
+                  ? grid.cells[(safe_lx * grid.ny + safe_ly) * grid.nz +
+                               safe_lz]
                   : -1;
           const varying bool valid = neighbor >= 0;
           const varying int safe_neighbor = valid ? neighbor : 0;
