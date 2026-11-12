@@ -534,7 +534,7 @@ static inline uniform int copy_near(const uniform Points &tpts, int j,
   const float ex = max(max(lo.x - x, x - hi.x), 0.0f);
   const float ey = max(max(lo.y - y, y - hi.y), 0.0f);
   const float ez = max(max(lo.z - z, z - hi.z), 0.0f);
-  const bool keep = valid && ex * ex + ey * ey + ez * ez <= r2;
+  const bool keep = and(valid, ex * ex + ey * ey + ez * ez <= r2);
   store_compacted((uniform int *uniform)gx, keep, intbits(x), perm);
   store_compacted((uniform int *uniform)gy, keep, intbits(y), perm);
   store_compacted((uniform int *uniform)gz, keep, intbits(z), perm);
@@ -550,10 +550,9 @@ static inline uniform int copy_near(const uniform Points &tpts, int j,
 // cell instead of one per run. Returns false, leaving the runs unchanged,
 // when the candidates could exceed GATHER_MAX.
 //
-// Every run is copied with the same number of whole gangs, the most any run
-// needs, so the copy loop's exit does not depend on the run; lanes past a
-// run's end are masked off. Runs whose last gang would read past the targets'
-// end clamp their indices instead.
+// Runs are copied in whole gangs with the lanes past a run's end masked off;
+// runs whose last gang would read past the targets' end clamp their indices
+// instead.
 static inline uniform bool gather_runs(const uniform Points &tpts,
                                        uniform int num_targets,
                                        const uniform Points &qpts,
@@ -566,14 +565,9 @@ static inline uniform bool gather_runs(const uniform Points &tpts,
                                        uniform float gx[], uniform float gy[],
                                        uniform float gz[], uniform int gi[]) {
   uniform int total = 0;
-  uniform int longest = 0;
   for (uniform int run = 0; run < num_runs; ++run) {
-    const uniform int length = run_end[run] - run_start[run];
-    total += length;
-    longest = max(longest, length);
+    total += run_end[run] - run_start[run];
   }
-  const uniform int span =
-      (longest + programCount - 1) & ~(programCount - 1);
   if (total > GATHER_MAX) {
     return false;
   }
@@ -595,6 +589,7 @@ static inline uniform bool gather_runs(const uniform Points &tpts,
   for (uniform int run = 0; run < num_runs; ++run) {
     const uniform int first = run_start[run];
     const uniform int length = run_end[run] - first;
+    const uniform int span = (length + programCount - 1) & ~(programCount - 1);
     if (first + span <= num_targets) {
       for (uniform int k = 0; k < span; k += programCount) {
         const int j = first + k + programIndex;
