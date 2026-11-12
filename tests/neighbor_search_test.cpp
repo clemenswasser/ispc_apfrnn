@@ -2275,10 +2275,10 @@ TEST_CASE("sparse same-set rows stay exact through moving frames") {
   CHECK(saw_neighbors);
 }
 
-TEST_CASE("hybrid cross rows stay exact across moving frames") {
+TEST_CASE("packed cross rows stay exact across moving frames") {
   // Most source points see none of the dense target blob; a few see many.
-  // The hybrid fixed base plus per-row overflow rows must stay exact while
-  // the source moves.
+  // The dense cross writer packs these very uneven rows, and they must stay
+  // exact through both read paths while the source moves.
   constexpr int kSourcePoints = 132000;
   constexpr float kRadius = 1.7f;
   auto source = apfrnn::support::make_point_cloud(kSourcePoints, 46.0f, 71);
@@ -2323,17 +2323,16 @@ TEST_CASE("hybrid cross rows stay exact across moving frames") {
     }
     search.run();
     CAPTURE(search.last_stats().paths);
-    // The first frame writes the fixed rows and seeds the layout; the hybrid
-    // writer takes over from the next frame.
-    if (frame > 0) {
-      CHECK((search.last_stats().paths & apfrnn::NSearch::kPathCrossBlocked) !=
-            0);
-    }
+    CHECK((search.last_stats().paths & apfrnn::NSearch::kPathCrossPairDense) !=
+          0);
+    const apfrnn::PairNeighbors view = search.neighbors(source_id, target_id);
     for (int point = 0; point < kSourcePoints; point += kSourcePoints / 40) {
       CAPTURE(point);
+      const auto exact = apfrnn::support::exact_cross_neighbors_for(
+          source, point, target, kRadius);
       CHECK(sorted_neighbors(search.get_neighbors(source_id, target_id, point)) ==
-            apfrnn::support::exact_cross_neighbors_for(source, point, target,
-                                                       kRadius));
+            exact);
+      CHECK(sorted_neighbors(view[point]) == exact);
     }
   }
 }

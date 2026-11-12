@@ -586,11 +586,27 @@ void write_cross_neighbors_target_major_csr_parallel(
 // set's own dense cell map, skipping the per-frame global range build. Rows
 // are packed without padding: row q (sorted index) starts at
 // neighbors[row_offset[q]] and holds min(counts[q], capacity) entries.
-// Returns false when the output would not fit int offsets.
+// known_total, when not negative, is the exact entry total (counts from an
+// earlier write over the same grid) and sizes the output; otherwise it is
+// sized for full rows. Returns false when the output would not fit int
+// offsets or known_total was short.
 bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
                                            int capacity, IntBuffer &neighbors,
                                            IntBuffer &counts,
-                                           IntBuffer &row_offset);
+                                           IntBuffer &row_offset,
+                                           int64_t known_total = -1);
+
+// Output slots the packed writers reserve for row_total entries.
+int64_t packed_rows_chunk(int capacity);
+int64_t packed_rows_slots(int64_t row_total, int capacity, int threads);
+
+// Cross counterpart of write_neighbors_packed_dense_parallel: packed rows
+// for the source's points against the target's dense grid.
+bool write_cross_neighbors_packed_dense_parallel(
+    const CrossNeighborSearchData &query_data,
+    const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data, int capacity, IntBuffer &neighbors,
+    IntBuffer &counts, IntBuffer &row_offset, int64_t known_total = -1);
 
 // Cross writer that builds the merged target-cell runs on the fly from the
 // target's dense cell map, skipping the per-frame global range build.

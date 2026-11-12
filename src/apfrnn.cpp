@@ -5070,11 +5070,29 @@ void write_cross_neighbors_target_major_parallel(
 
 }
 
-bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
-                                           int capacity, IntBuffer &neighbors,
-                                           IntBuffer &counts,
-                                           IntBuffer &row_offset) {
-  const int num_points = data.num_points;
+int64_t packed_rows_chunk(int capacity) {
+  return std::max<int64_t>(8192, int64_t{16} * capacity);
+}
+
+int64_t packed_rows_slots(int64_t row_total, int capacity, int threads) {
+  // Each thread fills its own chunks of the output front to back. A row that
+  // does not fit a chunk's remainder starts the next chunk, so with chunks of
+  // at least 16 rows the waste stays below 1/15 of the rows plus one chunk
+  // per thread.
+  return row_total + row_total / 14 +
+         static_cast<int64_t>(threads + 1) * packed_rows_chunk(capacity);
+}
+
+namespace {
+
+// Packed rows for the queries of `source` against the dense grid of
+// `target` (see write_neighbors_packed_dense_parallel).
+bool write_packed_dense_rows(const NeighborSearchData &source,
+                             const NeighborSearchData &target, int group,
+                             bool same_set, float radius, int capacity,
+                             int64_t known_total, IntBuffer &neighbors,
+                             IntBuffer &counts, IntBuffer &row_offset) {
+  const int num_points = source.num_points;
   const std::size_t n = static_cast<std::size_t>(num_points);
   const int stride = capacity + row_slack();
   counts.resize(n);
@@ -5082,16 +5100,11 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
   if (num_points == 0) {
     return true;
   }
-  // Each thread fills its own chunks of the output front to back. A row that
-  // does not fit a chunk's remainder starts the next chunk, so with chunks of
-  // at least 32 rows the waste stays below 1/31 of the rows plus one chunk
-  // per thread.
   const int threads = std::max(1, tbb::this_task_arena::max_concurrency());
-  const int64_t chunk =
-      std::max<int64_t>(int64_t{1} << 14, int64_t{32} * capacity);
-  const int64_t rows_total = static_cast<int64_t>(n) * capacity;
-  const int64_t required =
-      rows_total + rows_total / 31 + static_cast<int64_t>(threads + 1) * chunk;
+  const int64_t chunk = packed_rows_chunk(capacity);
+  const int64_t required = packed_rows_slots(
+      known_total >= 0 ? known_total : static_cast<int64_t>(n) * capacity,
+      capacity, threads);
   if (required > INT_MAX) {
     return false;
   }
@@ -5104,56 +5117,70 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
   neighbors.resize(static_cast<std::size_t>(required));
   hint_huge_pages(neighbors.data(), neighbors.size() * sizeof(int));
 
-  const ispc::Cells cells = cells_of(data);
-  const ispc::DenseGrid grid = dense_of(data);
-  const ispc::Points pts = points_of(data);
-  const float r2 = data.radius * data.radius;
+  const ispc::Cells queries = cells_of(source);
+  const ispc::DenseGrid grid = dense_of(target);
+  const ispc::Cells targets = cells_of(target);
+  const ispc::Points qpts = points_of(source);
+  const ispc::Points tpts = points_of(target);
+  const float r2 = radius * radius;
   // One cell's rows at full stride fit a small per-thread table that stays
   // in L1; only the copies of the filled entries reach the output.
-  const std::size_t table_size =
-      static_cast<std::size_t>(std::max(1, data.max_cell_points)) * stride;
-  // Dense cells hold ~7 points, so an eight-query group covers a whole cell
-  // per candidate pass instead of splitting it into two quads.
-  constexpr int kSameGroup = 8;
   struct alignas(64) Cursor {
     int64_t next = 0;
     int64_t end = 0;
   };
   std::vector<Cursor> cursors(static_cast<std::size_t>(threads));
   std::atomic<int64_t> next_chunk{0};
+  std::atomic<bool> full{false};
   int *const out = neighbors.data();
-  parallel_cells(0, data.num_cells, cell_grain(data.num_cells),
+  parallel_cells(0, source.num_cells, cell_grain(source.num_cells),
                  [&](int begin, int end) {
     static thread_local IntBuffer table;
-    if (table.size() < table_size) {
-      table.resize(table_size);
-    }
     int tid = tbb::this_task_arena::current_thread_index();
     if (tid < 0 || tid >= threads) {
       tid = 0;
     }
     Cursor &cursor = cursors[static_cast<std::size_t>(tid)];
-    // Rows are addressed through row_offset, first at their table slot and
-    // then, once copied, at their place in the output.
-    const ispc::FixedRows rows = {capacity, neighbor_permutation_table(),
-                                  nullptr,  counts.data(),
-                                  table.data(), row_offset.data(),
-                                  nullptr,  nullptr};
     for (int cell = begin; cell < end; ++cell) {
-      const int q_begin = data.cell_starts[static_cast<std::size_t>(cell)];
-      const int q_end = data.cell_ends[static_cast<std::size_t>(cell)];
+      const int q_begin = source.cell_starts[static_cast<std::size_t>(cell)];
+      const int q_end = source.cell_ends[static_cast<std::size_t>(cell)];
+      const std::size_t table_size = static_cast<std::size_t>(q_end - q_begin) *
+                                     static_cast<std::size_t>(stride);
+      if (table.size() < table_size) {
+        table.resize(table_size);
+      }
+      // Rows are addressed through row_offset, first at their table slot and
+      // then, once copied, at their place in the output.
       for (int q = q_begin; q < q_end; ++q) {
         row_offset[static_cast<std::size_t>(q)] = (q - q_begin) * stride;
       }
-      ispc::write_fixed_rows_dense(cell, cell + 1, kSameGroup, &cells, &grid,
-                                   &cells, &pts, &pts, true, r2, &rows);
+      const ispc::FixedRows rows = {capacity, neighbor_permutation_table(),
+                                    nullptr,  counts.data(),
+                                    table.data(), row_offset.data(),
+                                    nullptr,  nullptr};
+      ispc::write_fixed_rows_dense(cell, cell + 1, group, &queries, &grid,
+                                   &targets, &qpts, &tpts, same_set, r2,
+                                   &rows);
       for (int q = q_begin; q < q_end; ++q) {
         const int count =
             std::min(counts[static_cast<std::size_t>(q)], capacity);
+        if (count == 0) {
+          // Empty rows (most rows of a sparse cross pair) need no copy;
+          // any start is valid for them.
+          row_offset[static_cast<std::size_t>(q)] = 0;
+          continue;
+        }
         if (cursor.next + count > cursor.end) {
           cursor.next =
               next_chunk.fetch_add(chunk, std::memory_order_relaxed);
           cursor.end = cursor.next + chunk;
+          if (cursor.end > required) {
+            // Only reachable when known_total was too small: stop writing
+            // and report the failure.
+            full.store(true, std::memory_order_relaxed);
+            cursor.next = cursor.end = 0;
+            return;
+          }
         }
         std::memcpy(out + cursor.next,
                     table.data() + static_cast<std::size_t>(q - q_begin) *
@@ -5165,7 +5192,38 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
       }
     }
   });
-  return true;
+  return !full.load(std::memory_order_relaxed);
+}
+
+} // namespace
+
+bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
+                                           int capacity, IntBuffer &neighbors,
+                                           IntBuffer &counts,
+                                           IntBuffer &row_offset,
+                                           int64_t known_total) {
+  // Dense cells hold ~7 points, so an eight-query group covers a whole cell
+  // per candidate pass instead of splitting it into two quads.
+  return write_packed_dense_rows(data, data, 8, true, data.radius, capacity,
+                                 known_total, neighbors, counts, row_offset);
+}
+
+bool write_cross_neighbors_packed_dense_parallel(
+    const CrossNeighborSearchData &query_data,
+    const NeighborSearchData &source_data,
+    const NeighborSearchData &target_data, int capacity, IntBuffer &neighbors,
+    IntBuffer &counts, IntBuffer &row_offset, int64_t known_total) {
+  // Sparse targets (under 4 points per cell) leave enough work per candidate
+  // load to share it between eight queries (one cell); denser ones use pairs.
+  const bool sparse_target =
+      target_data.num_cells > 0 && target_data.num_points > 0 &&
+      target_data.max_cell_points > 0 && target_data.max_cell_points <= 64 &&
+      static_cast<int64_t>(target_data.num_points) <
+          4 * static_cast<int64_t>(target_data.num_cells);
+  return write_packed_dense_rows(source_data, target_data,
+                                 sparse_target ? 8 : 2, false,
+                                 query_data.radius, capacity, known_total,
+                                 neighbors, counts, row_offset);
 }
 
 

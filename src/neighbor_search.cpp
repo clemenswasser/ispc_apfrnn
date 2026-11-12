@@ -21,6 +21,7 @@
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
 #include <tbb/parallel_scan.h>
+#include <tbb/task_arena.h>
 #include <vector>
 
 namespace apfrnn {
@@ -89,6 +90,28 @@ int max_row_count(const IntBuffer &counts) {
         return acc;
       },
       [](int a, int b) { return std::max(a, b); });
+}
+
+// Entries the rows hold in total, the exact size of a packed layout.
+int64_t row_total(const IntBuffer &counts) {
+  return tbb::parallel_reduce(
+      tbb::blocked_range<std::size_t>(0, counts.size(), std::size_t{1} << 16),
+      int64_t{0},
+      [&](const tbb::blocked_range<std::size_t> &range, int64_t acc) {
+        for (std::size_t i = range.begin(); i < range.end(); ++i) {
+          acc += counts[i];
+        }
+        return acc;
+      },
+      [](int64_t a, int64_t b) { return a + b; });
+}
+
+// Whether packed rows of `total` entries fit the memory budget.
+bool packed_rows_fit(int64_t total, int capacity, int64_t memory_budget) {
+  const int threads = std::max(1, tbb::this_task_arena::max_concurrency());
+  return packed_rows_slots(total, capacity, threads) *
+             static_cast<int64_t>(sizeof(int)) <=
+         memory_budget;
 }
 
 // Whether the caller's point order follows the grid's sorted order, so rows
@@ -238,6 +261,9 @@ struct NSearch::Pair {
   // merely rewrites unchanged rows.
   bool cross_block_valid = false;
   bool cross_block_active = false;
+  // Packed cross rows: cross_row_offset gives each sorted row's start, with
+  // no padding between rows (see write_cross_neighbors_packed_dense_parallel).
+  bool cross_packed = false;
   int cross_block_size = 0;
   int cross_block_capacity = 0;
   uint64_t cross_block_source_generation = 0;
@@ -738,6 +764,7 @@ void NSearch::run_frame() {
           pair.last_fixed_capacity =
               plan::cross_fitted_capacity(max_count, capacity);
           pair.cross_block_active = false;
+          pair.cross_packed = false;
           pair.same_set = false;
           pair.valid = true;
           pair.cross.radius = radius;
@@ -1248,6 +1275,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   PointSet &target = sets_[static_cast<std::size_t>(set_j)];
   pair.incremental_rows_owned = false;
   pair.fixed_valid = false;
+  pair.cross_packed = false;
   pair.fixed_max_count = -1;
   pair.same_set = false;
   pair.valid = true;
@@ -1270,6 +1298,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       pair.last_fixed_capacity =
           plan::cross_fitted_capacity(max_count, capacity);
       pair.cross_block_active = false;
+      pair.cross_packed = false;
       note_path(kPathCrossCellRange);
       return;
     }
@@ -1314,6 +1343,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.fixed_valid = false;
     pair.fixed_max_count = -1;
     pair.cross_block_active = false;
+    pair.cross_packed = false;
     pair.cross_block_valid = false;
     IntBuffer().swap(pair.fixed_neighbors);
     IntBuffer().swap(pair.fixed_counts);
@@ -1324,7 +1354,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.valid = true;
     return;
   }
-  auto try_fixed = [&](int capacity) {
+  auto try_fixed = [&](int capacity, int64_t known_total = -1) {
     switch (cross_plan.writer) {
     case plan::CrossWriter::TargetMajor:
       note_path(kPathCrossTargetMajor);
@@ -1334,9 +1364,12 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       break;
     case plan::CrossWriter::PairDense:
       note_path(kPathCrossPairDense);
-      write_cross_neighbors_fixed_query_pair_dense_parallel(
-          pair.cross, source.data, target.data, capacity,
-          pair.fixed_neighbors, pair.fixed_counts);
+      if (!write_cross_neighbors_packed_dense_parallel(
+              pair.cross, source.data, target.data, capacity,
+              pair.fixed_neighbors, pair.fixed_counts,
+              pair.cross_row_offset, known_total)) {
+        return false;
+      }
       break;
     case plan::CrossWriter::QueryPair:
       note_path(kPathCrossQueryPair);
@@ -1364,6 +1397,12 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     pair.fixed_max_count = max_count;
     pair.fixed_valid = true;
     pair.cross_block_active = false;
+    pair.cross_packed = cross_plan.writer == plan::CrossWriter::PairDense;
+    if (pair.cross_packed) {
+      // cross_row_offset now holds the packed starts, not a block layout.
+      pair.cross_block_valid = false;
+      pair.cross_hybrid_active = false;
+    }
     pair.fixed_capacity = capacity + row_slack();
     pair.last_fixed_capacity = plan::cross_fitted_capacity(max_count, capacity);
     return true;
@@ -1392,11 +1431,12 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
         cross_plan.writer == plan::CrossWriter::PairDense;
     const bool dense_ranges =
         cross_plan.writer == plan::CrossWriter::PairDense;
+    // The dense writer packs its rows, so the block and hybrid layouts, which
+    // exist to cut padding, cannot hold fewer slots.
     const bool block_supported =
         source.data.num_points >= kCrossBlockMinPoints &&
         (cross_plan.writer == plan::CrossWriter::Active2 ||
-         cross_plan.writer == plan::CrossWriter::QueryPair ||
-         cross_plan.writer == plan::CrossWriter::PairDense);
+         cross_plan.writer == plan::CrossWriter::QueryPair);
     if (block_supported &&
         build_cross_block_rows(pair, source, target, pair_queries,
                                dense_ranges)) {
@@ -1408,10 +1448,9 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
       return;
     }
     if (try_fixed(cross_plan.first_capacity)) {
-      remember_cross_block_rows(pair, source, target,
-                                cross_plan.first_capacity);
-      if (cross_plan.writer == plan::CrossWriter::PairDense) {
-        seed_cross_hybrid(pair, source);
+      if (block_supported) {
+        remember_cross_block_rows(pair, source, target,
+                                  cross_plan.first_capacity);
       }
       return;
     }
@@ -1420,8 +1459,20 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     // the capacity the fixed path would need (not the small starting
     // capacity) so a layout that only wins because of padding is accepted.
     const int max_count = max_row_count(pair.fixed_counts);
-    const int grown = plan::cross_grown_capacity(
+    int grown = plan::cross_grown_capacity(
         max_count, source.data.num_points, memory_budget_);
+    // The failed write counted every row, so packed rows can be sized
+    // exactly; they fit the budget far more often than full rows.
+    int64_t known_total = -1;
+    if (cross_plan.writer == plan::CrossWriter::PairDense) {
+      known_total = row_total(pair.fixed_counts);
+      const int packed_capacity = plan::cross_grown_capacity(
+          max_count, source.data.num_points, INT64_MAX);
+      if (grown == 0 && packed_capacity > 0 &&
+          packed_rows_fit(known_total, packed_capacity, memory_budget_)) {
+        grown = packed_capacity;
+      }
+    }
     if (block_supported) {
       const int compare_capacity =
           grown > 0 ? grown : ((max_count + 63) & ~63);
@@ -1434,10 +1485,9 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
     }
     if (grown > 0) {
       note_path(kPathCrossGrown);
-      if (try_fixed(grown)) {
-        remember_cross_block_rows(pair, source, target, grown);
-        if (cross_plan.writer == plan::CrossWriter::PairDense) {
-          seed_cross_hybrid(pair, source);
+      if (try_fixed(grown, known_total)) {
+        if (block_supported) {
+          remember_cross_block_rows(pair, source, target, grown);
         }
         return;
       }
@@ -1453,6 +1503,7 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
 
   note_path(kPathCrossCsr);
   pair.cross_block_active = false;
+  pair.cross_packed = false;
   pair.cross_block_valid = false;
   // The CSR path is the low-memory fallback; release the block-row layout and
   // cached capacities so it does not keep the memory it was meant to save.
@@ -1633,7 +1684,7 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
                         pair.cross_hybrid_offset[
                             static_cast<std::size_t>(sorted_index)]);
       }
-    } else if (pair.cross_block_active) {
+    } else if (pair.cross_block_active || pair.cross_packed) {
       neighbors = pair.fixed_neighbors.data() +
                   static_cast<std::size_t>(
                       pair.cross_row_offset[
@@ -1714,7 +1765,7 @@ void NSearch::build_row_views() {
           view.fixed_limit = pair.cross_hybrid_base;
           view.stride = static_cast<std::size_t>(pair.cross_hybrid_base +
                                                  row_slack());
-        } else if (pair.cross_block_active) {
+        } else if (pair.cross_block_active || pair.cross_packed) {
           view.offsets = pair.cross_row_offset.data();
         } else {
           view.stride = static_cast<std::size_t>(pair.fixed_capacity);
@@ -1785,6 +1836,7 @@ bool NSearch::set_search_backend(SearchBackend backend) {
       pair.valid = false;
       pair.fixed_valid = false;
       pair.cross_block_active = false;
+      pair.cross_packed = false;
       pair.gpu_rows = false;
       pair.gpu_neighbors = nullptr;
       pair.gpu_offsets = nullptr;
@@ -2159,7 +2211,7 @@ void NSearch::build_grid_same_lists(int set) {
     }
   }
 
-  auto try_fixed = [&](int capacity) {
+  auto try_fixed = [&](int capacity, int64_t known_total = -1) {
     // Rows go to their original point's slot: the caller reads rows in its
     // own point order, which is unrelated to the grid's sorted order once
     // the points have moved.
@@ -2171,7 +2223,7 @@ void NSearch::build_grid_same_lists(int set) {
       note_path(kPathSamePairDense);
       if (!write_neighbors_packed_dense_parallel(
               data, capacity, point_set.fixed_neighbors,
-              point_set.fixed_counts, point_set.row_offset)) {
+              point_set.fixed_counts, point_set.row_offset, known_total)) {
         return false;
       }
       packed = true;
@@ -2269,12 +2321,23 @@ void NSearch::build_grid_same_lists(int set) {
     if (first_capacity > 0 && try_fixed(first_capacity)) {
       return;
     }
-    const int grown = plan::same_grown_capacity(
-        max_row_count(point_set.fixed_counts), data.num_points,
-        memory_budget_);
+    const int max_count = max_row_count(point_set.fixed_counts);
+    int grown =
+        plan::same_grown_capacity(max_count, data.num_points, memory_budget_);
+    // As for cross rows: packed rows are sized from the exact counts.
+    int64_t known_total = -1;
+    if (same_plan.writer == plan::SameWriter::PairDense) {
+      known_total = row_total(point_set.fixed_counts);
+      const int packed_capacity =
+          plan::same_grown_capacity(max_count, data.num_points, INT64_MAX);
+      if (grown == 0 && packed_capacity > 0 &&
+          packed_rows_fit(known_total, packed_capacity, memory_budget_)) {
+        grown = packed_capacity;
+      }
+    }
     if (grown > 0) {
       note_path(kPathSameGrown);
-      if (try_fixed(grown)) {
+      if (try_fixed(grown, known_total)) {
         return;
       }
     }
@@ -2798,6 +2861,7 @@ bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
           static_cast<std::size_t>(num_points)) {
     pair.cross_block_valid = false;
     pair.cross_block_active = false;
+    pair.cross_packed = false;
     return false;
   }
   // A budget lowered after the layout was cached must still be honored.
@@ -2812,6 +2876,7 @@ bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
     if (bytes > memory_budget_) {
       pair.cross_block_valid = false;
       pair.cross_block_active = false;
+      pair.cross_packed = false;
       return false;
     }
   }
@@ -2839,6 +2904,7 @@ bool NSearch::build_cross_block_rows(Pair &pair, PointSet &source,
 bool NSearch::remember_cross_block_rows(Pair &pair, PointSet &source,
                                         PointSet &target, int capacity) {
   pair.cross_block_active = false;
+  pair.cross_packed = false;
   // A moving set rebuilds its grid every frame, so a block layout learned now
   // cannot be reused and the scan would only add work. An infinite distance is
   // the first sync (no previous coordinates), not observed motion, so a static
@@ -3130,6 +3196,7 @@ bool NSearch::build_cross_hybrid_rows(Pair &pair, PointSet &source,
   }
   note_path(kPathCrossBlocked);
   pair.cross_block_active = false;
+  pair.cross_packed = false;
   pair.cross_block_valid = false;
   pair.cross_hybrid_active = true;
   pair.fixed_valid = true;
@@ -3181,8 +3248,12 @@ bool NSearch::transpose_cross_pair(Pair &forward, Pair &reverse,
     }
     const int source_id = source_original[row];
     const int *neighbors =
-        forward_rows + static_cast<std::size_t>(row) *
-                           static_cast<std::size_t>(forward_stride);
+        forward_rows +
+        (forward.cross_packed
+             ? static_cast<std::size_t>(
+                   forward.cross_row_offset[static_cast<std::size_t>(row)])
+             : static_cast<std::size_t>(row) *
+                   static_cast<std::size_t>(forward_stride));
     for (int k = 0; k < count; ++k) {
       const int reverse_row = target_to_sorted[neighbors[k]];
       int &filled = reverse_counts[reverse_row];
@@ -3209,6 +3280,7 @@ bool NSearch::transpose_cross_pair(Pair &forward, Pair &reverse,
       plan::cross_fitted_capacity(max_count, capacity);
   reverse.fixed_valid = true;
   reverse.cross_block_active = false;
+  reverse.cross_packed = false;
   reverse.same_set = false;
   reverse.valid = true;
   reverse.cross.radius = radius_;
@@ -3445,6 +3517,7 @@ void NSearch::clear_pair(Pair &pair) {
   pair.same_set = false;
   pair.fixed_valid = false;
   pair.cross_block_active = false;
+  pair.cross_packed = false;
   pair.cross_hybrid_active = false;
   pair.gpu_rows = false;
   pair.gpu_neighbors = nullptr;
