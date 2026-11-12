@@ -148,8 +148,9 @@ TEST_CASE("grown capacities respect limits and budget") {
 TEST_CASE("block row budget adds the 64 MiB slack after the per-point term") {
   constexpr int64_t kSlack = int64_t(64) << 20;
   CHECK(apfrnn::plan::block_output_budget(0, 0) == kSlack);
+  // Each row's padding is one gang of slack, so it follows the gang width.
   CHECK(apfrnn::plan::block_output_budget(1000, 10) ==
-        1000 * 4 + 10 * 32 + kSlack);
+        1000 * 4 + 10 * apfrnn::row_slack() * 4 + kSlack);
   // The slack must not multiply the exact-neighbor term.
   CHECK(apfrnn::plan::block_output_budget(1, 1) < kSlack + 1024);
 }

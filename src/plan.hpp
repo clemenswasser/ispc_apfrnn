@@ -62,8 +62,8 @@ CrossPlan cross_set(const NeighborSearchData &source, int source_last_capacity,
                     const NeighborSearchData &target, int pair_last_capacity,
                     int64_t memory_budget);
 
-// Budget for one block-row allocation: the exact neighbor bytes, 32 bytes per
-// point for offsets and capacities, and 64 MiB of slack.
+// Budget for one block-row allocation: the exact neighbor bytes, each row's
+// slack of one gang, and 64 MiB of slack.
 int64_t block_output_budget(int64_t exact_neighbors, int num_points);
 
 // Capacity for the retry after a fixed-row overflow, or 0 when the rows would

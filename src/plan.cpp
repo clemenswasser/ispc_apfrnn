@@ -181,8 +181,11 @@ bool place_rows_by_point(int64_t row_bytes) {
 }
 
 int64_t block_output_budget(int64_t exact_neighbors, int num_points) {
+  // Per row: the gang of slack after it, which grows with the gang width.
+  const int64_t row_padding =
+      static_cast<int64_t>(row_slack()) * static_cast<int64_t>(sizeof(int));
   return exact_neighbors * static_cast<int64_t>(sizeof(int)) +
-         static_cast<int64_t>(num_points) * 32 +
+         static_cast<int64_t>(num_points) * row_padding +
          (static_cast<int64_t>(64) << 20);
 }
 
