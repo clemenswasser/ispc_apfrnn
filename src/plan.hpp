@@ -33,7 +33,7 @@ struct SamePlan {
 
 enum class CrossWriter {
   TargetMajor,  // write_cross_neighbors_target_major_parallel
-  PairDense,    // write_cross_neighbors_fixed_query_pair_dense_parallel
+  PairDense,    // write_cross_neighbors_packed_dense_parallel
   QueryPair,    // write_cross_neighbors_fixed_query_pair_parallel
   Blocked,      // write_cross_neighbors_fixed_query_blocked_parallel
   Active2,      // write_cross_neighbors_fixed_query_active2_parallel

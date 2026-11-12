@@ -25,8 +25,8 @@ namespace detail {
 // One pair's row layout, resolved after run(). A row index is the point, or
 // to_sorted[point] when rows are in sorted order. Without counts the rows are
 // CSR: offsets[row] to offsets[row + 1]. With counts, a row starts at
-// offsets[row] when there are offsets and its count exceeds fixed_limit, and
-// at row * stride otherwise. Full means the layout needs the full lookup.
+// offsets[row] when there are offsets and at row * stride otherwise. Full
+// means the layout needs the full lookup.
 struct RowView {
   enum Kind : unsigned char { Full, Empty, Rows };
   Kind kind = Full;
@@ -36,7 +36,6 @@ struct RowView {
   const int *offsets = nullptr;
   const int *to_sorted = nullptr;
   std::size_t stride = 0;
-  int fixed_limit = -1;
 };
 
 // Reads one row of a Rows view; points outside the query set are empty.
@@ -52,9 +51,8 @@ inline NeighborList read_row(const RowView &view, int point) {
   }
   const int count = view.counts[row];
   const std::size_t start =
-      view.offsets != nullptr && count > view.fixed_limit
-          ? static_cast<std::size_t>(view.offsets[row])
-          : static_cast<std::size_t>(row) * view.stride;
+      view.offsets != nullptr ? static_cast<std::size_t>(view.offsets[row])
+                              : static_cast<std::size_t>(row) * view.stride;
   return {reinterpret_cast<const uint32_t *>(view.data + start),
           static_cast<std::size_t>(count)};
 }
@@ -336,9 +334,6 @@ private:
                                  PointSet &target, int capacity);
   // Hybrid cross rows: a fixed base capacity for most rows and per-row
   // capacities for the rows above it.
-  void seed_cross_hybrid(Pair &pair, PointSet &source);
-  bool build_cross_hybrid_rows(Pair &pair, PointSet &source, PointSet &target,
-                               bool pair_queries, bool dense_ranges);
   bool build_sweep_cross_lists(Pair &pair, PointSet &source, PointSet &target);
   static bool cell_range_cross_candidate(const PointSet &source,
                                          const PointSet &target);

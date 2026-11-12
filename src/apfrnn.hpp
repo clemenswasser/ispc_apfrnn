@@ -608,22 +608,6 @@ bool write_cross_neighbors_packed_dense_parallel(
     const NeighborSearchData &target_data, int capacity, IntBuffer &neighbors,
     IntBuffer &counts, IntBuffer &row_offset, int64_t known_total = -1);
 
-// Cross writer that builds the merged target-cell runs on the fly from the
-// target's dense cell map, skipping the per-frame global range build.
-void write_cross_neighbors_fixed_query_pair_dense_parallel(
-    CrossNeighborSearchData &query_data, const NeighborSearchData &source_data,
-    const NeighborSearchData &target_data, int capacity,
-    IntBuffer &fixed_neighbors, IntBuffer &counts);
-
-// Pass 2 of a hybrid cross layout: rewrite the listed rows with per-row
-// offsets and capacities.
-void write_cross_hybrid_rows_parallel(
-    const CrossNeighborSearchData &query_data,
-    const NeighborSearchData &source_data,
-    const NeighborSearchData &target_data, const std::vector<int> &queries,
-    const std::vector<int> &query_cells, IntBuffer &counts,
-    IntBuffer &neighbors, const IntBuffer &row_offset,
-    const IntBuffer &row_capacity);
 
 // Cross-set block-AABB filtered writer. target_data must have blocks.
 void write_cross_neighbors_fixed_query_blocked_parallel(

@@ -312,8 +312,8 @@ TEST_CASE("empty inputs are no-ops for every fixed-row writer") {
       empty_cross, target, 64, neighbors, counts);
   apfrnn::write_cross_neighbors_fixed_query_pair_parallel(
       empty_cross, target, 64, neighbors, counts);
-  apfrnn::write_cross_neighbors_fixed_query_pair_dense_parallel(
-      empty_cross, empty, target, 64, neighbors, counts);
+  CHECK(apfrnn::write_cross_neighbors_packed_dense_parallel(
+      empty_cross, empty, target, 64, neighbors, counts, row_offset));
   apfrnn::write_cross_neighbors_fixed_query_blocked_parallel(
       empty_cross, target, empty, 64, neighbors, counts);
 
