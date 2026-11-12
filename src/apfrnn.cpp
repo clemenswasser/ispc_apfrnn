@@ -1,6 +1,7 @@
 #include "apfrnn.hpp"
 
 #include "kernels_ispc.h"
+#include "plan.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -5100,6 +5101,36 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
   if (num_points == 0) {
     return true;
   }
+  const ispc::Cells queries = cells_of(source);
+  const ispc::DenseGrid grid = dense_of(target);
+  const ispc::Cells targets = cells_of(target);
+  const ispc::Points qpts = points_of(source);
+  const ispc::Points tpts = points_of(target);
+  const float r2 = radius * radius;
+  const int64_t table_slots = static_cast<int64_t>(n) * stride;
+  if (!plan::pack_rows(table_slots * static_cast<int64_t>(sizeof(int))) &&
+      table_slots <= INT_MAX) {
+    // A table that fits the last-level cache costs no DRAM traffic, so the
+    // rows are written in place at full stride, still read through
+    // row_offset.
+    prepare_fixed_rows(neighbors, counts, n, stride);
+    parallel_cells(0, num_points, 1 << 14, [&](int begin, int end) {
+      for (int q = begin; q < end; ++q) {
+        row_offset[static_cast<std::size_t>(q)] = q * stride;
+      }
+    });
+    const ispc::FixedRows rows = {capacity, neighbor_permutation_table(),
+                                  nullptr,  counts.data(),
+                                  neighbors.data(), row_offset.data(),
+                                  nullptr,  nullptr};
+    parallel_cells(0, source.num_cells, cell_grain(source.num_cells),
+                   [&](int begin, int end) {
+      ispc::write_fixed_rows_dense(begin, end, group, &queries, &grid,
+                                   &targets, &qpts, &tpts, same_set, r2,
+                                   &rows);
+    });
+    return true;
+  }
   const int threads = std::max(1, tbb::this_task_arena::max_concurrency());
   const int64_t chunk = packed_rows_chunk(capacity);
   const int64_t required = packed_rows_slots(
@@ -5117,12 +5148,6 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
   neighbors.resize(static_cast<std::size_t>(required));
   hint_huge_pages(neighbors.data(), neighbors.size() * sizeof(int));
 
-  const ispc::Cells queries = cells_of(source);
-  const ispc::DenseGrid grid = dense_of(target);
-  const ispc::Cells targets = cells_of(target);
-  const ispc::Points qpts = points_of(source);
-  const ispc::Points tpts = points_of(target);
-  const float r2 = radius * radius;
   // One cell's rows at full stride fit a small per-thread table that stays
   // in L1; only the copies of the filled entries reach the output.
   struct alignas(64) Cursor {

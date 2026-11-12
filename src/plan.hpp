@@ -92,6 +92,14 @@ bool place_rows_by_point(int64_t row_bytes);
 // this machine. Tests lower it so their small sets take the placed layout.
 int64_t &row_placement_min_bytes();
 
+// True when a dense writer's full-stride row table of `row_bytes` should be
+// packed: above the last-level cache, padded rows cost DRAM traffic on every
+// write and read, below it the copy into packed rows only costs time.
+bool pack_rows(int64_t row_bytes);
+// The table size above which rows are packed: the L3 cache size of this
+// machine. Tests lower it so their small sets take the packed layout.
+int64_t &packed_rows_min_bytes();
+
 int64_t same_fixed_slots(const IntBuffer &counts);
 int64_t same_block_slots(const IntBuffer &counts, int block);
 

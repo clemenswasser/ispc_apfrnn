@@ -583,9 +583,11 @@ void write_cross_neighbors_target_major_csr_parallel(
     const NeighborSearchData &target_data);
 
 // Same-set writer that builds the merged cell runs on the fly from the
-// set's own dense cell map, skipping the per-frame global range build. Rows
-// are packed without padding: row q (sorted index) starts at
-// neighbors[row_offset[q]] and holds min(counts[q], capacity) entries.
+// set's own dense cell map, skipping the per-frame global range build. Row q
+// (sorted index) starts at neighbors[row_offset[q]] and holds
+// min(counts[q], capacity) entries. Rows are packed without padding when the
+// full-stride table exceeds plan::packed_rows_min_bytes(), and written in
+// place at full stride otherwise.
 // known_total, when not negative, is the exact entry total (counts from an
 // earlier write over the same grid) and sizes the output; otherwise it is
 // sized for full rows. Returns false when the output would not fit int

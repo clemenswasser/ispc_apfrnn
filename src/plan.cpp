@@ -180,6 +180,23 @@ bool place_rows_by_point(int64_t row_bytes) {
   return row_bytes > row_placement_min_bytes();
 }
 
+int64_t &packed_rows_min_bytes() {
+  static int64_t l3_bytes = [] {
+#ifdef _SC_LEVEL3_CACHE_SIZE
+    const long size = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    if (size > 0) {
+      return static_cast<int64_t>(size);
+    }
+#endif
+    return static_cast<int64_t>(8) << 20;
+  }();
+  return l3_bytes;
+}
+
+bool pack_rows(int64_t row_bytes) {
+  return row_bytes > packed_rows_min_bytes();
+}
+
 int64_t block_output_budget(int64_t exact_neighbors, int num_points) {
   // Per row: the gang of slack after it, which grows with the gang width.
   const int64_t row_padding =

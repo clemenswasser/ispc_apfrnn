@@ -1,6 +1,7 @@
 #include "point_cloud.hpp"
 #include "scene.hpp"
 #include "apfrnn/neighbor_search.hpp"
+#include "plan.hpp"
 
 #include <doctest/doctest.h>
 
@@ -2147,6 +2148,42 @@ TEST_CASE("packed rows replace block rows once the caller follows the grid") {
   CHECK((before_sort & apfrnn::NSearch::kPathSameBlockRows) != 0);
   CHECK((after_sort & apfrnn::NSearch::kPathSamePairDense) != 0);
   CHECK((after_sort & apfrnn::NSearch::kPathSameBlockRows) == 0);
+}
+
+TEST_CASE("dense rows switch between in-place and packed tables") {
+  // Tables within the last-level cache are written in place at full stride,
+  // larger ones are packed; a set and a cross pair alternate between the
+  // two as the limit changes, and every frame stays exact.
+  constexpr float radius = 1.0f;
+  auto fluid = apfrnn::support::make_point_cloud(12000, 11.0f, 51);
+  auto boundary = apfrnn::support::make_point_cloud(5000, 11.0f, 52);
+  auto fluid_xyz = interleave(fluid);
+  auto boundary_xyz = interleave(boundary);
+  apfrnn::NSearch search(radius);
+  const int fluid_id =
+      search.add_point_set(fluid_xyz.data(), static_cast<int>(fluid.x.size()));
+  const int boundary_id = search.add_point_set(
+      boundary_xyz.data(), static_cast<int>(boundary.x.size()), true);
+  search.set_all_searches(false);
+  search.set_active_search(fluid_id, fluid_id, true);
+  search.set_active_search(fluid_id, boundary_id, true);
+  int64_t &limit = apfrnn::plan::packed_rows_min_bytes();
+  const int64_t saved = limit;
+  translate(fluid, 0.0f, 0.0f, 0.0f);
+  for (int frame = 0; frame < 6; ++frame) {
+    INFO("frame " << frame);
+    limit = frame % 2 == 0 ? INT64_MAX : 0;
+    translate(fluid, 0.11f, -0.07f, 0.05f);
+    fluid_xyz = interleave(fluid);
+    search.resize_point_set(fluid_id, fluid_xyz.data(),
+                            static_cast<int>(fluid.x.size()));
+    search.run();
+    const uint64_t paths = search.last_stats().paths;
+    CHECK((paths & apfrnn::NSearch::kPathSamePairDense) != 0);
+    check_same_set(search, fluid_id, fluid, radius);
+    check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+  }
+  limit = saved;
 }
 
 TEST_CASE("packed dense writer truncates rows above the capacity") {

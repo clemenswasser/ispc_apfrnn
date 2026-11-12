@@ -123,10 +123,25 @@ namespace {
 // Most tests use sets far smaller than a cache. Placing per-point rows for
 // every table size makes the whole test binary run that layout on reused
 // buffers, next to the sorted layout every newly allocated buffer still gets.
+// Likewise, packing rows for every table size runs the packed writers on the
+// small sets of the tests.
 const struct PlaceRowsInTests {
-  PlaceRowsInTests() { apfrnn::plan::row_placement_min_bytes() = 0; }
+  PlaceRowsInTests() {
+    apfrnn::plan::row_placement_min_bytes() = 0;
+    apfrnn::plan::packed_rows_min_bytes() = 0;
+  }
 } place_rows_in_tests;
 } // namespace
+
+TEST_CASE("dense rows are packed only when the table exceeds a cache") {
+  int64_t &limit = apfrnn::plan::packed_rows_min_bytes();
+  const int64_t saved = limit;
+  limit = int64_t{8} << 20;
+  CHECK_FALSE(apfrnn::plan::pack_rows(0));
+  CHECK_FALSE(apfrnn::plan::pack_rows(int64_t{8} << 20));
+  CHECK(apfrnn::plan::pack_rows(int64_t{1} << 30));
+  limit = saved;
+}
 
 TEST_CASE("fitted capacities keep a margin for degree changes") {
   CHECK(apfrnn::plan::same_fitted_capacity(10, 128) == 32);
