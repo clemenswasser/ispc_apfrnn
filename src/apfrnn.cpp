@@ -4727,7 +4727,8 @@ void write_same_set_block_rows_parallel(
         row_offset, row_capacity,
         [&](int begin, int end, const ispc::FixedRows &rows) {
           ispc::write_fixed_rows_dense(begin, end, kSameGroup, &cells, &grid,
-                                       &cells, &pts, &pts, true, r2, &rows);
+                                       &cells, &pts, &pts, data.num_points,
+                                       true, r2, &rows);
         });
     return;
   }
@@ -4953,7 +4954,8 @@ void write_cross_neighbors_block_rows_pair_dense_parallel(
       fixed_neighbors, row_offset, row_capacity,
       [&](int begin, int end, const ispc::FixedRows &rows) {
         ispc::write_fixed_rows_dense(begin, end, group, &queries, &grid,
-                                     &targets, &qpts, &tpts, false, r2, &rows);
+                                     &targets, &qpts, &tpts,
+                                     target_data.num_points, false, r2, &rows);
       });
 }
 
@@ -5126,7 +5128,8 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
     parallel_cells(0, source.num_cells, cell_grain(source.num_cells),
                    [&](int begin, int end) {
       ispc::write_fixed_rows_dense(begin, end, group, &queries, &grid,
-                                   &targets, &qpts, &tpts, same_set, r2,
+                                   &targets, &qpts, &tpts, target.num_points,
+                                   same_set, r2,
                                    &rows);
     });
     return true;
@@ -5184,7 +5187,8 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
                                     table.data(), row_offset.data(),
                                     nullptr,  nullptr};
       ispc::write_fixed_rows_dense(cell, cell + 1, group, &queries, &grid,
-                                   &targets, &qpts, &tpts, same_set, r2,
+                                   &targets, &qpts, &tpts, target.num_points,
+                                   same_set, r2,
                                    &rows);
       for (int q = q_begin; q < q_end; ++q) {
         const int count =

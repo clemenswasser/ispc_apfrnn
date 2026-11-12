@@ -71,6 +71,14 @@ static inline void finish_row(const uniform FixedRows &rows,
   rows.counts[query] = count;
 }
 
+// The caller index of query q for the self test. The test compares caller
+// indices so that it also holds for gathered targets (see gather_runs);
+// cross queries may carry no indices and never match a target.
+static inline uniform int self_index(const uniform Points &qpts,
+                                     uniform int q, uniform bool same_set) {
+  return same_set ? qpts.index[q] : -1;
+}
+
 static inline varying bool is_neighbor(const uniform Points &tpts, int j,
                                        uniform float<3> q, uniform float r2,
                                        uniform bool same_set,
@@ -127,14 +135,16 @@ static inline void rows_pair(uniform int q_start, uniform int q_end,
     const uniform int cap1 =
         rows.row_capacity != NULL ? rows.row_capacity[q1] : rows.capacity;
     uniform int c0 = 0, c1 = 0;
+    const uniform int s0 = self_index(qpts, q0, same_set);
+    const uniform int s1 = self_index(qpts, q1, same_set);
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
         const float<3> pj = point_at(tpts, j);
         const int value = tpts.index[j];
         const bool a0 = within_radius(pj, p0, r2) &&
-                        (!same_set || j != q0);
+                        (!same_set || value != s0);
         const bool a1 = within_radius(pj, p1, r2) &&
-                        (!same_set || j != q1);
+                        (!same_set || value != s1);
         o0 += append_active(o0, c0, a0, value, rows, cap0);
         if (v1) {
           o1 += append_active(o1, c1, a1, value, rows, cap1);
@@ -177,18 +187,22 @@ static inline void rows_quad(uniform int q_start, uniform int q_end,
     const uniform int cap3 =
         rows.row_capacity != NULL ? rows.row_capacity[q3] : rows.capacity;
     uniform int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    const uniform int s0 = self_index(qpts, q0, same_set);
+    const uniform int s1 = self_index(qpts, q1, same_set);
+    const uniform int s2 = self_index(qpts, q2, same_set);
+    const uniform int s3 = self_index(qpts, q3, same_set);
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
         const float<3> pj = point_at(tpts, j);
         const int value = tpts.index[j];
         const bool a0 = within_radius(pj, p0, r2) &&
-                        (!same_set || j != q0);
+                        (!same_set || value != s0);
         const bool a1 = within_radius(pj, p1, r2) &&
-                        (!same_set || j != q1);
+                        (!same_set || value != s1);
         const bool a2 = within_radius(pj, p2, r2) &&
-                        (!same_set || j != q2);
+                        (!same_set || value != s2);
         const bool a3 = within_radius(pj, p3, r2) &&
-                        (!same_set || j != q3);
+                        (!same_set || value != s3);
         o0 += append_active(o0, c0, a0, value, rows, cap0);
         if (v1) {
           o1 += append_active(o1, c1, a1, value, rows, cap1);
@@ -266,18 +280,26 @@ static inline void rows_oct(uniform int q_start, uniform int q_end,
         rows.row_capacity != NULL ? rows.row_capacity[q7] : rows.capacity;
     uniform int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     uniform int c4 = 0, c5 = 0, c6 = 0, c7 = 0;
+    const uniform int s0 = self_index(qpts, q0, same_set);
+    const uniform int s1 = self_index(qpts, q1, same_set);
+    const uniform int s2 = self_index(qpts, q2, same_set);
+    const uniform int s3 = self_index(qpts, q3, same_set);
+    const uniform int s4 = self_index(qpts, q4, same_set);
+    const uniform int s5 = self_index(qpts, q5, same_set);
+    const uniform int s6 = self_index(qpts, q6, same_set);
+    const uniform int s7 = self_index(qpts, q7, same_set);
     for (uniform int run = 0; run < num_runs; ++run) {
       foreach (j = run_start[run]... run_end[run]) {
         const float<3> pj = point_at(tpts, j);
         const int value = tpts.index[j];
-        const bool a0 = within_radius(pj, p0, r2) && (!same_set || j != q0);
-        const bool a1 = within_radius(pj, p1, r2) && (!same_set || j != q1);
-        const bool a2 = within_radius(pj, p2, r2) && (!same_set || j != q2);
-        const bool a3 = within_radius(pj, p3, r2) && (!same_set || j != q3);
-        const bool a4 = within_radius(pj, p4, r2) && (!same_set || j != q4);
-        const bool a5 = within_radius(pj, p5, r2) && (!same_set || j != q5);
-        const bool a6 = within_radius(pj, p6, r2) && (!same_set || j != q6);
-        const bool a7 = within_radius(pj, p7, r2) && (!same_set || j != q7);
+        const bool a0 = within_radius(pj, p0, r2) && (!same_set || value != s0);
+        const bool a1 = within_radius(pj, p1, r2) && (!same_set || value != s1);
+        const bool a2 = within_radius(pj, p2, r2) && (!same_set || value != s2);
+        const bool a3 = within_radius(pj, p3, r2) && (!same_set || value != s3);
+        const bool a4 = within_radius(pj, p4, r2) && (!same_set || value != s4);
+        const bool a5 = within_radius(pj, p5, r2) && (!same_set || value != s5);
+        const bool a6 = within_radius(pj, p6, r2) && (!same_set || value != s6);
+        const bool a7 = within_radius(pj, p7, r2) && (!same_set || value != s7);
         o0 += append_active(o0, c0, a0, value, rows, cap0);
         if (v1) o1 += append_active(o1, c1, a1, value, rows, cap1);
         if (v2) o2 += append_active(o2, c2, a2, value, rows, cap2);
@@ -494,6 +516,104 @@ export void write_fixed_rows_oct(
   }
 }
 
+// Most candidates gather_runs() copies; larger candidate sets are read from
+// their runs in place.
+#define GATHER_MAX 1024
+
+// Appends the lanes of targets j that are `valid` and within the radius of
+// the box [lo, hi] to the gather buffers; returns how many.
+static inline uniform int copy_near(const uniform Points &tpts, int j,
+                                    bool valid, uniform float<3> lo,
+                                    uniform float<3> hi, uniform float r2,
+                                    const uniform int *uniform perm,
+                                    uniform float *uniform gx,
+                                    uniform float *uniform gy,
+                                    uniform float *uniform gz,
+                                    uniform int *uniform gi) {
+  const float x = tpts.x[j], y = tpts.y[j], z = tpts.z[j];
+  const float ex = max(max(lo.x - x, x - hi.x), 0.0f);
+  const float ey = max(max(lo.y - y, y - hi.y), 0.0f);
+  const float ez = max(max(lo.z - z, z - hi.z), 0.0f);
+  const bool keep = valid && ex * ex + ey * ey + ez * ez <= r2;
+  store_compacted((uniform int *uniform)gx, keep, intbits(x), perm);
+  store_compacted((uniform int *uniform)gy, keep, intbits(y), perm);
+  store_compacted((uniform int *uniform)gz, keep, intbits(z), perm);
+  return store_compacted(gi, keep, tpts.index[j], perm);
+}
+
+// Copies the candidates of all runs that lie within the radius of the
+// bounding box of queries [q_start, q_end) into one contiguous buffer and
+// replaces the runs with the single run [0, kept). Every query of the cell
+// lies in that box, so a dropped candidate is no query's neighbor; the cell's
+// candidate block spans whole neighbor cells and is much larger than the box
+// grown by the radius. The query loops then also end one partial gang per
+// cell instead of one per run. Returns false, leaving the runs unchanged,
+// when the candidates could exceed GATHER_MAX.
+//
+// Every run is copied with the same number of whole gangs, the most any run
+// needs, so the copy loop's exit does not depend on the run; lanes past a
+// run's end are masked off. Runs whose last gang would read past the targets'
+// end clamp their indices instead.
+static inline uniform bool gather_runs(const uniform Points &tpts,
+                                       uniform int num_targets,
+                                       const uniform Points &qpts,
+                                       uniform int q_start, uniform int q_end,
+                                       uniform float r2,
+                                       const uniform int *uniform perm,
+                                       uniform int run_start[],
+                                       uniform int run_end[],
+                                       uniform int num_runs,
+                                       uniform float gx[], uniform float gy[],
+                                       uniform float gz[], uniform int gi[]) {
+  uniform int total = 0;
+  uniform int longest = 0;
+  for (uniform int run = 0; run < num_runs; ++run) {
+    const uniform int length = run_end[run] - run_start[run];
+    total += length;
+    longest = max(longest, length);
+  }
+  const uniform int span =
+      (longest + programCount - 1) & ~(programCount - 1);
+  if (total > GATHER_MAX) {
+    return false;
+  }
+  uniform float<3> lo = point_at(qpts, q_start);
+  uniform float<3> hi = lo;
+  for (uniform int q = q_start + 1; q < q_end; ++q) {
+    const uniform float<3> p = point_at(qpts, q);
+    lo.x = min(lo.x, p.x);
+    lo.y = min(lo.y, p.y);
+    lo.z = min(lo.z, p.z);
+    hi.x = max(hi.x, p.x);
+    hi.y = max(hi.y, p.y);
+    hi.z = max(hi.z, p.z);
+  }
+  // The box test rounds differently from the exact test, so it keeps a
+  // small margin: it may keep a few extra candidates but never drops one.
+  const uniform float near2 = r2 * 1.0001f;
+  uniform int n = 0;
+  for (uniform int run = 0; run < num_runs; ++run) {
+    const uniform int first = run_start[run];
+    const uniform int length = run_end[run] - first;
+    if (first + span <= num_targets) {
+      for (uniform int k = 0; k < span; k += programCount) {
+        const int j = first + k + programIndex;
+        n += copy_near(tpts, j, k + programIndex < length, lo, hi, near2, perm,
+                       gx + n, gy + n, gz + n, gi + n);
+      }
+    } else {
+      for (uniform int k = 0; k < span; k += programCount) {
+        const int j = min(first + k + programIndex, num_targets - 1);
+        n += copy_near(tpts, j, k + programIndex < length, lo, hi, near2, perm,
+                       gx + n, gy + n, gz + n, gi + n);
+      }
+    }
+  }
+  run_start[0] = 0;
+  run_end[0] = n;
+  return true;
+}
+
 // Candidate runs merged on the fly from the target's dense grid; `group`
 // (2 or 4) queries share each target load. For short rows; no staging. Each
 // branch below passes literals so the helpers are specialized.
@@ -503,8 +623,9 @@ export void write_fixed_rows_dense(
     const uniform DenseGrid *uniform grid_in,
     const uniform Cells *uniform targets_in,
     const uniform Points *uniform qpts_in,
-    const uniform Points *uniform tpts_in, uniform bool same_set,
-    uniform float r2, const uniform FixedRows *uniform rows_in) {
+    const uniform Points *uniform tpts_in, uniform int num_targets,
+    uniform bool same_set, uniform float r2,
+    const uniform FixedRows *uniform rows_in) {
   const uniform Cells queries = *queries_in;
   const uniform DenseGrid grid = *grid_in;
   const uniform Cells targets = *targets_in;
@@ -513,28 +634,40 @@ export void write_fixed_rows_dense(
   const uniform FixedRows rows = *rows_in;
   uniform int run_start[DENSE_MAX_RUNS];
   uniform int run_end[DENSE_MAX_RUNS];
+  uniform float gx[GATHER_MAX + programCount];
+  uniform float gy[GATHER_MAX + programCount];
+  uniform float gz[GATHER_MAX + programCount];
+  uniform int gi[GATHER_MAX + programCount];
+  const uniform Points gathered = {gx, gy, gz, gi};
   for (uniform int cell = start_cell; cell < end_cell; ++cell) {
-    const uniform int num_runs =
+    uniform int num_runs =
         dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
     const uniform int q_start = queries.starts[cell];
     const uniform int q_end = queries.ends[cell];
+    const uniform bool copied =
+        gather_runs(tpts, num_targets, qpts, q_start, q_end, r2, rows.perm,
+                    run_start, run_end, num_runs, gx, gy, gz, gi);
+    const uniform Points src = copied ? gathered : tpts;
+    if (copied) {
+      num_runs = 1;
+    }
     if (group == 8 && same_set) {
-      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                true, r2, rows);
     } else if (group == 8) {
-      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                false, r2, rows);
     } else if (group == 4 && same_set) {
-      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                 true, r2, rows);
     } else if (group == 4) {
-      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                 false, r2, rows);
     } else if (same_set) {
-      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                 true, r2, rows);
     } else {
-      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, tpts,
+      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src,
                 false, r2, rows);
     }
   }
