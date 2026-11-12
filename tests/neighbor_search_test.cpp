@@ -1557,6 +1557,49 @@ TEST_CASE("cross block rows fit a budget the fixed rows cannot") {
   }
 }
 
+TEST_CASE("packed same-set rows fit a budget the grown fixed rows cannot") {
+  // A dense set with one tight cluster: a few rows are far longer than the
+  // rest, so rows grown to the maximum exceed the budget, while packed rows
+  // sized from the exact counts fit it.
+  constexpr float radius = 1.0f;
+  auto cloud = apfrnn::support::make_point_cloud(8000, 12.0f, 9201);
+  std::mt19937 generator(9202);
+  std::uniform_real_distribution<float> offset(-0.3f, 0.3f);
+  for (int i = 0; i < 150; ++i) {
+    cloud.x.push_back(4.0f + offset(generator));
+    cloud.y.push_back(4.0f + offset(generator));
+    cloud.z.push_back(4.0f + offset(generator));
+  }
+  auto xyz = interleave(cloud);
+  apfrnn::NSearch search(radius);
+  search.set_memory_budget(3 << 20);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+  // The caller adopts the grid order after the first frame, so the later
+  // frames take the dense writer's packed rows.
+  for (int frame = 0; frame < 4; ++frame) {
+    INFO("frame " << frame);
+    if (frame == 1) {
+      search.prepare_zsort();
+      search.apply_zsort(id, cloud.x.data());
+      search.apply_zsort(id, cloud.y.data());
+      search.apply_zsort(id, cloud.z.data());
+    }
+    translate(cloud, 0.05f, 0.02f, -0.03f);
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    const auto stats = search.last_stats();
+    CAPTURE(stats.paths);
+    if (frame >= 2) {
+      CHECK((stats.paths & apfrnn::NSearch::kPathSamePairDense) != 0);
+    }
+    CHECK(stats.neighbor_bytes < (3u << 20));
+    check_same_set(search, id, cloud, radius);
+  }
+}
+
 TEST_CASE("sparse backends fall back to grid under memory pressure") {
   auto make_clustered_domain = [](int clusters, int per_cluster, float side,
                                   float spread, uint32_t seed) {
