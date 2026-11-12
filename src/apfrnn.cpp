@@ -5171,71 +5171,36 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
   // One cell's rows at full stride fit a small per-thread table that stays
   // in L1; only the copies of the filled entries reach the output.
   struct alignas(64) Cursor {
-    int64_t next = 0;
-    int64_t end = 0;
+    int64_t span[2] = {0, 0};
   };
   std::vector<Cursor> cursors(static_cast<std::size_t>(threads));
-  std::atomic<int64_t> next_chunk{0};
+  int64_t next_chunk = 0;
   std::atomic<bool> full{false};
-  int *const out = neighbors.data();
+  const std::size_t table_size =
+      static_cast<std::size_t>(std::max(1, source.max_cell_points)) *
+      static_cast<std::size_t>(stride);
+  const ispc::PackedOut pack = {neighbors.data(), row_offset.data(),
+                                &next_chunk,      chunk,
+                                required,         stride};
   parallel_cells(0, source.num_cells, cell_grain(source.num_cells),
                  [&](int begin, int end) {
     static thread_local IntBuffer table;
+    if (table.size() < table_size) {
+      table.resize(table_size);
+    }
     int tid = tbb::this_task_arena::current_thread_index();
     if (tid < 0 || tid >= threads) {
       tid = 0;
     }
-    Cursor &cursor = cursors[static_cast<std::size_t>(tid)];
-    for (int cell = begin; cell < end; ++cell) {
-      const int q_begin = source.cell_starts[static_cast<std::size_t>(cell)];
-      const int q_end = source.cell_ends[static_cast<std::size_t>(cell)];
-      const std::size_t table_size = static_cast<std::size_t>(q_end - q_begin) *
-                                     static_cast<std::size_t>(stride);
-      if (table.size() < table_size) {
-        table.resize(table_size);
-      }
-      // Rows are addressed through row_offset, first at their table slot and
-      // then, once copied, at their place in the output.
-      for (int q = q_begin; q < q_end; ++q) {
-        row_offset[static_cast<std::size_t>(q)] = (q - q_begin) * stride;
-      }
-      const ispc::FixedRows rows = {capacity, neighbor_permutation_table(),
-                                    nullptr,  counts.data(),
-                                    table.data(), row_offset.data(),
-                                    nullptr,  nullptr};
-      ispc::write_fixed_rows_dense(cell, cell + 1, group, &queries, &grid,
-                                   &targets, &qpts, &tpts, target.num_points,
-                                   same_set, r2,
-                                   &rows);
-      for (int q = q_begin; q < q_end; ++q) {
-        const int count =
-            std::min(counts[static_cast<std::size_t>(q)], capacity);
-        if (count == 0) {
-          // Empty rows (most rows of a sparse cross pair) need no copy;
-          // any start is valid for them.
-          row_offset[static_cast<std::size_t>(q)] = 0;
-          continue;
-        }
-        if (cursor.next + count > cursor.end) {
-          cursor.next =
-              next_chunk.fetch_add(chunk, std::memory_order_relaxed);
-          cursor.end = cursor.next + chunk;
-          if (cursor.end > required) {
-            // Only reachable when known_total was too small: stop writing
-            // and report the failure.
-            full.store(true, std::memory_order_relaxed);
-            cursor.next = cursor.end = 0;
-            return;
-          }
-        }
-        std::memcpy(out + cursor.next,
-                    table.data() + static_cast<std::size_t>(q - q_begin) *
-                                       static_cast<std::size_t>(stride),
-                    static_cast<std::size_t>(count) * sizeof(int));
-        row_offset[static_cast<std::size_t>(q)] =
-            static_cast<int>(cursor.next);
-        cursor.next += count;
-      }
+    const ispc::FixedRows rows = {capacity, neighbor_permutation_table(),
+                                  nullptr,  counts.data(),
+                                  table.data(), row_offset.data(),
+                                  nullptr,  nullptr};
+    if (!ispc::write_packed_rows_dense(
+            begin, end, group, &queries, &grid, &targets, &qpts, &tpts,
+            target.num_points, same_set, r2, &rows, &pack,
+            cursors[static_cast<std::size_t>(tid)].span)) {
+      full.store(true, std::memory_order_relaxed);
     }
   });
   return !full.load(std::memory_order_relaxed);

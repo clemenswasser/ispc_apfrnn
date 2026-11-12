@@ -636,9 +636,72 @@ static inline uniform bool gather_runs(const uniform Points &tpts,
   return true;
 }
 
-// Candidate runs merged on the fly from the target's dense grid; `group`
-// (2 or 4) queries share each target load. For short rows; no staging. Each
-// branch below passes literals so the helpers are specialized.
+// The rows of one query cell against the target's dense grid: candidate
+// runs merged on the fly, copied near the cell's queries when they fit, and
+// tested `group` (2, 4 or 8) queries per target load. Callers pass literals
+// for group and same_set so the helpers are specialized.
+static inline void dense_cell_rows(
+    uniform int cell, uniform int group, const uniform Cells &queries,
+    const uniform DenseGrid &grid, const uniform Cells &targets,
+    const uniform Points &qpts, const uniform Points &tpts,
+    uniform int num_targets, uniform bool same_set, uniform float r2,
+    const uniform FixedRows &rows, uniform int run_start[],
+    uniform int run_end[], uniform float gx[], uniform float gy[],
+    uniform float gz[], uniform int gi[]) {
+  const uniform Points gathered = {gx, gy, gz, gi};
+  uniform int num_runs =
+      dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
+  const uniform int q_start = queries.starts[cell];
+  const uniform int q_end = queries.ends[cell];
+  const uniform bool copied =
+      gather_runs(tpts, num_targets, qpts, q_start, q_end, r2, rows.perm,
+                  run_start, run_end, num_runs, gx, gy, gz, gi);
+  uniform Points src = tpts;
+  if (copied) {
+    src = gathered;
+    num_runs = 1;
+  }
+  if (group == 8 && same_set) {
+    rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src, true,
+             r2, rows);
+  } else if (group == 8) {
+    rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src, false,
+             r2, rows);
+  } else if (group == 4 && same_set) {
+    rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src, true,
+              r2, rows);
+  } else if (group == 4) {
+    rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src, false,
+              r2, rows);
+  } else if (same_set) {
+    rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src, true,
+              r2, rows);
+  } else {
+    rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src, false,
+              r2, rows);
+  }
+}
+
+static inline void dense_cell_rows_dispatch(
+    uniform int cell, uniform int group, const uniform Cells &queries,
+    const uniform DenseGrid &grid, const uniform Cells &targets,
+    const uniform Points &qpts, const uniform Points &tpts,
+    uniform int num_targets, uniform bool same_set, uniform float r2,
+    const uniform FixedRows &rows, uniform int run_start[],
+    uniform int run_end[], uniform float gx[], uniform float gy[],
+    uniform float gz[], uniform int gi[]) {
+  if (same_set) {
+    dense_cell_rows(cell, group, queries, grid, targets, qpts, tpts,
+                    num_targets, true, r2, rows, run_start, run_end, gx, gy,
+                    gz, gi);
+  } else {
+    dense_cell_rows(cell, group, queries, grid, targets, qpts, tpts,
+                    num_targets, false, r2, rows, run_start, run_end, gx, gy,
+                    gz, gi);
+  }
+}
+
+// Rows written in place (rows.row_offset gives each query's slot).
 export void write_fixed_rows_dense(
     uniform int start_cell, uniform int end_cell, uniform int group,
     const uniform Cells *uniform queries_in,
@@ -660,39 +723,96 @@ export void write_fixed_rows_dense(
   uniform float gy[GATHER_MAX + programCount];
   uniform float gz[GATHER_MAX + programCount];
   uniform int gi[GATHER_MAX + programCount];
-  const uniform Points gathered = {gx, gy, gz, gi};
   for (uniform int cell = start_cell; cell < end_cell; ++cell) {
-    uniform int num_runs =
-        dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
+    dense_cell_rows_dispatch(cell, group, queries, grid, targets, qpts, tpts,
+                             num_targets, same_set, r2, rows, run_start,
+                             run_end, gx, gy, gz, gi);
+  }
+}
+
+// Packed output of write_packed_rows_dense: rows are appended back to back
+// in chunks of the shared output, which threads claim from *next_chunk.
+struct PackedOut {
+  uniform int *uniform out;
+  uniform int *uniform row_offset;
+  uniform int64 *uniform next_chunk;
+  uniform int64 chunk;
+  uniform int64 required;
+  uniform int stride;
+};
+
+// Writes each cell's rows into rows.neighbors, a per-thread table holding one
+// cell at full stride that stays in L1, then copies the filled entries to the
+// calling thread's output chunk ([cursor[0], cursor[1])) and points
+// row_offset at them. Returns false when the output is full (the caller's
+// total was too small).
+export uniform bool write_packed_rows_dense(
+    uniform int start_cell, uniform int end_cell, uniform int group,
+    const uniform Cells *uniform queries_in,
+    const uniform DenseGrid *uniform grid_in,
+    const uniform Cells *uniform targets_in,
+    const uniform Points *uniform qpts_in,
+    const uniform Points *uniform tpts_in, uniform int num_targets,
+    uniform bool same_set, uniform float r2,
+    const uniform FixedRows *uniform rows_in,
+    const uniform PackedOut *uniform pack_in, uniform int64 cursor[2]) {
+  const uniform Cells queries = *queries_in;
+  const uniform DenseGrid grid = *grid_in;
+  const uniform Cells targets = *targets_in;
+  const uniform Points qpts = *qpts_in;
+  const uniform Points tpts = *tpts_in;
+  const uniform FixedRows rows = *rows_in;
+  const uniform PackedOut pack = *pack_in;
+  const uniform int *uniform table = rows.neighbors;
+  uniform int run_start[DENSE_MAX_RUNS];
+  uniform int run_end[DENSE_MAX_RUNS];
+  uniform float gx[GATHER_MAX + programCount];
+  uniform float gy[GATHER_MAX + programCount];
+  uniform float gz[GATHER_MAX + programCount];
+  uniform int gi[GATHER_MAX + programCount];
+  uniform int64 next = cursor[0];
+  uniform int64 end = cursor[1];
+  uniform bool ok = true;
+  for (uniform int cell = start_cell; cell < end_cell && ok; ++cell) {
     const uniform int q_start = queries.starts[cell];
     const uniform int q_end = queries.ends[cell];
-    const uniform bool copied =
-        gather_runs(tpts, num_targets, qpts, q_start, q_end, r2, rows.perm,
-                    run_start, run_end, num_runs, gx, gy, gz, gi);
-    const uniform Points src = copied ? gathered : tpts;
-    if (copied) {
-      num_runs = 1;
+    // Rows are addressed through row_offset, first at their table slot and
+    // then, once copied, at their place in the output.
+    foreach (q = q_start... q_end) {
+      pack.row_offset[q] = (q - q_start) * pack.stride;
     }
-    if (group == 8 && same_set) {
-      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-               true, r2, rows);
-    } else if (group == 8) {
-      rows_oct(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-               false, r2, rows);
-    } else if (group == 4 && same_set) {
-      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-                true, r2, rows);
-    } else if (group == 4) {
-      rows_quad(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-                false, r2, rows);
-    } else if (same_set) {
-      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-                true, r2, rows);
-    } else {
-      rows_pair(q_start, q_end, run_start, run_end, num_runs, qpts, src,
-                false, r2, rows);
+    dense_cell_rows_dispatch(cell, group, queries, grid, targets, qpts, tpts,
+                             num_targets, same_set, r2, rows, run_start,
+                             run_end, gx, gy, gz, gi);
+    for (uniform int q = q_start; q < q_end; ++q) {
+      const uniform int count = min(rows.counts[q], rows.capacity);
+      if (count == 0) {
+        // Empty rows (most rows of a sparse cross pair) need no copy; any
+        // start is valid for them.
+        pack.row_offset[q] = 0;
+        continue;
+      }
+      if (next + count > end) {
+        next = atomic_add_global(pack.next_chunk, pack.chunk);
+        end = next + pack.chunk;
+        if (end > pack.required) {
+          next = end = 0;
+          ok = false;
+          break;
+        }
+      }
+      const uniform int *uniform from = table + (q - q_start) * pack.stride;
+      uniform int *uniform to = pack.out + next;
+      foreach (k = 0... count) {
+        to[k] = from[k];
+      }
+      pack.row_offset[q] = (uniform int)next;
+      next += count;
     }
   }
+  cursor[0] = next;
+  cursor[1] = end;
+  return ok;
 }
 
 static inline uniform float axis_gap(uniform float q, uniform float lo,
