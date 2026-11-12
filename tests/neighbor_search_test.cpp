@@ -2104,6 +2104,51 @@ TEST_CASE("packed dense rows stay exact through moving frames") {
   CHECK(grown);
 }
 
+TEST_CASE("packed rows replace block rows once the caller follows the grid") {
+  // A dense block with sparse spray around it, like a fluid with a free
+  // surface: rows have very different lengths, which makes a moving set in
+  // generation order prefer per-point rows. After the caller adopts the
+  // grid order with zsort, the dense writer's packed rows take over; every
+  // frame stays exact.
+  constexpr float radius = 1.0f;
+  auto cloud = apfrnn::support::make_point_cloud(24000, 14.0f, 31);
+  const auto spray = apfrnn::support::make_point_cloud(10000, 22.0f, 32);
+  cloud.x.insert(cloud.x.end(), spray.x.begin(), spray.x.end());
+  cloud.y.insert(cloud.y.end(), spray.y.begin(), spray.y.end());
+  cloud.z.insert(cloud.z.end(), spray.z.begin(), spray.z.end());
+  std::vector<float> xyz = interleave(cloud);
+  apfrnn::NSearch search(radius);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+  std::mt19937 generator(13);
+  std::uniform_real_distribution<float> jitter(-0.05f, 0.05f);
+  uint64_t before_sort = 0;
+  uint64_t after_sort = 0;
+  for (int frame = 0; frame < 8; ++frame) {
+    INFO("frame " << frame);
+    if (frame == 4) {
+      search.prepare_zsort();
+      search.apply_zsort(id, cloud.x.data());
+      search.apply_zsort(id, cloud.y.data());
+      search.apply_zsort(id, cloud.z.data());
+    }
+    for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+      cloud.x[i] += jitter(generator);
+      cloud.y[i] += jitter(generator);
+      cloud.z[i] += jitter(generator);
+    }
+    xyz = interleave(cloud);
+    search.resize_point_set(id, xyz.data(), static_cast<int>(cloud.x.size()));
+    search.run();
+    (frame < 4 ? before_sort : after_sort) |= search.last_stats().paths;
+    check_same_set(search, id, cloud, radius);
+  }
+  CHECK((before_sort & apfrnn::NSearch::kPathSameBlockRows) != 0);
+  CHECK((after_sort & apfrnn::NSearch::kPathSamePairDense) != 0);
+  CHECK((after_sort & apfrnn::NSearch::kPathSameBlockRows) == 0);
+}
+
 TEST_CASE("packed dense writer truncates rows above the capacity") {
   // Rows above the capacity keep their full count and their first
   // `capacity` entries, and no two rows overlap in the output.

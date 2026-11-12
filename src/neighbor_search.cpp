@@ -91,6 +91,27 @@ int max_row_count(const IntBuffer &counts) {
       [](int a, int b) { return std::max(a, b); });
 }
 
+// Whether the caller's point order follows the grid's sorted order, so rows
+// stored in sorted order are read nearly front to back by a caller walking
+// its points. Sampled: consecutive sorted points whose caller indices are
+// close.
+bool caller_order_follows_grid(const NeighborSearchData &data) {
+  const int n = data.num_points;
+  if (n < 2 || data.original_index.size() < static_cast<std::size_t>(n)) {
+    return false;
+  }
+  const int step = std::max(1, (n - 1) / 4096);
+  int close = 0;
+  int total = 0;
+  for (int i = 0; i + 1 < n; i += step) {
+    const int gap = data.original_index[static_cast<std::size_t>(i) + 1] -
+                    data.original_index[static_cast<std::size_t>(i)];
+    close += gap >= -64 && gap <= 64;
+    ++total;
+  }
+  return 10 * close >= 7 * total;
+}
+
 double elapsed_ms(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration<double, std::milli>(
              std::chrono::steady_clock::now() - start)
@@ -2067,7 +2088,20 @@ void NSearch::build_grid_same_lists(int set) {
   if (data.cell_ranges_implicit) {
     ensure_cell_ranges(data);
   }
-  if (point_set.block_rows) {
+  const plan::SamePlan same_plan =
+      plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
+  // The dense writer packs its rows without padding, so the per-point and
+  // per-block layouts, which exist to cut padding, cannot hold fewer slots.
+  // They are still kept for callers whose point order does not follow the
+  // grid (those layouts place rows by the caller's point, packed rows are in
+  // sorted order) and for sets that changed size, whose per-point
+  // capacities carry over the resize.
+  const bool packed_writer =
+      same_plan.fixed_rows && same_plan.writer == plan::SameWriter::PairDense &&
+      point_set.fixed_counts.size() ==
+          static_cast<std::size_t>(data.num_points) &&
+      caller_order_follows_grid(data);
+  if (point_set.block_rows && !packed_writer) {
     if (block_rows_ok && build_same_block_rows(set)) {
       note_path(kPathSameBlockRows);
       return;
@@ -2077,7 +2111,7 @@ void NSearch::build_grid_same_lists(int set) {
     point_set.block_layout_valid = false;
   }
   if (grid_rebuilt && !first_lists) {
-    if (build_moving_block_rows(set)) {
+    if (!packed_writer && build_moving_block_rows(set)) {
       note_path(kPathSameBlockRows);
       return;
     }
@@ -2085,8 +2119,8 @@ void NSearch::build_grid_same_lists(int set) {
     // at the old capacity is expensive for high-degree sets (the growing
     // Fountain/clustered case), so try compact block rows from fresh exact
     // counts before falling back to fixed rows.
-    if (point_set.fixed_counts.size() !=
-        static_cast<std::size_t>(data.num_points)) {
+    if (!packed_writer && point_set.fixed_counts.size() !=
+                              static_cast<std::size_t>(data.num_points)) {
       if (build_same_block_rows(set, /*min_block=*/0,
                                 /*counts_ready=*/false)) {
         note_path(kPathSameBlockRows);
@@ -2096,14 +2130,12 @@ void NSearch::build_grid_same_lists(int set) {
   } else {
     point_set.moving_caps_valid = false;
   }
-  const plan::SamePlan same_plan =
-      plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
 
   // Per-block rows avoid padding every row to the set's maximum. They need
   // exact counts. On later frames the last
   // frame's counts decide; on the first build the counts are taken below.
   auto wants_block_rows = [&](int &min_block) {
-    if (!block_rows_ok ||
+    if (packed_writer || !block_rows_ok ||
         point_set.fixed_layout_generation == point_set.grid_generation) {
       return false;
     }
