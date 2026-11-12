@@ -2055,6 +2055,92 @@ TEST_CASE("block rows stay exact through motion and back to rest") {
   check_same_set(search, id, cloud, 1.7f);
 }
 
+TEST_CASE("packed dense rows stay exact through moving frames") {
+  // A dense moving set takes the packed same-set writer. The points first
+  // jitter, then contract so rows outgrow the fitted capacity and are
+  // rewritten at a grown one, then hold still; every frame is checked
+  // through both read paths.
+  constexpr float radius = 1.0f;
+  auto cloud = apfrnn::support::make_point_cloud(20000, 14.0f, 41);
+  auto xyz = interleave(cloud);
+  apfrnn::NSearch search(radius);
+  const int id =
+      search.add_point_set(xyz.data(), static_cast<int>(cloud.x.size()));
+  search.set_all_searches(true);
+  std::mt19937 generator(5);
+  bool grown = false;
+  for (int frame = 0; frame < 7; ++frame) {
+    INFO("frame " << frame);
+    if (frame >= 1 && frame <= 3) {
+      std::uniform_real_distribution<float> jitter(-0.2f, 0.2f);
+      for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+        cloud.x[i] += jitter(generator);
+        cloud.y[i] += jitter(generator);
+        cloud.z[i] += jitter(generator);
+      }
+    } else if (frame == 4) {
+      for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+        cloud.x[i] *= 0.8f;
+        cloud.y[i] *= 0.8f;
+        cloud.z[i] *= 0.8f;
+      }
+    }
+    const auto moved = interleave(cloud);
+    std::copy(moved.begin(), moved.end(), xyz.begin());
+    search.run();
+    const uint64_t paths = search.last_stats().paths;
+    CHECK((paths & apfrnn::NSearch::kPathSamePairDense) != 0);
+    grown = grown || (paths & apfrnn::NSearch::kPathSameGrown) != 0;
+    check_same_set(search, id, cloud, radius);
+    const apfrnn::PairNeighbors view = search.neighbors(id, id);
+    for (int point = 0; point < view.size(); point += 97) {
+      const apfrnn::NeighborList row = view[point];
+      std::vector<int> neighbors(row.begin(), row.end());
+      std::sort(neighbors.begin(), neighbors.end());
+      CHECK(neighbors ==
+            apfrnn::support::exact_neighbors_for(cloud, point, radius));
+    }
+  }
+  CHECK(grown);
+}
+
+TEST_CASE("packed dense writer truncates rows above the capacity") {
+  // Rows above the capacity keep their full count and their first
+  // `capacity` entries, and no two rows overlap in the output.
+  constexpr float radius = 1.0f;
+  constexpr int capacity = 8;
+  auto cloud = apfrnn::support::make_point_cloud(3000, 6.0f, 17);
+  apfrnn::NeighborSearchData data;
+  apfrnn::build_point_grid_inplace(data, cloud.x, cloud.y, cloud.z, radius);
+  REQUIRE(data.dense_valid);
+  apfrnn::IntBuffer values;
+  apfrnn::IntBuffer counts;
+  apfrnn::IntBuffer row_offset;
+  REQUIRE(apfrnn::write_neighbors_packed_dense_parallel(data, capacity, values,
+                                                        counts, row_offset));
+  std::vector<std::pair<int, int>> spans;
+  bool truncated = false;
+  for (int point = 0; point < static_cast<int>(cloud.x.size()); ++point) {
+    const int sorted_index = apfrnn::support::sorted_index_for(data, point);
+    const auto exact = apfrnn::support::exact_neighbors_for(cloud, point, radius);
+    const int count = counts[static_cast<std::size_t>(sorted_index)];
+    CHECK(count == static_cast<int>(exact.size()));
+    const int stored = std::min(count, capacity);
+    truncated = truncated || count > capacity;
+    const int start = row_offset[static_cast<std::size_t>(sorted_index)];
+    spans.emplace_back(start, start + stored);
+    for (int k = 0; k < stored; ++k) {
+      CHECK(std::binary_search(exact.begin(), exact.end(),
+                               values[static_cast<std::size_t>(start + k)]));
+    }
+  }
+  CHECK(truncated);
+  std::sort(spans.begin(), spans.end());
+  for (std::size_t i = 1; i < spans.size(); ++i) {
+    CHECK(spans[i - 1].second <= spans[i].first);
+  }
+}
+
 TEST_CASE("budget-forced per-point rows stay exact through moving frames") {
   // Above the fixed-row point cap with a budget that only fits per-point
   // rows, the moving block layout must keep its per-point capacities across

@@ -155,6 +155,9 @@ struct NSearch::PointSet {
   bool incremental_rows_owned = false;
   // Block-fixed rows: per-block capacities and per-query row offsets.
   bool block_rows = false;
+  // Packed fixed rows: row_offset gives each sorted row's start, with no
+  // padding between rows (see write_neighbors_packed_dense_parallel).
+  bool packed_rows = false;
   bool block_caps_valid = false;
   // row_offset/row_capacity and the buffer size match block_caps. On an
   // unchanged grid nothing overflows, so later frames skip the layout pass.
@@ -1570,7 +1573,8 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
   const int sorted_index =
       source.original_to_sorted[static_cast<std::size_t>(point)];
 
-  if (pair.same_set && source.fixed_valid && source.block_rows) {
+  if (pair.same_set && source.fixed_valid &&
+      (source.block_rows || source.packed_rows)) {
     const int count =
         source.fixed_counts[static_cast<std::size_t>(sorted_index)];
     const int *neighbors =
@@ -1674,7 +1678,7 @@ void NSearch::build_row_views() {
       if (pair.same_set && source.fixed_valid) {
         view.data = source.fixed_neighbors.data();
         view.counts = source.fixed_counts.data();
-        if (source.block_rows) {
+        if (source.block_rows || source.packed_rows) {
           view.offsets = source.row_offset.data();
         } else {
           view.stride = static_cast<std::size_t>(source.fixed_capacity);
@@ -1926,6 +1930,7 @@ void NSearch::build_point_grid(int set) {
 
 void NSearch::build_same_lists(int set) {
   PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+  point_set.packed_rows = false;
   if (!point_set.valid) {
     return;
   }
@@ -2128,12 +2133,16 @@ void NSearch::build_grid_same_lists(int set) {
     // the points have moved.
     const RowPlacement placement{data.original_index.data()};
     bool placed = false;
+    bool packed = false;
     switch (same_plan.writer) {
     case plan::SameWriter::PairDense:
       note_path(kPathSamePairDense);
-      placed = write_neighbors_fixed_query_pair_dense_parallel(
-          data, capacity, point_set.fixed_neighbors, point_set.fixed_counts,
-          placement);
+      if (!write_neighbors_packed_dense_parallel(
+              data, capacity, point_set.fixed_neighbors,
+              point_set.fixed_counts, point_set.row_offset)) {
+        return false;
+      }
+      packed = true;
       break;
     case plan::SameWriter::Blocked:
       note_path(kPathSameBlocked);
@@ -2170,6 +2179,11 @@ void NSearch::build_grid_same_lists(int set) {
                          point_set.slot_counts);
     }
     point_set.rows_by_original = placed;
+    point_set.packed_rows = packed;
+    if (packed) {
+      // row_offset now holds the packed starts, not a block layout.
+      point_set.block_layout_valid = false;
+    }
     point_set.fixed_valid = true;
     point_set.same_lists_valid = true;
     return true;

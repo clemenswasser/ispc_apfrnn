@@ -583,11 +583,14 @@ void write_cross_neighbors_target_major_csr_parallel(
     const NeighborSearchData &target_data);
 
 // Same-set writer that builds the merged cell runs on the fly from the
-// set's own dense cell map, skipping the per-frame global range build.
-bool write_neighbors_fixed_query_pair_dense_parallel(
-    NeighborSearchData &data, int capacity,
-    IntBuffer &fixed_neighbors, IntBuffer &counts,
-    RowPlacement placement = {});
+// set's own dense cell map, skipping the per-frame global range build. Rows
+// are packed without padding: row q (sorted index) starts at
+// neighbors[row_offset[q]] and holds min(counts[q], capacity) entries.
+// Returns false when the output would not fit int offsets.
+bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
+                                           int capacity, IntBuffer &neighbors,
+                                           IntBuffer &counts,
+                                           IntBuffer &row_offset);
 
 // Cross writer that builds the merged target-cell runs on the fly from the
 // target's dense cell map, skipping the per-frame global range build.
