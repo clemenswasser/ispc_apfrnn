@@ -32,15 +32,6 @@ struct Cells {
   const uniform uint64 *uniform keys;
 };
 
-// Dense cell lookup: cells[(x * ny + y) * nz + z] is a cell index or -1,
-// with x/y/z relative to (min_x, min_y, min_z). z varies fastest, as in the
-// cell key order, so consecutive cells read neighboring lookup entries.
-struct DenseGrid {
-  const uniform int *uniform cells;
-  uniform int nx, ny, nz;
-  uniform int min_x, min_y, min_z;
-};
-
 // Open-addressing hash from cell key to cell index.
 struct HashGrid {
   const uniform uint64 *uniform keys;
@@ -49,6 +40,17 @@ struct HashGrid {
   uniform uint32 mask;
   // One control byte per slot: 0x80 = empty, otherwise a 7-bit fingerprint.
   const uniform uint8 *uniform control;
+};
+
+// Dense cell lookup: cells[(x * ny + y) * nz + z] is a cell index or -1,
+// with x/y/z relative to (min_x, min_y, min_z). z varies fastest, as in the
+// cell key order, so consecutive cells read neighboring lookup entries.
+// A sparse set has no lookup (cells is NULL) and finds cells in `hash`.
+struct DenseGrid {
+  const uniform int *uniform cells;
+  uniform int nx, ny, nz;
+  uniform int min_x, min_y, min_z;
+  const uniform HashGrid *uniform hash;
 };
 
 // Candidate point ranges of each query cell:

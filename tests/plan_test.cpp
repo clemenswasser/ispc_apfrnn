@@ -36,10 +36,18 @@ TEST_CASE("same-set plan picks the on-the-fly pair writer for moderate density")
   CHECK(plan.writer == apfrnn::plan::SameWriter::PairDense);
 }
 
-TEST_CASE("same-set plan uses eight queries for a sparse hash grid") {
+TEST_CASE("same-set plan sends a sparse hash grid to the packed writer") {
   auto data = grid(200000, 38170, 5);
   data.dense_valid = false;
   const auto plan = apfrnn::plan::same_set(data, 0, kBudget);
+  CHECK(plan.ranges == apfrnn::plan::SameRanges::None);
+  CHECK(plan.writer == apfrnn::plan::SameWriter::PairDense);
+}
+
+TEST_CASE("same-set plan keeps merged ranges for a sparse grid with long rows") {
+  auto data = grid(200000, 38170, 5);
+  data.dense_valid = false;
+  const auto plan = apfrnn::plan::same_set(data, 300, kBudget);
   CHECK(plan.ranges == apfrnn::plan::SameRanges::Merged);
   CHECK(plan.writer == apfrnn::plan::SameWriter::QueryOct);
 }

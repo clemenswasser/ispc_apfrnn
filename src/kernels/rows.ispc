@@ -351,6 +351,69 @@ static inline uniform int floor_to_cell_uniform(uniform float value) {
 // Most runs dense_runs() can return: one per neighbor cell.
 #define DENSE_MAX_RUNS 27
 
+// The hash lookup of one cell key, or -1 (see find_cell_index).
+static inline uniform int find_cell_uniform(const uniform HashGrid &hash,
+                                            uniform uint64 key) {
+  uniform uint64 h64 = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+  h64 ^= h64 >> 33;
+  const uniform uint8 fingerprint = (uniform uint8)(h64 >> 56) & 0x7f;
+  uniform uint32 h = (uniform uint32)h64 & hash.mask;
+  while (true) {
+    const uniform uint8 control = hash.control[h];
+    if (control == 0x80) {
+      return -1;
+    }
+    if (control == fingerprint && hash.keys[h] == key) {
+      return hash.vals[h];
+    }
+    h = (h + 1) & hash.mask;
+  }
+}
+
+// As dense_runs for a sparse set: the 27 neighbor cells are found in the
+// hash, and cells that are adjacent in the sorted order merge into one run.
+static inline uniform int hash_runs(const uniform HashGrid &hash,
+                                    const uniform Cells &targets,
+                                    uniform uint64 key, uniform int run_start[],
+                                    uniform int run_end[]) {
+  const uniform int cx = unpack_coord_uniform(key, 42);
+  const uniform int cy = unpack_coord_uniform(key, 21);
+  const uniform int cz = unpack_coord_uniform(key, 0);
+  uniform int num_runs = 0;
+  for (uniform int dx = -1; dx <= 1; ++dx) {
+    for (uniform int dy = -1; dy <= 1; ++dy) {
+      uniform int current_start = -1;
+      uniform int current_end = -1;
+      for (uniform int dz = -1; dz <= 1; ++dz) {
+        const uniform int neighbor =
+            find_cell_uniform(hash, make_key_uniform(cx + dx, cy + dy, cz + dz));
+        if (neighbor == -1) {
+          continue;
+        }
+        const uniform int start = targets.starts[neighbor];
+        const uniform int end = targets.ends[neighbor];
+        if (current_end == start) {
+          current_end = end;
+        } else {
+          if (current_start != -1) {
+            run_start[num_runs] = current_start;
+            run_end[num_runs] = current_end;
+            ++num_runs;
+          }
+          current_start = start;
+          current_end = end;
+        }
+      }
+      if (current_start != -1) {
+        run_start[num_runs] = current_start;
+        run_end[num_runs] = current_end;
+        ++num_runs;
+      }
+    }
+  }
+  return num_runs;
+}
+
 // Collects the 27 neighbor cells of cell (cx, cy, cz) as runs of contiguous
 // target points. Adjacent cells along z merge into one run when the cells are
 // sorted by signed coordinate, giving 9 runs. Radix-sorted keys order a
@@ -361,6 +424,9 @@ static inline uniform int dense_runs(const uniform DenseGrid &grid,
                                      uniform uint64 key,
                                      uniform int run_start[],
                                      uniform int run_end[]) {
+  if (grid.cells == NULL) {
+    return hash_runs(*grid.hash, targets, key, run_start, run_end);
+  }
   const uniform int cx = unpack_coord_uniform(key, 42);
   const uniform int cy = unpack_coord_uniform(key, 21);
   const uniform int cz = unpack_coord_uniform(key, 0);

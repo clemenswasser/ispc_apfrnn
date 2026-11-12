@@ -88,7 +88,12 @@ SamePlan same_set(const NeighborSearchData &data, int last_capacity,
   plan.fixed_rows = data.num_points <= kFixedMaxPoints ||
                     row_bytes(data.num_points, first) <= memory_budget;
 
-  const bool on_the_fly = data.dense_valid && !data.blocks_valid &&
+  // The packed writer merges candidate runs per cell from the dense lookup,
+  // or from the hash table of a sparse set with a one-cell stencil (built
+  // on demand by the writer).
+  const bool cell_lookup =
+      data.dense_valid || (data.cell_stencil == 1 && !data.cell_ranges_implicit);
+  const bool on_the_fly = cell_lookup && !data.blocks_valid &&
                           data.max_cell_points > 0 && first < 256 &&
                           moderate_density(data, last_capacity);
   if (on_the_fly) {

@@ -5121,7 +5121,14 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
     return true;
   }
   const ispc::Cells queries = cells_of(source);
-  const ispc::DenseGrid grid = dense_of(target);
+  // A sparse target has no dense lookup; the kernel then finds cells in its
+  // hash table.
+  const ispc::HashGrid hash = hash_of(target);
+  ispc::DenseGrid grid = dense_of(target);
+  if (!target.dense_valid) {
+    grid = ispc::DenseGrid{};
+    grid.hash = &hash;
+  }
   const ispc::Cells targets = cells_of(target);
   const ispc::Points qpts = points_of(source);
   const ispc::Points tpts = points_of(target);
@@ -5213,6 +5220,9 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
                                            IntBuffer &counts,
                                            IntBuffer &row_offset,
                                            int64_t known_total) {
+  if (!data.dense_valid) {
+    ensure_hash_table(data);
+  }
   // Dense cells hold ~7 points, so an eight-query group covers a whole cell
   // per candidate pass instead of splitting it into two quads.
   return write_packed_dense_rows(data, data, 8, true, data.radius, capacity,
