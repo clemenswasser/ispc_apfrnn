@@ -28,6 +28,9 @@
 //   --traces=DIR             captured traces (default traces)
 //   --memory_budget_mb=N     cap on one fixed-row allocation (library default
 //                            when omitted); useful to compare CSR fallback.
+//   --reference_cache=DIR    keep reference summaries in DIR, keyed by the
+//                            exact validated positions (see
+//                            cached_reference_summary()).
 
 #include "api_bench.hpp"
 #include "backends.hpp"
@@ -35,7 +38,9 @@
 #include "scenes.hpp"
 
 #include <benchmark/benchmark.h>
+#include <tbb/blocked_range.h>
 #include <tbb/global_control.h>
+#include <tbb/parallel_reduce.h>
 #ifdef APFRNN_BENCH_BASELINES
 #include <omp.h>
 #endif
@@ -161,6 +166,86 @@ std::map<std::string, ReferenceSummary> &reference_cache() {
   return references;
 }
 
+std::string &reference_cache_dir() {
+  static std::string dir;
+  return dir;
+}
+
+// A hash of everything the reference summary depends on: the radius, the
+// pairs and every point's exact coordinates by trace id. Summing per-point
+// hashes makes it independent of the point order, which a backend's z-sort
+// changes but the summary does not see.
+uint64_t reference_fingerprint(const SceneData &scene) {
+  uint64_t radius_bits = 0;
+  std::memcpy(&radius_bits, &scene.radius, sizeof(float));
+  uint64_t hash = mix(radius_bits);
+  for (const auto &[query, target] : scene.pairs) {
+    hash = mix(hash ^ ((static_cast<uint64_t>(query) << 32) |
+                       static_cast<uint32_t>(target)));
+  }
+  for (std::size_t set = 0; set < scene.xyz.size(); ++set) {
+    const std::vector<float> &xyz = scene.xyz[set];
+    uint64_t sum = 0;
+    for (std::size_t point = 0; point < xyz.size() / 3; ++point) {
+      uint32_t bits[3];
+      std::memcpy(bits, xyz.data() + 3 * point, sizeof(bits));
+      const uint64_t id = scene.trace_id(static_cast<int>(set),
+                                         static_cast<int>(point));
+      sum += mix(mix((static_cast<uint64_t>(set) << 32) | id) ^
+                 mix((static_cast<uint64_t>(bits[0]) << 32) | bits[1]) ^
+                 bits[2]);
+    }
+    hash = mix(hash ^ mix(sum ^ (static_cast<uint64_t>(xyz.size()) << 1)));
+  }
+  return hash;
+}
+
+// The independent reference is the slowest part of a large scene's setup and
+// depends only on the validated positions. With --reference_cache, a summary
+// computed once is reused by every later process that validates exactly the
+// same positions (same fingerprint), so each run still checks its lists
+// against the reference.
+ReferenceSummary cached_reference_summary(const SceneData &scene) {
+  const std::string &dir = reference_cache_dir();
+  if (dir.empty()) {
+    return reference_summary(scene);
+  }
+  char name[32];
+  std::snprintf(name, sizeof(name), "/%016llx.ref",
+                static_cast<unsigned long long>(reference_fingerprint(scene)));
+  const std::string path = dir + name;
+  ReferenceSummary summary;
+  if (FILE *file = std::fopen(path.c_str(), "r")) {
+    int complete = 0;
+    long long exact = 0;
+    long long band = 0;
+    unsigned long long checksum = 0;
+    const int read = std::fscanf(file, "%d %lld %lld %llx", &complete, &exact,
+                                 &band, &checksum);
+    std::fclose(file);
+    if (read == 4) {
+      summary.complete = complete != 0;
+      summary.exact_pairs = exact;
+      summary.band_pairs = band;
+      summary.checksum = checksum;
+      return summary;
+    }
+  }
+  summary = reference_summary(scene);
+  // Written under a process-unique name and renamed, so a concurrent reader
+  // never sees a partial file.
+  const std::string temp = path + "." + std::to_string(getpid());
+  if (FILE *file = std::fopen(temp.c_str(), "w")) {
+    std::fprintf(file, "%d %lld %lld %llx\n", summary.complete ? 1 : 0,
+                 static_cast<long long>(summary.exact_pairs),
+                 static_cast<long long>(summary.band_pairs),
+                 static_cast<unsigned long long>(summary.checksum));
+    std::fclose(file);
+    std::rename(temp.c_str(), path.c_str());
+  }
+  return summary;
+}
+
 // Backends round the distance test differently, so pairs at almost exactly
 // the radius may or may not be listed. Distances are recomputed in double:
 // pairs clearly within the radius are hashed (every backend must list all of
@@ -176,34 +261,50 @@ Validation validate(const Backend &backend, const SceneData &scene) {
   const double r = scene.radius;
   const double band = 64.0 * std::numeric_limits<float>::epsilon() * max_abs;
 
+  // Points are checked in parallel; every field is a sum (the checksum wraps
+  // modulo 2^64), so the result does not depend on the split.
+  auto add = [](Validation a, const Validation &b) {
+    a.neighbors += b.neighbors;
+    a.same_set_neighbors += b.same_set_neighbors;
+    a.false_positives += b.false_positives;
+    a.checksum += b.checksum;
+    return a;
+  };
   Validation result;
-  std::vector<uint32_t> row;
   for (std::size_t pair = 0; pair < scene.pairs.size(); ++pair) {
     const auto [query, target] = scene.pairs[pair];
     const float *q_xyz = scene.xyz[static_cast<std::size_t>(query)].data();
     const float *t_xyz = scene.xyz[static_cast<std::size_t>(target)].data();
-    for (int point = 0; point < scene.points(query); ++point) {
-      backend.neighbors(query, target, point, row);
-      const uint64_t key = mix((static_cast<uint64_t>(pair) << 32) |
-                               scene.trace_id(query, point));
-      const float *q = q_xyz + 3 * static_cast<std::size_t>(point);
-      for (uint32_t neighbor : row) {
-        const float *t = t_xyz + 3 * static_cast<std::size_t>(neighbor);
-        const double dx = double(t[0]) - q[0], dy = double(t[1]) - q[1],
-                     dz = double(t[2]) - q[2];
-        const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (d < r - band) {
-          result.checksum +=
-              mix(key ^ scene.trace_id(target, static_cast<int>(neighbor)));
-        } else if (d > r + band) {
-          ++result.false_positives;
-        }
-      }
-      result.neighbors += static_cast<int64_t>(row.size());
-      if (query == 0 && target == 0) {
-        result.same_set_neighbors += static_cast<int64_t>(row.size());
-      }
-    }
+    const Validation part = tbb::parallel_reduce(
+        tbb::blocked_range<int>(0, scene.points(query), 1024), Validation{},
+        [&](const tbb::blocked_range<int> &range, Validation acc) {
+          std::vector<uint32_t> row;
+          for (int point = range.begin(); point < range.end(); ++point) {
+            backend.neighbors(query, target, point, row);
+            const uint64_t key = mix((static_cast<uint64_t>(pair) << 32) |
+                                     scene.trace_id(query, point));
+            const float *q = q_xyz + 3 * static_cast<std::size_t>(point);
+            for (uint32_t neighbor : row) {
+              const float *t = t_xyz + 3 * static_cast<std::size_t>(neighbor);
+              const double dx = double(t[0]) - q[0], dy = double(t[1]) - q[1],
+                           dz = double(t[2]) - q[2];
+              const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+              if (d < r - band) {
+                acc.checksum += mix(
+                    key ^ scene.trace_id(target, static_cast<int>(neighbor)));
+              } else if (d > r + band) {
+                ++acc.false_positives;
+              }
+            }
+            acc.neighbors += static_cast<int64_t>(row.size());
+            if (query == 0 && target == 0) {
+              acc.same_set_neighbors += static_cast<int64_t>(row.size());
+            }
+          }
+          return acc;
+        },
+        add);
+    result = add(result, part);
   }
   // Pairs clearly within the radius that a backend did not list are not
   // seen here; they change the checksum.
@@ -344,7 +445,8 @@ void frames(benchmark::State &state, const SceneSpec &spec,
   auto &references = reference_cache();
   auto reference = references.find(spec.name);
   if (reference == references.end()) {
-    reference = references.emplace(spec.name, reference_summary(scene)).first;
+    reference =
+        references.emplace(spec.name, cached_reference_summary(scene)).first;
   }
   const ReferenceSummary &reference_summary = reference->second;
 
@@ -577,8 +679,11 @@ int main(int argc, char **argv) {
     constexpr const char *kBudget = "--memory_budget_mb=";
     constexpr const char *kThreads = "--threads=";
     constexpr const char *kTraces = "--traces=";
+    constexpr const char *kRefCache = "--reference_cache=";
     if (std::strncmp(argv[i], kTraces, std::strlen(kTraces)) == 0) {
       traces = argv[i] + std::strlen(kTraces);
+    } else if (std::strncmp(argv[i], kRefCache, std::strlen(kRefCache)) == 0) {
+      reference_cache_dir() = argv[i] + std::strlen(kRefCache);
     } else if (std::strncmp(argv[i], kRes, std::strlen(kRes)) == 0) {
       learnsph_res = argv[i] + std::strlen(kRes);
     } else if (std::strncmp(argv[i], kBudget, std::strlen(kBudget)) == 0) {

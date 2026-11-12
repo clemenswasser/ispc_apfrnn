@@ -4,7 +4,7 @@ build, on our backend only.
 
 Rounds alternate the two builds (base first on even rounds, candidate first on
 odd ones), so drift in clock, temperature or background load hits both. Every
-scene runs in its own process. Each scene's result is the mean of the per-round candidate/base log ratios. A scene
+scene runs in its own process, pinned to one logical CPU per physical core. Each scene's result is the mean of the per-round candidate/base log ratios. A scene
 counts as faster or slower only when a paired t-test rejects no change at 95%
 and the change is at least 1%; the +- column is that 95% interval. Every run checks its lists against the reference and the script
 stops on a mismatch. The benchmark times a fixed window of frames per scene
@@ -135,7 +135,35 @@ def list_scenes(bench, regex, select, traces):
     return names
 
 
-def bench_once(bench, names, args, traces):
+def physical_core_cpus():
+    """One logical CPU per physical core that has SMT siblings (the P-cores
+    on a hybrid part), so no two benchmark threads share a core. Falls back
+    to 0-15 when the topology is not readable."""
+    chosen = set()
+    for path in Path("/sys/devices/system/cpu").glob(
+            "cpu[0-9]*/topology/thread_siblings_list"):
+        text = path.read_text().strip()
+        cpus = []
+        for part in text.split(","):
+            low, _, high = part.partition("-")
+            cpus.extend(range(int(low), int(high or low) + 1))
+        if len(cpus) > 1:
+            chosen.add(min(cpus))
+    return ",".join(str(cpu) for cpu in sorted(chosen)) if chosen else "0-15"
+
+
+def reference_cache_args(bench):
+    """A fresh reference cache per build and invocation: each build computes
+    a scene's reference once and reuses it in later rounds, and nothing
+    computed by another build or an older harness is ever read. Builds whose
+    harness predates the flag run without it."""
+    if b"--reference_cache=" not in Path(bench).read_bytes():
+        return []
+    cache = Path(tempfile.mkdtemp(prefix="apfrnn-ref-"))
+    return [f"--reference_cache={cache}"]
+
+
+def bench_once(bench, names, args, traces, extra):
     """Times every scene in its own process, so no scene runs after another
     scene's allocations and a small scene is not measured in a large one's
     memory state."""
@@ -147,7 +175,8 @@ def bench_once(bench, names, args, traces):
             cmd = ["taskset", "-c", args.cpus, str(bench),
                    f"--benchmark_filter={pattern}",
                    "--benchmark_format=json", f"--benchmark_out={out.name}",
-                   f"--threads={args.threads}", f"--traces={traces}"]
+                   f"--threads={args.threads}", f"--traces={traces}",
+                   *extra]
             result = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, text=True)
             if result.returncode != 0:
@@ -216,12 +245,13 @@ def main():
     parser.add_argument("--tier", choices=["quick", "full"], default="quick")
     parser.add_argument("--filter")
     parser.add_argument("--rounds", type=int)
-    parser.add_argument("--cpus", default="0-15")
+    parser.add_argument("--cpus", default=None)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--traces", type=Path, default=None)
     args = parser.parse_args()
     rounds = args.rounds or (7 if args.tier == "quick" and not args.filter else 5)
     traces = args.traces or common_root() / "traces"
+    args.cpus = args.cpus or physical_core_cpus()
 
     profile = tuned_profile()
     if profile and profile != "benchmark-quiet":
@@ -242,12 +272,14 @@ def main():
         sys.exit("no scenes selected")
     print(f"{len(names)} scenes, {rounds} rounds", file=sys.stderr)
 
+    extra = {side: reference_cache_args(bench) for side, bench in builds.items()}
+    print(f"cpus {args.cpus}", file=sys.stderr)
     samples = {"base": {}, "cand": {}}
     for index in range(rounds):
         order = ["base", "cand"] if index % 2 == 0 else ["cand", "base"]
         for side in order:
             for name, value in bench_once(builds[side], names, args,
-                                          traces).items():
+                                          traces, extra[side]).items():
                 samples[side].setdefault(name, []).append(value)
         print(f"round {index + 1}/{rounds} done", file=sys.stderr)
 
