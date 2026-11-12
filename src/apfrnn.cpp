@@ -281,21 +281,97 @@ bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
   const uint64_t packed_varying =
       total_width >= 64 ? ~uint64_t{0} : (uint64_t{1} << total_width) - 1;
   // Packing and unpacking cost about one pass each.
-  const bool packed = passes(packed_varying) + 2 <= passes(varying_bits);
   const int shift_y = width[2];
   const int shift_x = width[1] + width[2];
+  auto pack = [&](uint64_t key) {
+    return (static_cast<uint64_t>(field(key, 42) - bits.lo[0]) << shift_x) |
+           (static_cast<uint64_t>(field(key, 21) - bits.lo[1]) << shift_y) |
+           static_cast<uint64_t>(field(key, 0) - bits.lo[2]);
+  };
+  auto unpack = [&](uint64_t packed_key) {
+    const uint64_t mask_y = (uint64_t{1} << width[1]) - 1;
+    const uint64_t mask_z = (uint64_t{1} << width[2]) - 1;
+    return make_key(static_cast<int>(packed_key >> shift_x) + bits.lo[0],
+                    static_cast<int>((packed_key >> shift_y) & mask_y) +
+                        bits.lo[1],
+                    static_cast<int>(packed_key & mask_z) + bits.lo[2]);
+  };
+  // When the packed key and the point index fit in 64 bits together, sort
+  // single words (key above, index below): half the bytes per pass of the
+  // key/index pairs, and equal keys stay in index order. The word arrays
+  // live in the scratch buffer, which holds twice as many words as points.
+  int index_width = 0;
+  while ((static_cast<uint64_t>(num_points - 1) >> index_width) != 0) {
+    ++index_width;
+  }
+  if (total_width + index_width <= 64) {
+    uint64_t *words = reinterpret_cast<uint64_t *>(scratch.data());
+    uint64_t *words_alt = words + num_points;
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 1 << 14),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            words[i] = (pack(src[i].key) << index_width) |
+                       static_cast<uint64_t>(src[i].index);
+          }
+        });
+    uint64_t *from = words;
+    uint64_t *to = words_alt;
+    for (int low = index_width; low < index_width + total_width;
+         low += kRadixBits) {
+      std::fill(histogram.begin(), histogram.end(), 0);
+      tbb::parallel_for(0, kRadixChunks, [&](int chunk) {
+        const int begin = static_cast<int>(
+            static_cast<long long>(chunk) * num_points / kRadixChunks);
+        const int end = static_cast<int>(
+            static_cast<long long>(chunk + 1) * num_points / kRadixChunks);
+        int *row = histogram.data() +
+                   static_cast<std::size_t>(chunk) * kRadixBuckets;
+        for (int i = begin; i < end; ++i) {
+          ++row[(from[i] >> low) & (kRadixBuckets - 1)];
+        }
+      });
+      int total = 0;
+      for (int bucket = 0; bucket < kRadixBuckets; ++bucket) {
+        for (int chunk = 0; chunk < kRadixChunks; ++chunk) {
+          const std::size_t slot =
+              static_cast<std::size_t>(chunk) * kRadixBuckets + bucket;
+          offsets[slot] = total;
+          total += histogram[slot];
+        }
+      }
+      tbb::parallel_for(0, kRadixChunks, [&](int chunk) {
+        const int begin = static_cast<int>(
+            static_cast<long long>(chunk) * num_points / kRadixChunks);
+        const int end = static_cast<int>(
+            static_cast<long long>(chunk + 1) * num_points / kRadixChunks);
+        int *row = offsets.data() +
+                   static_cast<std::size_t>(chunk) * kRadixBuckets;
+        for (int i = begin; i < end; ++i) {
+          to[row[(from[i] >> low) & (kRadixBuckets - 1)]++] = from[i];
+        }
+      });
+      std::swap(from, to);
+    }
+    const uint64_t index_mask = (uint64_t{1} << index_width) - 1;
+    SortPointKey *out = keys.data();
+    tbb::parallel_for(
+        tbb::blocked_range<int>(0, num_points, 1 << 14),
+        [&](const tbb::blocked_range<int> &range) {
+          for (int i = range.begin(); i < range.end(); ++i) {
+            out[i] = SortPointKey{unpack(from[i] >> index_width),
+                                  static_cast<int>(from[i] & index_mask)};
+          }
+        });
+    return true;
+  }
+  const bool packed = passes(packed_varying) + 2 <= passes(varying_bits);
   if (packed) {
     tbb::parallel_for(
         tbb::blocked_range<int>(0, num_points, 1 << 14),
         [&](const tbb::blocked_range<int> &range) {
           for (int i = range.begin(); i < range.end(); ++i) {
-            const uint64_t key = src[i].key;
-            src[i].key =
-                (static_cast<uint64_t>(field(key, 42) - bits.lo[0])
-                 << shift_x) |
-                (static_cast<uint64_t>(field(key, 21) - bits.lo[1])
-                 << shift_y) |
-                static_cast<uint64_t>(field(key, 0) - bits.lo[2]);
+            src[i].key = pack(src[i].key);
           }
         });
     varying_bits = packed_varying;
@@ -353,18 +429,12 @@ bool radix_sort_point_keys(std::vector<SortPointKey> &keys,
     std::copy(src, src + num_points, keys.data());
   }
   if (packed) {
-    const uint64_t mask_y = (uint64_t{1} << width[1]) - 1;
-    const uint64_t mask_z = (uint64_t{1} << width[2]) - 1;
     SortPointKey *out = keys.data();
     tbb::parallel_for(
         tbb::blocked_range<int>(0, num_points, 1 << 14),
         [&](const tbb::blocked_range<int> &range) {
           for (int i = range.begin(); i < range.end(); ++i) {
-            const uint64_t key = out[i].key;
-            out[i].key = make_key(
-                static_cast<int>(key >> shift_x) + bits.lo[0],
-                static_cast<int>((key >> shift_y) & mask_y) + bits.lo[1],
-                static_cast<int>(key & mask_z) + bits.lo[2]);
+            out[i].key = unpack(out[i].key);
           }
         });
     return true;
