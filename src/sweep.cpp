@@ -305,6 +305,89 @@ void adopt_sorted_order(Index &index, const std::vector<float> &x,
       });
 }
 
+// Point indices in ascending (x, index) order. A stable LSD radix sort over
+// x's order-preserving bit pattern, with the index in the low half of each
+// value, replaces a comparison sort whose comparator loads x through the
+// index: four sequential histogram and scatter passes instead of a cache miss
+// and an unpredictable branch per comparison. The values start in index order
+// and every pass is stable, so equal x keep ascending index, the comparison
+// order. -0.0 and +0.0 compare equal, so both map to the key of +0.0.
+static void sort_by_x(const std::vector<float> &x, IntBuffer &order) {
+  const int num_points = static_cast<int>(x.size());
+  std::vector<uint64_t> values(static_cast<std::size_t>(num_points));
+  std::vector<uint64_t> scratch(static_cast<std::size_t>(num_points));
+  constexpr int kGrain = 1 << 14;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          uint32_t bits = 0;
+          std::memcpy(&bits, &x[static_cast<std::size_t>(i)], sizeof(bits));
+          if (bits == 0x80000000u) {
+            bits = 0;
+          }
+          const uint32_t key =
+              (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;
+          values[static_cast<std::size_t>(i)] =
+              (static_cast<uint64_t>(key) << 32) | static_cast<uint32_t>(i);
+        }
+      });
+  constexpr int kChunks = 16;
+  const int chunks = std::max(1, std::min(kChunks, num_points / 4096));
+  auto chunk_begin = [&](int chunk) {
+    return static_cast<int>(static_cast<int64_t>(chunk) * num_points / chunks);
+  };
+  std::vector<int> offsets(static_cast<std::size_t>(chunks) * 256);
+  uint64_t *src = values.data();
+  uint64_t *dst = scratch.data();
+  for (int shift = 32; shift < 64; shift += 8) {
+    std::fill(offsets.begin(), offsets.end(), 0);
+    tbb::parallel_for(0, chunks, [&](int chunk) {
+      int *row = offsets.data() + static_cast<std::size_t>(chunk) * 256;
+      for (int i = chunk_begin(chunk); i < chunk_begin(chunk + 1); ++i) {
+        ++row[(src[i] >> shift) & 0xff];
+      }
+    });
+    // A digit that is the same in every value leaves the order unchanged.
+    int nonempty = 0;
+    for (int digit = 0; digit < 256 && nonempty < 2; ++digit) {
+      for (int chunk = 0; chunk < chunks; ++chunk) {
+        if (offsets[static_cast<std::size_t>(chunk) * 256 + digit] != 0) {
+          ++nonempty;
+          break;
+        }
+      }
+    }
+    if (nonempty < 2) {
+      continue;
+    }
+    int running = 0;
+    for (int digit = 0; digit < 256; ++digit) {
+      for (int chunk = 0; chunk < chunks; ++chunk) {
+        int &slot = offsets[static_cast<std::size_t>(chunk) * 256 + digit];
+        const int count = slot;
+        slot = running;
+        running += count;
+      }
+    }
+    tbb::parallel_for(0, chunks, [&](int chunk) {
+      int *row = offsets.data() + static_cast<std::size_t>(chunk) * 256;
+      for (int i = chunk_begin(chunk); i < chunk_begin(chunk + 1); ++i) {
+        dst[row[(src[i] >> shift) & 0xff]++] = src[i];
+      }
+    });
+    std::swap(src, dst);
+  }
+  order.resize(static_cast<std::size_t>(num_points));
+  tbb::parallel_for(tbb::blocked_range<int>(0, num_points, kGrain),
+                    [&](const tbb::blocked_range<int> &range) {
+                      for (int i = range.begin(); i < range.end(); ++i) {
+                        order[static_cast<std::size_t>(i)] =
+                            static_cast<int>(static_cast<uint32_t>(src[i]));
+                      }
+                    });
+}
+
 void ensure_index(Index &index, const std::vector<float> &x,
                   const std::vector<float> &y, const std::vector<float> &z) {
   if (index.valid) {
@@ -315,23 +398,21 @@ void ensure_index(Index &index, const std::vector<float> &x,
     index.clear();
     return;
   }
-  index.order.resize(static_cast<std::size_t>(num_points));
-  std::iota(index.order.begin(), index.order.end(), 0);
-  tbb::parallel_sort(index.order.begin(), index.order.end(),
-                     [&x](int a, int b) {
-                       const float xa = x[static_cast<std::size_t>(a)];
-                       const float xb = x[static_cast<std::size_t>(b)];
-                       return xa < xb || (xa == xb && a < b);
-                     });
+  sort_by_x(x, index.order);
   index.x.resize(static_cast<std::size_t>(num_points));
   index.y.resize(static_cast<std::size_t>(num_points));
   index.z.resize(static_cast<std::size_t>(num_points));
-  for (int i = 0; i < num_points; ++i) {
-    const int source = index.order[static_cast<std::size_t>(i)];
-    index.x[static_cast<std::size_t>(i)] = x[static_cast<std::size_t>(source)];
-    index.y[static_cast<std::size_t>(i)] = y[static_cast<std::size_t>(source)];
-    index.z[static_cast<std::size_t>(i)] = z[static_cast<std::size_t>(source)];
-  }
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_points, 1 << 14),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int i = range.begin(); i < range.end(); ++i) {
+          const std::size_t source =
+              static_cast<std::size_t>(index.order[static_cast<std::size_t>(i)]);
+          index.x[static_cast<std::size_t>(i)] = x[source];
+          index.y[static_cast<std::size_t>(i)] = y[source];
+          index.z[static_cast<std::size_t>(i)] = z[source];
+        }
+      });
   index.valid = true;
 }
 
