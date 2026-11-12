@@ -365,6 +365,34 @@ static inline uniform int dense_runs(const uniform DenseGrid &grid,
   const uniform int cy = unpack_coord_uniform(key, 21);
   const uniform int cz = unpack_coord_uniform(key, 0);
   uniform int num_runs = 0;
+  const uniform int ix = cx - grid.min_x;
+  const uniform int iy = cy - grid.min_y;
+  const uniform int iz = cz - grid.min_z;
+  if (ix > 0 && ix < grid.nx - 1 && iy > 0 && iy < grid.ny - 1 && iz > 0 &&
+      iz < grid.nz - 1 && (cz > 0 || cz < -1)) {
+    // Interior cell whose column does not cross z = 0: the occupied cells of
+    // each neighbor column are consecutive in the sorted order, so the
+    // column's run spans from its first occupied cell to its last, and an
+    // empty column yields an empty run. No branch depends on occupancy.
+    const uniform int plane = grid.nx * grid.ny;
+    for (uniform int dy = -1; dy <= 1; ++dy) {
+      for (uniform int dx = -1; dx <= 1; ++dx) {
+        const uniform int base = ((iz - 1) * grid.ny + iy + dy) * grid.nx +
+                                 ix + dx;
+        const uniform int n0 = grid.cells[base];
+        const uniform int n1 = grid.cells[base + plane];
+        const uniform int n2 = grid.cells[base + 2 * plane];
+        const uniform int first = n0 != -1 ? n0 : (n1 != -1 ? n1 : n2);
+        const uniform int last = n2 != -1 ? n2 : (n1 != -1 ? n1 : n0);
+        const uniform int start = targets.starts[max(first, 0)];
+        const uniform int end = targets.ends[max(last, 0)];
+        run_start[num_runs] = start;
+        run_end[num_runs] = first != -1 ? end : start;
+        ++num_runs;
+      }
+    }
+    return num_runs;
+  }
   for (uniform int dx = -1; dx <= 1; ++dx) {
     for (uniform int dy = -1; dy <= 1; ++dy) {
       uniform int current_start = -1;
