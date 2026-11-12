@@ -724,23 +724,47 @@ inline bool sort_point_set(
     original_index[i] = idx;
   });
 
-  cell_starts.clear();
-  cell_ends.clear();
-  unique_keys.clear();
-  cell_starts.reserve(num_points);
-  cell_ends.reserve(num_points);
-  unique_keys.reserve(num_points);
-  cell_starts.push_back(0);
-  unique_keys.push_back(point_keys[0].key);
-
-  for (int i = 1; i < num_points; ++i) {
-    if (point_keys[i].key != point_keys[i - 1].key) {
-      cell_ends.push_back(i);
-      cell_starts.push_back(i);
-      unique_keys.push_back(point_keys[i].key);
+  // Cells start where the sorted key changes. Chunks count their starts,
+  // a scan places them, and each chunk writes its cells in place.
+  constexpr int kChunk = 1 << 14;
+  const int chunks = (num_points + kChunk - 1) / kChunk;
+  std::vector<int> chunk_cells(static_cast<std::size_t>(chunks) + 1, 0);
+  auto starts_cell = [&](int i) {
+    return i == 0 || point_keys[i].key != point_keys[i - 1].key;
+  };
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * kChunk;
+    const int end = std::min(num_points, begin + kChunk);
+    int count = 0;
+    for (int i = begin; i < end; ++i) {
+      count += starts_cell(i) ? 1 : 0;
     }
+    chunk_cells[static_cast<std::size_t>(chunk) + 1] = count;
+  });
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    chunk_cells[static_cast<std::size_t>(chunk) + 1] +=
+        chunk_cells[static_cast<std::size_t>(chunk)];
   }
-  cell_ends.push_back(num_points);
+  const int num_cells = chunk_cells.back();
+  cell_starts.resize(static_cast<std::size_t>(num_cells));
+  cell_ends.resize(static_cast<std::size_t>(num_cells));
+  unique_keys.resize(static_cast<std::size_t>(num_cells));
+  tbb::parallel_for(0, chunks, [&](int chunk) {
+    const int begin = chunk * kChunk;
+    const int end = std::min(num_points, begin + kChunk);
+    int cell = chunk_cells[static_cast<std::size_t>(chunk)];
+    for (int i = begin; i < end; ++i) {
+      if (starts_cell(i)) {
+        if (cell > 0) {
+          cell_ends[static_cast<std::size_t>(cell) - 1] = i;
+        }
+        cell_starts[static_cast<std::size_t>(cell)] = i;
+        unique_keys[static_cast<std::size_t>(cell)] = point_keys[i].key;
+        ++cell;
+      }
+    }
+  });
+  cell_ends[static_cast<std::size_t>(num_cells) - 1] = num_points;
   return false;
 }
 
