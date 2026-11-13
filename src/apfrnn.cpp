@@ -112,15 +112,22 @@ inline bool prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
   // Shrink once the waste passes a quarter of the buffer: a fitted capacity
   // can be far below the first guess, and the old rule kept the larger
   // buffer resident for the rest of the run.
+  // Regrowth of a large buffer costs a full pass of page zeroing; small
+  // buffers keep exact sizes.
+  constexpr std::size_t kHeadroomMin = std::size_t{16} << 20;
+  const bool regrow = values.capacity() > 0 && required > values.capacity() &&
+                      required >= kHeadroomMin;
   const bool fresh =
       required > values.capacity() || 4 * required < 3 * values.capacity();
   if (fresh) {
     IntBuffer().swap(values);
     // A fitted capacity creeps up as a moving set's maximum degree grows, and
     // each regrowth to a new buffer faults in and zeroes every page again.
-    // Headroom absorbs small regrowths; pages that are never written are
-    // never faulted in.
-    values.reserve(required + required / 8);
+    // A buffer that had to grow gets headroom for the next small regrowth;
+    // pages that are never written are never faulted in.
+    if (regrow) {
+      values.reserve(required + required / 8);
+    }
   }
   values.resize(required);
   hint_huge_pages(values.data(),
