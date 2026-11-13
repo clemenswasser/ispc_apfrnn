@@ -560,14 +560,14 @@ inline bool sort_point_set(
     }
     int *inverse = inverse_out != nullptr ? inverse_out->data() : nullptr;
     constexpr int64_t kCellGrain = 4096;
-    std::vector<std::atomic<int>> counts(
-        static_cast<std::size_t>(total_cells));
+    // Plain ints updated with atomic builtins: a vector of std::atomic<int>
+    // would zero the whole cell box serially before the parallel zeroing.
+    IntBuffer counts(static_cast<std::size_t>(total_cells));
     tbb::parallel_for(
         tbb::blocked_range<int64_t>(0, total_cells, kCellGrain),
         [&](const tbb::blocked_range<int64_t> &range) {
           for (int64_t cell = range.begin(); cell < range.end(); ++cell) {
-            counts[static_cast<std::size_t>(cell)].store(
-                0, std::memory_order_relaxed);
+            counts[static_cast<std::size_t>(cell)] = 0;
           }
         });
 
@@ -581,12 +581,12 @@ inline bool sort_point_set(
             const int lz = unpack_coord(key, 0) - min_cz;
             const int64_t cell =
                 (static_cast<int64_t>(lx) * ny + ly) * nz + lz;
-            counts[static_cast<std::size_t>(cell)].fetch_add(
-                1, std::memory_order_relaxed);
+            __atomic_fetch_add(&counts[static_cast<std::size_t>(cell)], 1,
+                               __ATOMIC_RELAXED);
           }
         });
 
-    std::vector<int> offsets(static_cast<std::size_t>(total_cells));
+    IntBuffer offsets(static_cast<std::size_t>(total_cells));
     tbb::parallel_scan(
         tbb::blocked_range<int64_t>(0, total_cells, kCellGrain), 0,
         [&](const tbb::blocked_range<int64_t> &range, int sum,
@@ -596,8 +596,7 @@ inline bool sort_point_set(
             if (is_final_scan) {
               offsets[static_cast<std::size_t>(cell)] = temp;
             }
-            temp += counts[static_cast<std::size_t>(cell)].load(
-                std::memory_order_relaxed);
+            temp += counts[static_cast<std::size_t>(cell)];
           }
           return temp;
         },
@@ -607,8 +606,7 @@ inline bool sort_point_set(
         tbb::blocked_range<int64_t>(0, total_cells, kCellGrain), 0,
         [&](const tbb::blocked_range<int64_t> &range, int sum) {
           for (int64_t cell = range.begin(); cell < range.end(); ++cell) {
-            if (counts[static_cast<std::size_t>(cell)].load(
-                    std::memory_order_relaxed) > 0) {
+            if (counts[static_cast<std::size_t>(cell)] > 0) {
               ++sum;
             }
           }
@@ -631,8 +629,7 @@ inline bool sort_point_set(
           int64_t ly = remaining % ny;
           int64_t lx = remaining / ny;
           for (int64_t cell = range.begin(); cell < range.end(); ++cell) {
-            const int count = counts[static_cast<std::size_t>(cell)].load(
-                std::memory_order_relaxed);
+            const int count = counts[static_cast<std::size_t>(cell)];
             if (count > 0) {
               if (is_final_scan) {
                 const int start = offsets[static_cast<std::size_t>(cell)];
