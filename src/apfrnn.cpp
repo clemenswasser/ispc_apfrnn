@@ -2123,170 +2123,154 @@ static void build_point_blocks_inplace(NeighborSearchData &data) {
   const int block_size =
       (num_points >= 100000 && max_cell_points > 512) ? 64 : 256;
 
+  // A cell's block count follows from its point count, so the block offsets
+  // come from one scan and every cell is then built independently.
   data.cell_block_start.resize(static_cast<std::size_t>(num_cells) + 1);
   data.cell_block_count.resize(static_cast<std::size_t>(num_cells));
-  data.cell_min_x.resize(static_cast<std::size_t>(num_cells));
-  data.cell_min_y.resize(static_cast<std::size_t>(num_cells));
-  data.cell_min_z.resize(static_cast<std::size_t>(num_cells));
-  data.cell_max_x.resize(static_cast<std::size_t>(num_cells));
-  data.cell_max_y.resize(static_cast<std::size_t>(num_cells));
-  data.cell_max_z.resize(static_cast<std::size_t>(num_cells));
-  const std::size_t estimated_blocks =
-      static_cast<std::size_t>(num_points / block_size + num_cells);
-  data.block_begin.reserve(estimated_blocks);
-  data.block_end.reserve(estimated_blocks);
-  data.block_cell.reserve(estimated_blocks);
-  data.block_min_x.reserve(estimated_blocks);
-  data.block_min_y.reserve(estimated_blocks);
-  data.block_min_z.reserve(estimated_blocks);
-  data.block_max_x.reserve(estimated_blocks);
-  data.block_max_y.reserve(estimated_blocks);
-  data.block_max_z.reserve(estimated_blocks);
-
-  std::vector<int> order;
-  std::vector<uint32_t> codes;
-  std::vector<float> temp_x;
-  std::vector<float> temp_y;
-  std::vector<float> temp_z;
-  std::vector<int> temp_index;
-  constexpr uint32_t kLocalMortonMax = (1U << 10) - 1U;
-
+  int num_blocks = 0;
   for (int cell = 0; cell < num_cells; ++cell) {
     const std::size_t cell_index = static_cast<std::size_t>(cell);
-    const int begin = data.cell_starts[cell_index];
-    const int end = data.cell_ends[cell_index];
-    const int count = end - begin;
-    data.cell_block_start[cell_index] = data.block_begin.size();
-
-    float cell_min_x = data.sorted_x[static_cast<std::size_t>(begin)];
-    float cell_min_y = data.sorted_y[static_cast<std::size_t>(begin)];
-    float cell_min_z = data.sorted_z[static_cast<std::size_t>(begin)];
-    float cell_max_x = cell_min_x;
-    float cell_max_y = cell_min_y;
-    float cell_max_z = cell_min_z;
-    for (int i = begin + 1; i < end; ++i) {
-      cell_min_x = std::min(cell_min_x,
-                            data.sorted_x[static_cast<std::size_t>(i)]);
-      cell_min_y = std::min(cell_min_y,
-                            data.sorted_y[static_cast<std::size_t>(i)]);
-      cell_min_z = std::min(cell_min_z,
-                            data.sorted_z[static_cast<std::size_t>(i)]);
-      cell_max_x = std::max(cell_max_x,
-                            data.sorted_x[static_cast<std::size_t>(i)]);
-      cell_max_y = std::max(cell_max_y,
-                            data.sorted_y[static_cast<std::size_t>(i)]);
-      cell_max_z = std::max(cell_max_z,
-                            data.sorted_z[static_cast<std::size_t>(i)]);
-    }
-    data.cell_min_x[cell_index] = cell_min_x;
-    data.cell_min_y[cell_index] = cell_min_y;
-    data.cell_min_z[cell_index] = cell_min_z;
-    data.cell_max_x[cell_index] = cell_max_x;
-    data.cell_max_y[cell_index] = cell_max_y;
-    data.cell_max_z[cell_index] = cell_max_z;
-
-    if (count > block_size) {
-      float min_x = data.sorted_x[static_cast<std::size_t>(begin)];
-      float min_y = data.sorted_y[static_cast<std::size_t>(begin)];
-      float min_z = data.sorted_z[static_cast<std::size_t>(begin)];
-      float max_x = min_x;
-      float max_y = min_y;
-      float max_z = min_z;
-      for (int i = begin + 1; i < end; ++i) {
-        min_x = std::min(min_x, data.sorted_x[static_cast<std::size_t>(i)]);
-        min_y = std::min(min_y, data.sorted_y[static_cast<std::size_t>(i)]);
-        min_z = std::min(min_z, data.sorted_z[static_cast<std::size_t>(i)]);
-        max_x = std::max(max_x, data.sorted_x[static_cast<std::size_t>(i)]);
-        max_y = std::max(max_y, data.sorted_y[static_cast<std::size_t>(i)]);
-        max_z = std::max(max_z, data.sorted_z[static_cast<std::size_t>(i)]);
-      }
-      const float extent_x = max_x - min_x;
-      const float extent_y = max_y - min_y;
-      const float extent_z = max_z - min_z;
-      const float inv_x = extent_x > 0.0f ? kLocalMortonMax / extent_x : 0.0f;
-      const float inv_y = extent_y > 0.0f ? kLocalMortonMax / extent_y : 0.0f;
-      const float inv_z = extent_z > 0.0f ? kLocalMortonMax / extent_z : 0.0f;
-
-      order.resize(static_cast<std::size_t>(count));
-      codes.resize(static_cast<std::size_t>(count));
-      std::iota(order.begin(), order.end(), 0);
-      for (int local = 0; local < count; ++local) {
-        const std::size_t source = static_cast<std::size_t>(begin + local);
-        const uint32_t qx = static_cast<uint32_t>(std::min(
-            static_cast<float>(kLocalMortonMax),
-            std::max(0.0f, (data.sorted_x[source] - min_x) * inv_x)));
-        const uint32_t qy = static_cast<uint32_t>(std::min(
-            static_cast<float>(kLocalMortonMax),
-            std::max(0.0f, (data.sorted_y[source] - min_y) * inv_y)));
-        const uint32_t qz = static_cast<uint32_t>(std::min(
-            static_cast<float>(kLocalMortonMax),
-            std::max(0.0f, (data.sorted_z[source] - min_z) * inv_z)));
-        codes[static_cast<std::size_t>(local)] = (qx << 20) | (qy << 10) | qz;
-      }
-      std::sort(order.begin(), order.end(),
-                [&codes](int a, int b) {
-                  return codes[static_cast<std::size_t>(a)] <
-                         codes[static_cast<std::size_t>(b)];
-                });
-
-      temp_x.resize(static_cast<std::size_t>(count));
-      temp_y.resize(static_cast<std::size_t>(count));
-      temp_z.resize(static_cast<std::size_t>(count));
-      temp_index.resize(static_cast<std::size_t>(count));
-      for (int local = 0; local < count; ++local) {
-        const std::size_t source = static_cast<std::size_t>(
-            begin + order[static_cast<std::size_t>(local)]);
-        temp_x[static_cast<std::size_t>(local)] = data.sorted_x[source];
-        temp_y[static_cast<std::size_t>(local)] = data.sorted_y[source];
-        temp_z[static_cast<std::size_t>(local)] = data.sorted_z[source];
-        temp_index[static_cast<std::size_t>(local)] =
-            data.original_index[source];
-      }
-      for (int local = 0; local < count; ++local) {
-        const std::size_t destination =
-            static_cast<std::size_t>(begin + local);
-        data.sorted_x[destination] = temp_x[static_cast<std::size_t>(local)];
-        data.sorted_y[destination] = temp_y[static_cast<std::size_t>(local)];
-        data.sorted_z[destination] = temp_z[static_cast<std::size_t>(local)];
-        data.original_index[destination] =
-            temp_index[static_cast<std::size_t>(local)];
-      }
-    }
-
-    for (int block_begin = begin; block_begin < end;
-         block_begin += block_size) {
-      const int block_end = std::min(end, block_begin + block_size);
-      float min_x = data.sorted_x[static_cast<std::size_t>(block_begin)];
-      float min_y = data.sorted_y[static_cast<std::size_t>(block_begin)];
-      float min_z = data.sorted_z[static_cast<std::size_t>(block_begin)];
-      float max_x = min_x;
-      float max_y = min_y;
-      float max_z = min_z;
-      for (int i = block_begin + 1; i < block_end; ++i) {
-        min_x = std::min(min_x, data.sorted_x[static_cast<std::size_t>(i)]);
-        min_y = std::min(min_y, data.sorted_y[static_cast<std::size_t>(i)]);
-        min_z = std::min(min_z, data.sorted_z[static_cast<std::size_t>(i)]);
-        max_x = std::max(max_x, data.sorted_x[static_cast<std::size_t>(i)]);
-        max_y = std::max(max_y, data.sorted_y[static_cast<std::size_t>(i)]);
-        max_z = std::max(max_z, data.sorted_z[static_cast<std::size_t>(i)]);
-      }
-      data.block_begin.push_back(block_begin);
-      data.block_end.push_back(block_end);
-      data.block_cell.push_back(cell);
-      data.block_min_x.push_back(min_x);
-      data.block_min_y.push_back(min_y);
-      data.block_min_z.push_back(min_z);
-      data.block_max_x.push_back(max_x);
-      data.block_max_y.push_back(max_y);
-      data.block_max_z.push_back(max_z);
-    }
-    data.cell_block_count[cell_index] =
-        data.block_begin.size() - data.cell_block_start[cell_index];
+    const int count = data.cell_ends[cell_index] - data.cell_starts[cell_index];
+    const int blocks = (count + block_size - 1) / block_size;
+    data.cell_block_start[cell_index] = num_blocks;
+    data.cell_block_count[cell_index] = blocks;
+    num_blocks += blocks;
   }
-  data.cell_block_start[static_cast<std::size_t>(num_cells)] =
-      data.block_begin.size();
-  data.blocks_valid = true;
+  data.cell_block_start[static_cast<std::size_t>(num_cells)] = num_blocks;
+  const std::size_t cells = static_cast<std::size_t>(num_cells);
+  const std::size_t blocks = static_cast<std::size_t>(num_blocks);
+  data.cell_min_x.resize(cells);
+  data.cell_min_y.resize(cells);
+  data.cell_min_z.resize(cells);
+  data.cell_max_x.resize(cells);
+  data.cell_max_y.resize(cells);
+  data.cell_max_z.resize(cells);
+  data.block_begin.resize(blocks);
+  data.block_end.resize(blocks);
+  data.block_cell.resize(blocks);
+  data.block_min_x.resize(blocks);
+  data.block_min_y.resize(blocks);
+  data.block_min_z.resize(blocks);
+  data.block_max_x.resize(blocks);
+  data.block_max_y.resize(blocks);
+  data.block_max_z.resize(blocks);
 
+  constexpr uint32_t kLocalMortonMax = (1U << 10) - 1U;
+  float *sx = data.sorted_x.data();
+  float *sy = data.sorted_y.data();
+  float *sz = data.sorted_z.data();
+  int *original = data.original_index.data();
+
+  // Bounds of the points [begin, end) in sorted order.
+  struct Box {
+    float lo[3];
+    float hi[3];
+  };
+  auto bounds = [&](int begin, int end) {
+    Box box{{sx[begin], sy[begin], sz[begin]}, {sx[begin], sy[begin], sz[begin]}};
+    for (int i = begin + 1; i < end; ++i) {
+      box.lo[0] = std::min(box.lo[0], sx[i]);
+      box.lo[1] = std::min(box.lo[1], sy[i]);
+      box.lo[2] = std::min(box.lo[2], sz[i]);
+      box.hi[0] = std::max(box.hi[0], sx[i]);
+      box.hi[1] = std::max(box.hi[1], sy[i]);
+      box.hi[2] = std::max(box.hi[2], sz[i]);
+    }
+    return box;
+  };
+
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, num_cells, 64),
+      [&](const tbb::blocked_range<int> &range) {
+        std::vector<int> order;
+        std::vector<uint32_t> codes;
+        std::vector<float> temp_x;
+        std::vector<float> temp_y;
+        std::vector<float> temp_z;
+        std::vector<int> temp_index;
+        for (int cell = range.begin(); cell < range.end(); ++cell) {
+          const std::size_t cell_index = static_cast<std::size_t>(cell);
+          const int begin = data.cell_starts[cell_index];
+          const int end = data.cell_ends[cell_index];
+          const int count = end - begin;
+          const Box cell_box = bounds(begin, end);
+          data.cell_min_x[cell_index] = cell_box.lo[0];
+          data.cell_min_y[cell_index] = cell_box.lo[1];
+          data.cell_min_z[cell_index] = cell_box.lo[2];
+          data.cell_max_x[cell_index] = cell_box.hi[0];
+          data.cell_max_y[cell_index] = cell_box.hi[1];
+          data.cell_max_z[cell_index] = cell_box.hi[2];
+
+          if (count > block_size) {
+            // Order the cell's points along a local Morton curve so that
+            // consecutive blocks are spatially compact.
+            const float extent_x = cell_box.hi[0] - cell_box.lo[0];
+            const float extent_y = cell_box.hi[1] - cell_box.lo[1];
+            const float extent_z = cell_box.hi[2] - cell_box.lo[2];
+            const float inv_x =
+                extent_x > 0.0f ? kLocalMortonMax / extent_x : 0.0f;
+            const float inv_y =
+                extent_y > 0.0f ? kLocalMortonMax / extent_y : 0.0f;
+            const float inv_z =
+                extent_z > 0.0f ? kLocalMortonMax / extent_z : 0.0f;
+            const std::size_t n = static_cast<std::size_t>(count);
+            order.resize(n);
+            codes.resize(n);
+            std::iota(order.begin(), order.end(), 0);
+            for (int local = 0; local < count; ++local) {
+              const int source = begin + local;
+              const uint32_t qx = static_cast<uint32_t>(std::min(
+                  static_cast<float>(kLocalMortonMax),
+                  std::max(0.0f, (sx[source] - cell_box.lo[0]) * inv_x)));
+              const uint32_t qy = static_cast<uint32_t>(std::min(
+                  static_cast<float>(kLocalMortonMax),
+                  std::max(0.0f, (sy[source] - cell_box.lo[1]) * inv_y)));
+              const uint32_t qz = static_cast<uint32_t>(std::min(
+                  static_cast<float>(kLocalMortonMax),
+                  std::max(0.0f, (sz[source] - cell_box.lo[2]) * inv_z)));
+              codes[static_cast<std::size_t>(local)] =
+                  (qx << 20) | (qy << 10) | qz;
+            }
+            std::sort(order.begin(), order.end(), [&codes](int a, int b) {
+              return codes[static_cast<std::size_t>(a)] <
+                     codes[static_cast<std::size_t>(b)];
+            });
+            temp_x.resize(n);
+            temp_y.resize(n);
+            temp_z.resize(n);
+            temp_index.resize(n);
+            for (std::size_t local = 0; local < n; ++local) {
+              const int source = begin + order[local];
+              temp_x[local] = sx[source];
+              temp_y[local] = sy[source];
+              temp_z[local] = sz[source];
+              temp_index[local] = original[source];
+            }
+            std::copy(temp_x.begin(), temp_x.end(), sx + begin);
+            std::copy(temp_y.begin(), temp_y.end(), sy + begin);
+            std::copy(temp_z.begin(), temp_z.end(), sz + begin);
+            std::copy(temp_index.begin(), temp_index.end(), original + begin);
+          }
+
+          std::size_t block =
+              static_cast<std::size_t>(data.cell_block_start[cell_index]);
+          for (int block_begin = begin; block_begin < end;
+               block_begin += block_size, ++block) {
+            const int block_end = std::min(end, block_begin + block_size);
+            const Box box = bounds(block_begin, block_end);
+            data.block_begin[block] = block_begin;
+            data.block_end[block] = block_end;
+            data.block_cell[block] = cell;
+            data.block_min_x[block] = box.lo[0];
+            data.block_min_y[block] = box.lo[1];
+            data.block_min_z[block] = box.lo[2];
+            data.block_max_x[block] = box.hi[0];
+            data.block_max_y[block] = box.hi[1];
+            data.block_max_z[block] = box.hi[2];
+          }
+        }
+      });
+  data.blocks_valid = true;
 }
 
 
