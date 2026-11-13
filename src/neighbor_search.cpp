@@ -1953,10 +1953,15 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
 // the same order, so the inline reader returns the same rows.
 namespace {
 
-// Makes reads of a pair's rows prefetch ahead (see detail::prefetch_row):
-// only rows larger than the last-level cache gain from it.
+// Makes reads of a pair's rows prefetch ahead (see detail::prefetch_row).
+// Only packed rows in sorted order larger than the last-level cache gain
+// from it: rows placed by point are already read front to back, and
+// fixed-stride rows are short or evenly spaced for the hardware
+// prefetchers.
 void mark_prefetch(detail::RowView &view, std::size_t ints) {
-  if (plan::pack_rows(static_cast<int64_t>(ints * sizeof(int)))) {
+  if (view.to_sorted != nullptr && view.offsets != nullptr &&
+      view.counts != nullptr &&
+      plan::pack_rows(static_cast<int64_t>(ints * sizeof(int)))) {
     view.kind = detail::RowView::RowsPrefetch;
   }
 }
