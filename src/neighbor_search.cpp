@@ -2619,21 +2619,27 @@ bool NSearch::build_moving_block_rows(int set) {
   const std::size_t n = static_cast<std::size_t>(num_points);
   if (!point_set.moving_caps_valid) {
     // Decide from the last frame's counts: slot totals do not depend on the
-    // row order. Sets that keep fixed rows are re-checked every 16 frames.
-    if (point_set.fixed_counts.size() != n || point_set.moving_check_wait > 0) {
+    // row order, and their ratio barely changes when the set resizes, so a
+    // set that grows every frame can still switch. Sets that keep fixed rows
+    // are re-checked every 16 frames.
+    if (point_set.fixed_counts.empty() || point_set.moving_check_wait > 0) {
       point_set.moving_check_wait =
           std::max(0, point_set.moving_check_wait - 1);
       return false;
     }
     // When the budget cannot hold fixed rows, per-point rows are the only
     // row layout the plan can use, so keep them even when their saving over
-    // the fixed layout is small.
+    // the fixed layout is small. A set that changed size recounts for any
+    // other layout, so it keeps per-point rows whenever they save slots.
     const plan::SamePlan same_plan =
         plan::same_set(data, point_set.last_fixed_capacity, memory_budget_);
+    const bool resized = point_set.fixed_counts.size() != n;
     if (same_plan.fixed_rows &&
-        !plan::prefer_block_rows(
-            plan::same_fixed_slots(point_set.fixed_counts),
-            plan::same_moving_slots(point_set.fixed_counts))) {
+        (resized ? plan::same_moving_slots(point_set.fixed_counts) >=
+                       plan::same_fixed_slots(point_set.fixed_counts)
+                 : !plan::prefer_block_rows(
+                       plan::same_fixed_slots(point_set.fixed_counts),
+                       plan::same_moving_slots(point_set.fixed_counts)))) {
       point_set.moving_check_wait = 16;
       return false;
     }

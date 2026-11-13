@@ -176,6 +176,16 @@ TEST_CASE("growing high-degree sets stay exact") {
   run_scene(spec, 6);
 }
 
+TEST_CASE("growing moderate-degree sets stay exact") {
+  // A slab grows every frame, so last frame's counts never match the current
+  // size; the per-point layout is chosen from them and seeds the new points.
+  run_scene(apfrnn::bench::growing_scene(
+                apfrnn::bench::synthetic_scene(
+                    apfrnn::bench::Distribution::Slab, 20000),
+                26000, 1000),
+            6);
+}
+
 TEST_CASE("sparse moving sets with multi-point cells stay exact") {
   // A sparse cloud small enough that several cells hold two or three points.
   // Those cells take the direct neighborhood scan around the unique-cell
