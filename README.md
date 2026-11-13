@@ -88,34 +88,34 @@ Searches captured from SPH simulations, in the order the simulation produced.
 <!-- bench:replay:start -->
 | Simulation | Moving particles | Avg neighbors | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact | Memory ours / Tree / Compact (MB) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ramp hv, t=0.10 s | 3k | 23 | 0.13 ms | 1.55 ms | n/a | 11.9x | 19.9x | n/a | 64 / 65 / n/a |
-| ramp lv, t=0.10 s | 3k | 23 | 0.13 ms | 1.58 ms | n/a | 12.0x | 19.9x | n/a | 64 / 65 / n/a |
-| ramp hv, t=0.30 s | 8k | 44 | 0.25 ms | 0.85 ms | 3.36 ms | 3.4x | 4.1x | 13.4x | 75 / 66 / 64 |
-| ramp lv, t=0.30 s | 8k | 38 | 0.25 ms | 0.90 ms | 2.89 ms | 3.7x | 4.5x | 11.8x | 63 / 66 / 64 |
-| funnel, t=0.20 s | 23k | 45 | 0.92 ms | 6.73 ms | n/a | 7.3x | 9.1x | n/a | 165 / 102 / n/a |
-| sink, t=0.10 s | 29k | 64 | 0.85 ms | 1.45 ms | 5.39 ms | 1.7x | 1.9x | 6.3x | 64 / 67 / 74 |
-| sink, t=0.50 s | 29k | 60 | 0.91 ms | 1.38 ms | 5.57 ms | 1.5x | 1.7x | 6.1x | 64 / 67 / 73 |
-| funnel, t=0.60 s | 73k | 47 | 4.11 ms | 10.87 ms | n/a | 2.6x | 3.5x | n/a | 178 / 124 / n/a |
-| wall, t=0.50 s | 74k | 61 | 2.82 ms | 4.09 ms | 25.91 ms | 1.4x | 1.8x | 9.2x | 147 / 105 / 111 |
-| droplet, t=0.05 s | 74k | 56 | 1.87 ms | 3.28 ms | 12.00 ms | 1.8x | 2.1x | 6.4x | 63 / 77 / 92 |
-| droplet, t=0.40 s | 74k | 57 | 1.87 ms | 3.40 ms | 12.09 ms | 1.8x | 2.2x | 6.5x | 63 / 77 / 92 |
-| wall, t=0.10 s | 74k | 53 | 1.68 ms | 3.70 ms | 21.21 ms | 2.2x | 2.8x | 12.6x | 63 / 104 / 103 |
-| funnel, t=0.20 s | 106k | 48 | 4.02 ms | 17.59 ms | n/a | 4.4x | 5.4x | n/a | 333 / 185 / n/a |
-| dam break, t=0.10 s | 155k | 58 | 4.65 ms | 6.86 ms | 37.59 ms | 1.5x | 1.7x | 8.1x | 193 / 128 / 176 |
-| dam break, t=0.40 s | 155k | 58 | 5.14 ms | 8.18 ms | 39.80 ms | 1.6x | 1.9x | 7.7x | 191 / 133 / 177 |
-| bowl, t=0.10 s | 170k | 64 | 5.75 ms | 7.14 ms | 36.35 ms | 1.2x | 1.3x | 6.3x | 209 / 130 / 175 |
-| bowl, t=0.50 s | 170k | 62 | 5.56 ms | 6.89 ms | 36.19 ms | 1.2x | 1.3x | 6.5x | 204 / 133 / 175 |
-| funnel, t=0.40 s | 213k | 49 | 10.78 ms | 26.88 ms | n/a | 2.5x | 2.9x | n/a | 458 / 244 / n/a |
-| sink, t=0.10 s | 214k | 63 | 7.16 ms | 11.22 ms | 41.47 ms | 1.6x | 1.8x | 5.8x | 201 / 152 / 212 |
-| sink, t=0.40 s | 214k | 56 | 7.74 ms | 9.76 ms | 42.42 ms | 1.3x | 1.4x | 5.5x | 215 / 141 / 210 |
-| droplet, t=0.05 s | 578k | 57 | 17.67 ms | 22.71 ms | 101.20 ms | 1.3x | 1.3x | 5.7x | 255 / 300 / 541 |
-| droplet, t=0.25 s | 578k | 58 | 17.78 ms | 21.74 ms | 104.49 ms | 1.2x | 1.2x | 5.9x | 254 / 301 / 540 |
-| wall, t=0.10 s | 578k | 54 | 16.48 ms | 28.40 ms | 144.59 ms | 1.7x | 1.9x | 8.8x | 419 / 415 / 668 |
-| dam break, t=0.10 s | 701k | 50 | 23.54 ms | 35.85 ms | 178.34 ms | 1.5x | 1.7x | 7.6x | 647 / 460 / 734 |
-| bowl, t=0.10 s | 1.3M | 38 | 37.21 ms | 64.30 ms | 280.93 ms | 1.7x | 2.1x | 7.6x | 1071 / 762 / 1162 |
-| wall, t=0.10 s | 1.7M | 56 | 48.85 ms | 82.50 ms | 397.50 ms | 1.7x | 1.8x | 8.1x | 1112 / 1058 / 1857 |
-| dam break, t=0.10 s | 2.4M | 43 | 82.07 ms | 126.65 ms | 568.81 ms | 1.5x | 1.6x | 6.9x | 2231 / 1447 / 2366 |
-| bowl, t=0.10 s | 3.8M | 40 | 109.10 ms | 188.96 ms | 854.51 ms | 1.7x | 2.0x | 7.8x | 3021 / 2238 / 3255 |
+| ramp hv, t=0.10 s | 3k | 23 | 0.13 ms | 1.53 ms | n/a | 11.9x | 20.9x | n/a | 64 / 65 / n/a |
+| ramp lv, t=0.10 s | 3k | 23 | 0.13 ms | 1.59 ms | n/a | 12.0x | 20.6x | n/a | 65 / 65 / n/a |
+| ramp hv, t=0.30 s | 8k | 44 | 0.23 ms | 0.89 ms | 3.35 ms | 4.0x | 5.0x | 14.8x | 76 / 66 / 64 |
+| ramp lv, t=0.30 s | 8k | 38 | 0.22 ms | 0.91 ms | 2.91 ms | 4.2x | 5.1x | 13.5x | 63 / 66 / 64 |
+| funnel, t=0.20 s | 23k | 45 | 0.79 ms | 6.55 ms | n/a | 8.3x | 11.3x | n/a | 166 / 107 / n/a |
+| sink, t=0.10 s | 29k | 64 | 0.73 ms | 1.50 ms | 5.32 ms | 2.1x | 2.6x | 7.3x | 65 / 67 / 74 |
+| sink, t=0.50 s | 29k | 60 | 0.79 ms | 1.39 ms | 5.47 ms | 1.8x | 2.1x | 6.9x | 65 / 66 / 74 |
+| funnel, t=0.60 s | 73k | 47 | 2.88 ms | 10.82 ms | n/a | 3.8x | 5.5x | n/a | 138 / 130 / n/a |
+| wall, t=0.50 s | 74k | 61 | 2.02 ms | 4.08 ms | 25.66 ms | 2.0x | 2.6x | 12.7x | 69 / 105 / 111 |
+| droplet, t=0.05 s | 74k | 56 | 1.63 ms | 3.26 ms | 12.03 ms | 2.0x | 2.6x | 7.4x | 63 / 78 / 92 |
+| droplet, t=0.40 s | 74k | 57 | 1.67 ms | 3.40 ms | 11.95 ms | 2.0x | 2.6x | 7.2x | 63 / 78 / 92 |
+| wall, t=0.10 s | 74k | 53 | 1.39 ms | 3.63 ms | 21.04 ms | 2.6x | 3.6x | 15.1x | 63 / 106 / 103 |
+| funnel, t=0.20 s | 106k | 48 | 3.14 ms | 17.59 ms | n/a | 5.6x | 7.7x | n/a | 301 / 196 / n/a |
+| dam break, t=0.10 s | 155k | 58 | 3.60 ms | 6.72 ms | 37.32 ms | 1.9x | 2.3x | 10.4x | 101 / 125 / 176 |
+| dam break, t=0.40 s | 155k | 58 | 3.92 ms | 7.77 ms | 39.34 ms | 2.0x | 2.4x | 10.0x | 100 / 133 / 177 |
+| bowl, t=0.10 s | 170k | 64 | 4.33 ms | 7.28 ms | 36.20 ms | 1.7x | 1.9x | 8.4x | 108 / 129 / 175 |
+| bowl, t=0.50 s | 170k | 62 | 4.31 ms | 6.81 ms | 36.20 ms | 1.6x | 1.8x | 8.4x | 107 / 130 / 175 |
+| funnel, t=0.40 s | 213k | 49 | 7.46 ms | 26.38 ms | n/a | 3.5x | 4.8x | n/a | 332 / 247 / n/a |
+| sink, t=0.10 s | 214k | 63 | 5.51 ms | 11.09 ms | 41.18 ms | 2.0x | 2.5x | 7.5x | 117 / 151 / 212 |
+| sink, t=0.40 s | 214k | 56 | 5.68 ms | 9.88 ms | 42.07 ms | 1.7x | 2.0x | 7.4x | 112 / 144 / 210 |
+| droplet, t=0.05 s | 578k | 57 | 14.94 ms | 22.59 ms | 98.07 ms | 1.5x | 1.6x | 6.6x | 205 / 302 / 541 |
+| droplet, t=0.25 s | 578k | 58 | 15.03 ms | 23.02 ms | 100.01 ms | 1.5x | 1.7x | 6.7x | 204 / 308 / 540 |
+| wall, t=0.10 s | 578k | 54 | 13.31 ms | 28.50 ms | 143.45 ms | 2.1x | 2.5x | 10.8x | 278 / 417 / 668 |
+| dam break, t=0.10 s | 701k | 50 | 18.39 ms | 36.35 ms | 176.83 ms | 2.0x | 2.3x | 9.6x | 287 / 485 / 734 |
+| bowl, t=0.10 s | 1.3M | 38 | 28.18 ms | 63.14 ms | 277.52 ms | 2.2x | 2.7x | 9.8x | 398 / 796 / 1163 |
+| wall, t=0.10 s | 1.7M | 56 | 41.30 ms | 82.97 ms | 391.48 ms | 2.0x | 2.3x | 9.5x | 713 / 1086 / 1857 |
+| dam break, t=0.10 s | 2.4M | 43 | 64.05 ms | 128.52 ms | 564.10 ms | 2.0x | 2.4x | 8.8x | 855 / 1550 / 2366 |
+| bowl, t=0.10 s | 3.8M | 40 | 83.83 ms | 187.08 ms | 844.44 ms | 2.2x | 2.7x | 10.1x | 1077 / 2387 / 3256 |
 <!-- bench:replay:end -->
 
 ### Synthetic scenes
@@ -123,37 +123,37 @@ Searches captured from SPH simulations, in the order the simulation produced.
 <!-- bench:headline-timing:start -->
 | Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| uniform | 32 | 7.15 ms | 16.28 ms | 35.78 ms | 2.3x | 2.9x | 5.0x |
-| uniform, 1M | 33 | 42.30 ms | 91.74 ms | 200.29 ms | 2.2x | 2.6x | 4.7x |
-| uniform, moving | 32 | 7.05 ms | 17.91 ms | 35.10 ms | 2.5x | 3.2x | 5.0x |
-| jittered lattice | 29 | 6.32 ms | 13.21 ms | 34.29 ms | 2.1x | 2.5x | 5.4x |
-| SPH-like slab | 58 | 9.32 ms | 18.58 ms | 56.41 ms | 2.0x | 2.3x | 6.0x |
-| slab, moving | 58 | 9.28 ms | 19.49 ms | 55.50 ms | 2.1x | 2.5x | 6.0x |
-| huge sparse domain | 0 | 3.79 ms | 4.56 ms | 163.12 ms | 1.2x | 1.2x | 43.0x |
-| thin slab | 243 | 26.91 ms | 33.67 ms | 386.21 ms | 1.3x | 1.2x | 14.4x |
-| surface | 270 | 26.48 ms | 36.35 ms | 116.73 ms | 1.4x | 1.3x | 4.4x |
-| two-scale clusters | 575 | 47.61 ms | 54.64 ms | 545.34 ms | 1.1x | 1.2x | 11.5x |
-| clustered | 632 | 53.21 ms | 63.82 ms | 933.87 ms | 1.2x | 1.2x | 17.5x |
-| thin pipe | 3403 | 231.34 ms | 290.51 ms | 1251.10 ms | 1.3x | 1.6x | 5.4x |
-| pathological (10k, one cell) | 9999 | 32.80 ms | 107.51 ms | 394.24 ms | 3.3x | 6.3x | 12.0x |
+| uniform | 32 | 5.38 ms | 16.37 ms | 35.51 ms | 3.0x | 4.0x | 6.6x |
+| uniform, 1M | 33 | 28.51 ms | 91.96 ms | 199.59 ms | 3.2x | 4.1x | 7.0x |
+| uniform, moving | 32 | 5.42 ms | 17.48 ms | 34.49 ms | 3.2x | 4.3x | 6.4x |
+| jittered lattice | 29 | 4.98 ms | 13.17 ms | 33.99 ms | 2.6x | 3.4x | 6.8x |
+| SPH-like slab | 58 | 7.18 ms | 19.05 ms | 56.09 ms | 2.7x | 3.4x | 7.8x |
+| slab, moving | 58 | 7.20 ms | 20.09 ms | 54.84 ms | 2.8x | 3.6x | 7.6x |
+| huge sparse domain | 0 | 2.15 ms | 4.63 ms | 161.82 ms | 2.2x | 2.2x | 75.3x |
+| thin slab | 243 | 23.97 ms | 32.98 ms | 385.70 ms | 1.4x | 1.4x | 16.1x |
+| surface | 270 | 24.73 ms | 36.30 ms | 112.98 ms | 1.5x | 1.4x | 4.6x |
+| two-scale clusters | 575 | 43.76 ms | 53.26 ms | 542.86 ms | 1.2x | 1.3x | 12.4x |
+| clustered | 632 | 47.13 ms | 65.51 ms | 928.76 ms | 1.4x | 1.5x | 19.7x |
+| thin pipe | 3403 | 231.40 ms | 291.45 ms | 1242.74 ms | 1.3x | 1.6x | 5.4x |
+| pathological (10k, one cell) | 9999 | 32.33 ms | 71.82 ms | 389.50 ms | 2.2x | 4.1x | 12.0x |
 <!-- bench:headline-timing:end -->
 
 <!-- bench:headline-memory:start -->
 | Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
 |---|---:|---:|---:|---:|
-| uniform | 81 | 150 | 150 | 175 |
-| uniform, 1M | 649 | 794 | 488 | 842 |
-| uniform, moving | 81 | 150 | 150 | 175 |
-| jittered lattice | 63 | 150 | 150 | 175 |
-| SPH-like slab | 106 | 167 | 152 | 235 |
-| slab, moving | 106 | 167 | 172 | 232 |
+| uniform | 89 | 151 | 151 | 175 |
+| uniform, 1M | 313 | 339 | 482 | 842 |
+| uniform, moving | 89 | 151 | 151 | 175 |
+| jittered lattice | 69 | 150 | 151 | 175 |
+| SPH-like slab | 116 | 151 | 153 | 235 |
+| slab, moving | 116 | 151 | 172 | 233 |
 | huge sparse domain | 5 | 150 | 150 | 353 |
-| thin slab | 356 | 392 | 298 | 455 |
-| surface | 344 | 406 | 344 | 519 |
-| two-scale clusters | 666 | 669 | 601 | 803 |
-| clustered | 715 | 711 | 615 | 872 |
-| thin pipe | 3695 | 3762 | 3710 | 5437 |
-| pathological (10k, one cell) | 491 | 550 | 1482 | 596 |
+| thin slab | 356 | 392 | 288 | 455 |
+| surface | 344 | 406 | 346 | 523 |
+| two-scale clusters | 666 | 669 | 583 | 804 |
+| clustered | 715 | 711 | 605 | 872 |
+| thin pipe | 4143 | 3762 | 3655 | 5434 |
+| pathological (10k, one cell) | 502 | 551 | 1482 | 596 |
 <!-- bench:headline-memory:end -->
 
 ### Stress scenes
@@ -161,29 +161,29 @@ Searches captured from SPH simulations, in the order the simulation produced.
 <!-- bench:stress-timing:start -->
 | Scene | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| clustered 500k | 646 | 135.11 ms | 169.14 ms | 2349.42 ms | 1.3x | 1.3x | 17.4x |
-| clustered 1M | 652 | 270.51 ms | 347.25 ms | 4777.70 ms | 1.3x | 1.4x | 17.7x |
-| two-scale 1M | 810 | 290.31 ms | 347.02 ms | 3671.30 ms | 1.2x | 1.3x | 12.6x |
-| uniform 2M | 33 | 77.32 ms | 111.46 ms | 418.03 ms | 1.4x | 1.5x | 5.4x |
-| 8 sets x 2.5k | 4 | 1.61 ms | 2.70 ms | 3.29 ms | 1.7x | 2.5x | 2.0x |
-| 8 sets x 12.5k | 4 | 8.92 ms | 10.28 ms | 21.84 ms | 1.2x | 1.3x | 2.4x |
-| 16 sets x 1.25k | 2 | 4.67 ms | 5.31 ms | 6.03 ms | 1.1x | 1.5x | 1.3x |
-| droplets 200k | 26 | 5.56 ms | 6.12 ms | 18.67 ms | 1.1x | 1.1x | 3.4x |
-| droplets 200k, jitter | 25 | 5.74 ms | 5.72 ms | 24.46 ms | 1.0x | 1.0x | 4.3x |
+| clustered 500k | 646 | 120.59 ms | 168.94 ms | 2333.93 ms | 1.4x | 1.6x | 19.4x |
+| clustered 1M | 652 | 240.99 ms | 346.85 ms | 4755.97 ms | 1.4x | 1.6x | 19.7x |
+| two-scale 1M | 810 | 275.52 ms | 351.58 ms | 3651.34 ms | 1.3x | 1.4x | 13.3x |
+| uniform 2M | 33 | 54.31 ms | 110.86 ms | 414.70 ms | 2.0x | 2.3x | 7.6x |
+| 8 sets x 2.5k | 4 | 1.30 ms | 2.67 ms | 3.28 ms | 2.1x | 2.3x | 2.5x |
+| 8 sets x 12.5k | 4 | 4.68 ms | 10.30 ms | 21.87 ms | 2.2x | 2.4x | 4.7x |
+| 16 sets x 1.25k | 2 | 2.71 ms | 5.23 ms | 5.94 ms | 1.9x | 2.6x | 2.2x |
+| droplets 200k | 26 | 4.43 ms | 6.09 ms | 18.65 ms | 1.4x | 1.5x | 4.2x |
+| droplets 200k, jitter | 25 | 4.66 ms | 6.11 ms | 24.19 ms | 1.3x | 1.4x | 5.2x |
 <!-- bench:stress-timing:end -->
 
 <!-- bench:stress-memory:start -->
 | Scene | Rows MB (ours) | Peak RSS ours | Tree | Compact |
 |---|---:|---:|---:|---:|
-| clustered 500k | 1837 | 1754 | 1527 | 2183 |
-| clustered 1M | 3702 | 3492 | 2913 | 4384 |
-| two-scale 1M | 4708 | 4430 | 3701 | 5066 |
-| uniform 2M | 870 | 1254 | 685 | 1626 |
-| 8 sets x 2.5k | 29 | 150 | 150 | 150 |
-| 8 sets x 12.5k | 83 | 210 | 150 | 202 |
-| 16 sets x 1.25k | 59 | 150 | 150 | 150 |
-| droplets 200k | 56 | 150 | 150 | 150 |
-| droplets 200k, jitter | 56 | 150 | 150 | 150 |
+| clustered 500k | 1839 | 1753 | 1528 | 2184 |
+| clustered 1M | 3706 | 3497 | 2932 | 4383 |
+| two-scale 1M | 4742 | 4431 | 3833 | 5067 |
+| uniform 2M | 946 | 605 | 680 | 1626 |
+| 8 sets x 2.5k | 8 | 151 | 150 | 150 |
+| 8 sets x 12.5k | 44 | 151 | 151 | 202 |
+| 16 sets x 1.25k | 9 | 150 | 150 | 151 |
+| droplets 200k | 54 | 150 | 151 | 151 |
+| droplets 200k, jitter | 67 | 150 | 151 | 150 |
 <!-- bench:stress-memory:end -->
 
 ### Scaling
@@ -191,18 +191,18 @@ Searches captured from SPH simulations, in the order the simulation produced.
 <!-- bench:scale:start -->
 | Distribution | Points | Avg degree | ispc_apfrnn | TreeNSearch | CompactNSearch | vs Tree | vs Tree (search) | vs Compact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| uniform | 175k | 32 | 6.10 ms | 14.56 ms | 30.64 ms | 2.4x | 3.0x | 5.0x |
-| uniform | 500k | 33 | 18.82 ms | 39.25 ms | 95.27 ms | 2.1x | 2.6x | 5.1x |
-| uniform | 1M | 33 | 42.15 ms | 91.48 ms | 199.89 ms | 2.2x | 2.6x | 4.7x |
-| uniform | 2M | 33 | 77.30 ms | 111.53 ms | 419.31 ms | 1.4x | 1.5x | 5.4x |
-| uniform | 4M | 33 | 162.19 ms | 391.12 ms | 879.97 ms | 2.4x | 3.0x | 5.4x |
-| uniform | 8M | 33 | 335.09 ms | 780.88 ms | 1783.11 ms | 2.3x | 2.6x | 5.3x |
-| sparse | 175k | 0 | 3.28 ms | 3.88 ms | 136.52 ms | 1.2x | 1.2x | 41.6x |
-| sparse | 500k | 0 | 9.99 ms | 12.26 ms | 283.18 ms | 1.2x | 1.3x | 28.3x |
-| sparse | 1M | 0 | 10.82 ms | 16.00 ms | 545.38 ms | 1.5x | 1.6x | 50.4x |
-| sparse | 2M | 0 | 22.85 ms | 37.97 ms | 1136.94 ms | 1.7x | 1.8x | 49.7x |
-| sparse | 4M | 0 | 38.58 ms | 105.66 ms | 2469.53 ms | 2.7x | 3.2x | 64.0x |
-| sparse | 8M | 0 | 80.48 ms | 141.50 ms | 4928.53 ms | 1.8x | 2.0x | 61.2x |
+| uniform | 175k | 32 | 4.69 ms | 14.51 ms | 30.02 ms | 3.1x | 4.1x | 6.4x |
+| uniform | 500k | 33 | 13.39 ms | 40.34 ms | 94.28 ms | 3.0x | 4.0x | 7.0x |
+| uniform | 1M | 33 | 28.44 ms | 91.35 ms | 198.76 ms | 3.2x | 4.1x | 7.0x |
+| uniform | 2M | 33 | 54.28 ms | 111.76 ms | 416.01 ms | 2.1x | 2.3x | 7.7x |
+| uniform | 4M | 33 | 114.25 ms | 387.04 ms | 875.32 ms | 3.4x | 4.4x | 7.7x |
+| uniform | 8M | 33 | 287.83 ms | 774.72 ms | 1780.22 ms | 2.7x | 3.1x | 6.2x |
+| sparse | 175k | 0 | 1.92 ms | 3.99 ms | 136.03 ms | 2.1x | 2.1x | 70.9x |
+| sparse | 500k | 0 | 6.01 ms | 12.20 ms | 284.14 ms | 2.0x | 2.1x | 47.3x |
+| sparse | 1M | 0 | 10.43 ms | 15.75 ms | 541.66 ms | 1.5x | 1.6x | 51.9x |
+| sparse | 2M | 0 | 21.24 ms | 38.79 ms | 1126.46 ms | 1.8x | 2.0x | 53.0x |
+| sparse | 4M | 0 | 36.15 ms | 102.54 ms | 2474.52 ms | 2.8x | 3.2x | 68.5x |
+| sparse | 8M | 0 | 77.30 ms | 145.30 ms | 4914.39 ms | 1.9x | 2.1x | 63.6x |
 <!-- bench:scale:end -->
 
 ### Growing sets
@@ -210,7 +210,7 @@ Searches captured from SPH simulations, in the order the simulation produced.
 <!-- bench:growing:start -->
 | Scene | ispc_apfrnn | TreeNSearch | vs Tree | vs Tree (search) |
 |---|---:|---:|---:|---:|
-| uniform 200k -> 400k | 23.19 ms | 37.09 ms | 1.6x | 1.8x |
-| slab 200k -> 400k | 42.83 ms | 43.18 ms | 1.0x | 1.0x |
-| clustered 200k -> 400k | 79.80 ms | 86.73 ms | 1.1x | 1.0x |
+| uniform 200k -> 400k | 19.06 ms | 37.05 ms | 1.9x | 2.2x |
+| slab 200k -> 400k | 40.28 ms | 43.45 ms | 1.1x | 1.0x |
+| clustered 200k -> 400k | 72.20 ms | 87.11 ms | 1.2x | 1.2x |
 <!-- bench:growing:end -->
