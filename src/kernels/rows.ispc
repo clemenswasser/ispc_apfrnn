@@ -869,6 +869,39 @@ export void write_fixed_rows_dense(
   }
 }
 
+// The row of one query against candidate runs, compacted straight to `out`
+// (at least capacity + programCount slots). Counts every neighbor but stores
+// at most `capacity`. Returns the count.
+static inline uniform int direct_row(uniform int query,
+                                     const uniform int *uniform run_start,
+                                     const uniform int *uniform run_end,
+                                     uniform int num_runs,
+                                     const uniform Points &qpts,
+                                     const uniform Points &tpts,
+                                     uniform bool same_set, uniform float r2,
+                                     const uniform int *uniform perm,
+                                     uniform int *uniform out,
+                                     uniform int capacity,
+                                     uniform bool checked) {
+  const uniform float<3> q = point_at(qpts, query);
+  const uniform int self = self_index(qpts, query, same_set);
+  uniform int count = 0;
+  for (uniform int run = 0; run < num_runs; ++run) {
+    foreach (j = run_start[run]... run_end[run]) {
+      const int value = tpts.index[j];
+      const bool near = within_radius(point_at(tpts, j), q, r2);
+      const bool hit = same_set ? and(near, value != self) : near;
+      const uniform int mask = packmask(hit);
+      if (!checked || count <= capacity) {
+        out[programIndex] = shuffle(value, perm[mask * 8 + programIndex]);
+        out += popcnt(mask);
+      }
+      count += popcnt(mask);
+    }
+  }
+  return count;
+}
+
 // Packed output of write_packed_rows_dense: rows are appended back to back
 // in chunks of the shared output, which threads claim from *next_chunk.
 struct PackedOut {
@@ -880,11 +913,13 @@ struct PackedOut {
   uniform int stride;
 };
 
-// Writes each cell's rows into rows.neighbors, a per-thread table holding one
-// cell at full stride that stays in L1, then copies the filled entries to the
-// calling thread's output chunk ([cursor[0], cursor[1])) and points
-// row_offset at them. Returns false when the output is full (the caller's
-// total was too small).
+// Appends packed rows to the calling thread's output chunk ([cursor[0],
+// cursor[1])) and points row_offset at them. With group 1 each query's row
+// is compacted straight into the chunk (direct_row); the cell's candidates
+// are still gathered once. Larger groups write each cell's rows into
+// rows.neighbors, a per-thread table holding one cell at full stride that
+// stays in L1, and copy the filled entries out. Returns false when the
+// output is full (the caller's total was too small).
 export uniform bool write_packed_rows_dense(
     uniform int start_cell, uniform int end_cell, uniform int group,
     const uniform Cells *uniform queries_in,
@@ -912,6 +947,62 @@ export uniform bool write_packed_rows_dense(
   uniform int64 next = cursor[0];
   uniform int64 end = cursor[1];
   uniform bool ok = true;
+  if (group == 1) {
+    const uniform Points gathered = {gx, gy, gz, gi};
+    for (uniform int cell = start_cell; cell < end_cell && ok; ++cell) {
+      const uniform int q_start = queries.starts[cell];
+      const uniform int q_end = queries.ends[cell];
+      uniform int num_runs =
+          dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
+      uniform Points src = tpts;
+      const uniform bool copied =
+          gather_runs(tpts, num_targets, qpts, q_start, q_end, r2, rows.perm,
+                      run_start, run_end, num_runs, gx, gy, gz, gi);
+      // Gathered candidates are few enough to reserve room for all of them,
+      // so their rows need no capacity test while written.
+      uniform int room = rows.capacity;
+      if (copied) {
+        src = gathered;
+        num_runs = 1;
+        room = max(room, run_end[0]);
+      }
+      for (uniform int q = q_start; q < q_end; ++q) {
+        if (next + room + programCount > end) {
+          next = atomic_add_global(pack.next_chunk, pack.chunk);
+          end = next + pack.chunk;
+          if (end > pack.required) {
+            next = end = 0;
+            ok = false;
+            break;
+          }
+        }
+        uniform int count;
+        if (same_set && copied) {
+          count = direct_row(q, run_start, run_end, num_runs, qpts, src, true,
+                             r2, rows.perm, pack.out + next, rows.capacity,
+                             false);
+        } else if (same_set) {
+          count = direct_row(q, run_start, run_end, num_runs, qpts, src, true,
+                             r2, rows.perm, pack.out + next, rows.capacity,
+                             true);
+        } else if (copied) {
+          count = direct_row(q, run_start, run_end, num_runs, qpts, src, false,
+                             r2, rows.perm, pack.out + next, rows.capacity,
+                             false);
+        } else {
+          count = direct_row(q, run_start, run_end, num_runs, qpts, src, false,
+                             r2, rows.perm, pack.out + next, rows.capacity,
+                             true);
+        }
+        rows.counts[q] = count;
+        pack.row_offset[q] = count == 0 ? 0 : (uniform int)next;
+        next += min(count, rows.capacity);
+      }
+    }
+    cursor[0] = next;
+    cursor[1] = end;
+    return ok;
+  }
   for (uniform int cell = start_cell; cell < end_cell && ok; ++cell) {
     const uniform int q_start = queries.starts[cell];
     const uniform int q_end = queries.ends[cell];

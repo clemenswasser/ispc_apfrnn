@@ -5204,12 +5204,14 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
                                   nullptr,  counts.data(),
                                   neighbors.data(), row_offset.data(),
                                   nullptr,  nullptr};
+    // Rows written in place at full stride need the group writers; a cell's
+    // ~7 points fill one eight-query group.
+    const int in_place_group = group == 1 ? 8 : group;
     parallel_cells(0, source.num_cells, cell_grain(source.num_cells),
                    [&](int begin, int end) {
-      ispc::write_fixed_rows_dense(begin, end, group, &queries, &grid,
-                                   &targets, &qpts, &tpts, target.num_points,
-                                   same_set, r2,
-                                   &rows);
+      ispc::write_fixed_rows_dense(begin, end, in_place_group, &queries,
+                                   &grid, &targets, &qpts, &tpts,
+                                   target.num_points, same_set, r2, &rows);
     });
     return true;
   }
@@ -5285,9 +5287,13 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
       ensure_hash_table(data);
     }
   }
-  // Dense cells hold ~7 points, so an eight-query group covers a whole cell
-  // per candidate pass instead of splitting it into two quads.
-  return write_packed_dense_rows(data, data, 8, true, data.radius, capacity,
+  // Sparse sets (no dense lookup) write one query at a time (group 1): their
+  // few points per cell leave most of an eight-query group idle, and a single
+  // query's row is compacted straight into the packed output instead of
+  // through the per-cell table. Dense cells hold ~7 points, so an eight-query
+  // group covers a whole cell per candidate pass.
+  const int group = data.dense_valid ? 8 : 1;
+  return write_packed_dense_rows(data, data, group, true, data.radius, capacity,
                                  known_total, neighbors, counts, row_offset);
 }
 
