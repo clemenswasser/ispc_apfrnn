@@ -1310,7 +1310,10 @@ bool NSearch::cell_range_cross_candidate(const PointSet &source,
       target.bounds.min_z < 0.0f) {
     return false;
   }
-  if (target.use_sweep || !target.valid ||
+  // A target with a dense lookup (one point in most cells of its box, such
+  // as a lattice) is cheaper for the dense writers; the cell-range walk is
+  // for sparse unique-cell targets.
+  if (target.use_sweep || !target.valid || target.data.dense_valid ||
       target.data.cell_stencil != 1 || target.data.max_cell_points > 1 ||
       target.data.num_cells <= 0 ||
       target.data.scratch_unique_keys.size() !=
