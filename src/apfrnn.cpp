@@ -116,6 +116,11 @@ inline bool prepare_fixed_rows(IntBuffer &values, IntBuffer &counts,
       required > values.capacity() || 4 * required < 3 * values.capacity();
   if (fresh) {
     IntBuffer().swap(values);
+    // A fitted capacity creeps up as a moving set's maximum degree grows, and
+    // each regrowth to a new buffer faults in and zeroes every page again.
+    // Headroom absorbs small regrowths; pages that are never written are
+    // never faulted in.
+    values.reserve(required + required / 8);
   }
   values.resize(required);
   hint_huge_pages(values.data(),
