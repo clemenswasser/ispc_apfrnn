@@ -719,6 +719,23 @@ static inline void dense_cell_rows(
       dense_runs(grid, targets, queries.keys[cell], run_start, run_end);
   const uniform int q_start = queries.starts[cell];
   const uniform int q_end = queries.ends[cell];
+  // A cross-pair cell with no target points around it (most query cells of
+  // a fluid against its boundary) has only empty rows: they are written
+  // directly, skipping the query bounds and row setup. A same-set cell always
+  // finds its own points.
+  uniform int candidates = 1;
+  if (!same_set) {
+    candidates = 0;
+    for (uniform int run = 0; run < num_runs; ++run) {
+      candidates += run_end[run] - run_start[run];
+    }
+  }
+  if (candidates == 0) {
+    foreach (q = q_start... q_end) {
+      rows.counts[q] = 0;
+    }
+    return;
+  }
   const uniform bool copied =
       gather_runs(tpts, num_targets, qpts, q_start, q_end, r2, rows.perm,
                   run_start, run_end, num_runs, gx, gy, gz, gi);
