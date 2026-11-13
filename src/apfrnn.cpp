@@ -1768,7 +1768,13 @@ void write_csr_rows_pair_parallel(int num_items, int grain, int capacity,
 
 // Blocked writers run over source blocks; small block counts use a finer
 // grain so all threads get work.
-int block_grain(int block_count) { return block_count < 256 ? 8 : 64; }
+// Blocks of a clustered set differ in cost by orders of magnitude, and each
+// is far more work than a task, so every thread gets about 16 chunks to
+// balance by stealing.
+int block_grain(int block_count) {
+  const int threads = std::max(1, tbb::this_task_arena::max_concurrency());
+  return std::clamp(block_count / (16 * threads), 1, 64);
+}
 
 
 inline void
