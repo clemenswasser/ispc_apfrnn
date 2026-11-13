@@ -269,6 +269,22 @@ struct NSearch::Pair {
   int cross_block_target_points = 0;
   IntBuffer cross_row_offset;
   IntBuffer cross_row_capacity;
+  // Rows split from a union search (see run_merged): CSR by the query's
+  // caller index, neighbor ids in the target set's caller order.
+  bool merged_rows = false;
+  IntBuffer merged_offsets;
+  IntBuffer merged_data;
+};
+
+// State of the union search of an all-pairs scene (see run_merged).
+struct NSearch::Merged {
+  std::unique_ptr<NSearch> search;
+  std::vector<float> xyz;
+  // First union index of each set (size sets + 1) and the set of each union
+  // point.
+  std::vector<int> offset;
+  std::vector<uint16_t> set_of;
+  bool active = false;
 };
 
 // GPU backend state of one NSearch (device buffers, result slots, cached
@@ -466,6 +482,38 @@ void NSearch::set_all_searches(bool active) {
 void NSearch::prepare_zsort() {
   row_views_valid_ = false;
   zsort_order_.assign(sets_.size(), {});
+  if (merged_ && merged_->active) {
+    // The sets have no grids of their own: each set takes the order its
+    // points have in the union grid.
+    const PointSet &all = merged_->search->sets_[0];
+    const IntBuffer &order = all.data.original_index;
+    const std::size_t total = merged_->set_of.size();
+    if (!all.valid || all.use_sweep || order.size() != total) {
+      return;
+    }
+    for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
+      PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+      const int first = merged_->offset[static_cast<std::size_t>(set)];
+      std::vector<int> local;
+      local.reserve(static_cast<std::size_t>(point_set.source_count));
+      bool in_order = true;
+      for (int point : order) {
+        if (merged_->set_of[static_cast<std::size_t>(point)] == set) {
+          in_order = in_order &&
+                     point - first == static_cast<int>(local.size());
+          local.push_back(point - first);
+        }
+      }
+      if (in_order) {
+        continue;
+      }
+      zsort_order_[static_cast<std::size_t>(set)] = std::move(local);
+      point_set.dirty = true;
+      point_set.valid = false;
+      invalidate_pairs_for_set(set);
+    }
+    return;
+  }
   for (int set = 0; set < static_cast<int>(sets_.size()); ++set) {
     PointSet &point_set = sets_[static_cast<std::size_t>(set)];
     const IntBuffer &order = point_set.data.original_index;
@@ -609,6 +657,26 @@ void NSearch::run_frame() {
     effective_backend_ = (gpu_available() && gpu_policy_ok())
                              ? SearchBackend::GpuExact
                              : SearchBackend::CpuExact;
+  }
+
+  if (merged_eligible()) {
+    run_merged();
+    return;
+  }
+  if (merged_ && merged_->active) {
+    // Leaving the union search: the per-set grids were not kept up to date
+    // and the pairs hold union rows.
+    merged_->active = false;
+    for (std::vector<Pair> &row : pairs_) {
+      for (Pair &pair : row) {
+        if (pair.merged_rows) {
+          pair.merged_rows = false;
+          pair.valid = false;
+          IntBuffer().swap(pair.merged_offsets);
+          IntBuffer().swap(pair.merged_data);
+        }
+      }
+    }
   }
 
   const auto build_start = std::chrono::steady_clock::now();
@@ -1494,6 +1562,206 @@ void NSearch::build_cross_pair(Pair &pair, int set_i, int set_j) {
   write_cross_neighbors_parallel(pair.cross, target.data);
 }
 
+// Every pair of three or more sets searched against each other: the union of
+// the sets as one point set has the same pairs, so one grid and one candidate
+// pass per point replace a grid per set and a pass per pair. The per-pair
+// searches of such scenes are small and sparse (each set alone holds a
+// fraction of the points near any query), which is what makes them slow.
+bool NSearch::merged_eligible() const {
+  const int set_count = static_cast<int>(sets_.size());
+  if (effective_backend_ != SearchBackend::CpuExact || set_count < 3 ||
+      set_count > 64) {
+    return false;
+  }
+  int64_t total = 0;
+  for (int set_i = 0; set_i < set_count; ++set_i) {
+    const PointSet &point_set = sets_[static_cast<std::size_t>(set_i)];
+    // Larger moving sets skip the SoA copy the union is built from.
+    if (point_set.source_count >= 1000000) {
+      return false;
+    }
+    total += point_set.source_count;
+    for (const Pair &pair : pairs_[static_cast<std::size_t>(set_i)]) {
+      if (!pair.active) {
+        return false;
+      }
+    }
+  }
+  // The union keeps a second copy of the rows (union rows plus split rows).
+  constexpr int64_t kMergedMaxPoints = 4000000;
+  return total > 0 && total <= kMergedMaxPoints;
+}
+
+void NSearch::run_merged() {
+  const int set_count = static_cast<int>(sets_.size());
+  // Moving sets rewrite their rows on every run; only a scene of unchanged
+  // static sets keeps the last union rows.
+  bool any_invalid = false;
+  for (const PointSet &point_set : sets_) {
+    any_invalid = any_invalid || !point_set.is_static || point_set.dirty;
+  }
+  for (const std::vector<Pair> &row : pairs_) {
+    for (const Pair &pair : row) {
+      any_invalid = any_invalid || !pair.valid || !pair.merged_rows;
+    }
+  }
+  if (!merged_) {
+    merged_ = std::make_unique<Merged>();
+  }
+  Merged &merged = *merged_;
+  if (!any_invalid && merged.active) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  // Static sets are synced here; moving sets were synced by
+  // sync_dynamic_sets. The per-set grids are not built, so they are stale
+  // once this search leaves the union.
+  merged.offset.assign(static_cast<std::size_t>(set_count) + 1, 0);
+  for (int set = 0; set < set_count; ++set) {
+    PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+    if (point_set.is_static && (point_set.dirty || !point_set.valid)) {
+      sync_source(set);
+    }
+    point_set.valid = false;
+    merged.offset[static_cast<std::size_t>(set) + 1] =
+        merged.offset[static_cast<std::size_t>(set)] +
+        static_cast<int>(point_set.x.size());
+  }
+  const int total = merged.offset.back();
+  const bool resized = merged.set_of.size() != static_cast<std::size_t>(total);
+  merged.xyz.resize(static_cast<std::size_t>(total) * 3);
+  merged.set_of.resize(static_cast<std::size_t>(total));
+  tbb::parallel_for(0, set_count, [&](int set) {
+    const PointSet &point_set = sets_[static_cast<std::size_t>(set)];
+    const int first = merged.offset[static_cast<std::size_t>(set)];
+    const int n = static_cast<int>(point_set.x.size());
+    float *out = merged.xyz.data() + static_cast<std::size_t>(first) * 3;
+    for (int i = 0; i < n; ++i) {
+      out[3 * i] = point_set.x[static_cast<std::size_t>(i)];
+      out[3 * i + 1] = point_set.y[static_cast<std::size_t>(i)];
+      out[3 * i + 2] = point_set.z[static_cast<std::size_t>(i)];
+      merged.set_of[static_cast<std::size_t>(first + i)] =
+          static_cast<uint16_t>(set);
+    }
+  });
+  if (!merged.search) {
+    merged.search = std::make_unique<NSearch>(radius_);
+    merged.search->add_point_set(merged.xyz.data(), total);
+    merged.search->set_all_searches(true);
+  } else {
+    if (merged.search->radius_ != radius_) {
+      merged.search->set_radius(radius_);
+    }
+    if (resized || merged.search->sets_[0].source != merged.xyz.data()) {
+      merged.search->resize_point_set(0, merged.xyz.data(), total);
+    }
+    merged.search->update_point_sets();
+  }
+  merged.search->set_memory_budget(memory_budget_);
+  merged.search->run();
+  merged.active = true;
+  const RunStats inner = merged.search->last_stats();
+
+  // Split each union row by the target set: count, prefix, fill. Rows are
+  // CSR by the query's caller index in every pair.
+  const auto split_start = std::chrono::steady_clock::now();
+  const PairNeighbors all = merged.search->neighbors(0, 0);
+  for (int set_i = 0; set_i < set_count; ++set_i) {
+    const std::size_t rows =
+        static_cast<std::size_t>(sets_[static_cast<std::size_t>(set_i)].x.size());
+    for (Pair &pair : pairs_[static_cast<std::size_t>(set_i)]) {
+      pair.merged_offsets.resize(rows + 1);
+      pair.merged_offsets[0] = 0;
+    }
+  }
+  constexpr int kGrain = 2048;
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, total, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        int count[64];
+        for (int u = range.begin(); u < range.end(); ++u) {
+          const int set_i = merged.set_of[static_cast<std::size_t>(u)];
+          const int point = u - merged.offset[static_cast<std::size_t>(set_i)];
+          std::fill(count, count + set_count, 0);
+          for (uint32_t neighbor : all[u]) {
+            ++count[merged.set_of[neighbor]];
+          }
+          std::vector<Pair> &row = pairs_[static_cast<std::size_t>(set_i)];
+          for (int set_j = 0; set_j < set_count; ++set_j) {
+            row[static_cast<std::size_t>(set_j)]
+                .merged_offsets[static_cast<std::size_t>(point) + 1] =
+                count[set_j];
+          }
+        }
+      });
+  tbb::parallel_for(0, set_count * set_count, [&](int index) {
+    Pair &pair = pairs_[static_cast<std::size_t>(index / set_count)]
+                       [static_cast<std::size_t>(index % set_count)];
+    IntBuffer &offsets = pair.merged_offsets;
+    for (std::size_t i = 1; i < offsets.size(); ++i) {
+      offsets[i] += offsets[i - 1];
+    }
+    pair.merged_data.resize(static_cast<std::size_t>(offsets.back()));
+  });
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, total, kGrain),
+      [&](const tbb::blocked_range<int> &range) {
+        int cursor[64];
+        for (int u = range.begin(); u < range.end(); ++u) {
+          const int set_i = merged.set_of[static_cast<std::size_t>(u)];
+          const int point = u - merged.offset[static_cast<std::size_t>(set_i)];
+          std::vector<Pair> &row = pairs_[static_cast<std::size_t>(set_i)];
+          for (int set_j = 0; set_j < set_count; ++set_j) {
+            cursor[set_j] = row[static_cast<std::size_t>(set_j)]
+                                .merged_offsets[static_cast<std::size_t>(point)];
+          }
+          for (uint32_t neighbor : all[u]) {
+            const int set_j = merged.set_of[neighbor];
+            row[static_cast<std::size_t>(set_j)]
+                .merged_data[static_cast<std::size_t>(cursor[set_j]++)] =
+                static_cast<int>(neighbor) -
+                merged.offset[static_cast<std::size_t>(set_j)];
+          }
+        }
+      });
+  int max_neighbors = 0;
+  std::size_t neighbor_bytes = inner.neighbor_bytes;
+  for (int set_i = 0; set_i < set_count; ++set_i) {
+    for (int set_j = 0; set_j < set_count; ++set_j) {
+      Pair &pair = pairs_[static_cast<std::size_t>(set_i)]
+                         [static_cast<std::size_t>(set_j)];
+      pair.merged_rows = true;
+      pair.valid = true;
+      pair.same_set = set_i == set_j;
+      pair.fixed_valid = false;
+      pair.gpu_rows = false;
+      for (std::size_t i = 0; i + 1 < pair.merged_offsets.size(); ++i) {
+        max_neighbors = std::max(
+            max_neighbors, pair.merged_offsets[i + 1] - pair.merged_offsets[i]);
+      }
+      neighbor_bytes += pair.merged_offsets.capacity() * sizeof(int) +
+                        pair.merged_data.capacity() * sizeof(int);
+    }
+  }
+  const double split_ms = elapsed_ms(split_start);
+  last_stats_.grid_ms = inner.grid_ms;
+  last_stats_.same_build_ms = inner.same_build_ms;
+  last_stats_.same_set_ms = inner.same_set_ms;
+  last_stats_.cross_set_ms = split_ms;
+  last_stats_.sync_build_ms = elapsed_ms(start) - split_ms;
+  last_stats_.neighbor_bytes = neighbor_bytes;
+  last_stats_.grid_bytes =
+      inner.grid_bytes + merged.xyz.capacity() * sizeof(float) +
+      merged.set_of.capacity() * sizeof(uint16_t);
+  last_stats_.max_neighbors = max_neighbors;
+  last_stats_.grid_sets = inner.grid_sets;
+  last_stats_.sweep_sets = inner.sweep_sets;
+  last_stats_.dense_sets = inner.dense_sets;
+  last_stats_.hash_sets = inner.hash_sets;
+  path_bits_.fetch_or(inner.paths, std::memory_order_relaxed);
+  last_stats_.paths = path_bits_.load(std::memory_order_relaxed);
+}
+
 void NSearch::collect_memory_stats() {
   const int set_count = static_cast<int>(sets_.size());
   for (int set_i = 0; set_i < set_count; ++set_i) {
@@ -1582,6 +1850,13 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
   const PointSet &source = sets_[static_cast<std::size_t>(set_i)];
   if (point < 0 || point >= static_cast<int>(source.x.size())) {
     return {};
+  }
+
+  if (pair.merged_rows) {
+    const int begin = pair.merged_offsets[static_cast<std::size_t>(point)];
+    const int end = pair.merged_offsets[static_cast<std::size_t>(point) + 1];
+    return {reinterpret_cast<const uint32_t *>(pair.merged_data.data() + begin),
+            static_cast<std::size_t>(end - begin)};
   }
 
   if (pair.gpu_rows) {
@@ -1697,6 +1972,11 @@ void NSearch::build_row_views() {
       }
       view.kind = detail::RowView::Rows;
       view.points = static_cast<unsigned>(source.x.size());
+      if (pair.merged_rows) {
+        view.data = pair.merged_data.data();
+        view.offsets = pair.merged_offsets.data();
+        continue;
+      }
       if (pair.same_set && source.fixed_valid &&
           (source.sparse_rows_by_original || source.rows_by_original)) {
         view.data = source.fixed_neighbors.data();

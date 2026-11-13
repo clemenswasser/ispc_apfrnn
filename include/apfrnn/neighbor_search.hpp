@@ -284,6 +284,7 @@ private:
   struct PointSet;
   struct Pair;
   struct GpuState;
+  struct Merged;
 
   NeighborList get_neighbors_checked(int set_i, int set_j, int point) const;
   void run_frame();
@@ -318,6 +319,10 @@ private:
   bool transpose_cross_pair(Pair &forward, Pair &reverse, PointSet &source,
                             PointSet &target);
   void collect_memory_stats();
+  // An all-pairs search of several small sets runs as one search over their
+  // union, split into per-pair rows (see run_merged in neighbor_search.cpp).
+  bool merged_eligible() const;
+  void run_merged();
 
   void build_point_grid(int set);
   // Converts a sweep set to a grid; `building` is the pair being built.
@@ -354,6 +359,7 @@ private:
   std::vector<PointSet> sets_;
   std::vector<std::vector<Pair>> pairs_;
   std::unique_ptr<GpuState> gpu_;
+  std::unique_ptr<Merged> merged_;
   RunStats last_stats_;
   bool parallel_pairs_ = false;
   std::atomic<int> parallel_overflows_{0};

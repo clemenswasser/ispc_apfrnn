@@ -1870,10 +1870,15 @@ TEST_CASE("shared dense ranges are dropped when a set leaves the dense grid") {
                          static_cast<int>(clouds[0].x.size()));
   }
   search.set_all_searches(true);
+  // Not every pair: an all-pairs scene searches the union of its sets.
+  search.set_active_search(2, 1, false);
 
   auto check_all = [&] {
     for (int query = 0; query < kSets; ++query) {
       for (int target = 0; target < kSets; ++target) {
+        if (query == 2 && target == 1) {
+          continue;
+        }
         const auto &q = clouds[static_cast<std::size_t>(query)];
         const auto &t = clouds[static_cast<std::size_t>(target)];
         if (query == target) {
@@ -1916,6 +1921,89 @@ TEST_CASE("shared dense ranges are dropped when a set leaves the dense grid") {
   search.run();
   CHECK(search.last_stats().dense_sets == kSets);
   check_all();
+}
+
+TEST_CASE("an all-pairs scene of several sets stays exact through moving frames") {
+  // Every pair of four sets active: the search runs over the union of the
+  // sets and splits the rows per pair. Frames move points in place, keep one
+  // set static, resize one set, z-sort the sets, and finally turn one pair
+  // off, which leaves the union search for per-pair searches.
+  constexpr float radius = 1.0f;
+  constexpr int kSets = 4;
+  std::vector<apfrnn::support::PointCloud> clouds;
+  std::vector<std::vector<float>> xyz;
+  for (int set = 0; set < kSets; ++set) {
+    clouds.push_back(apfrnn::support::make_point_cloud(1500 + 300 * set, 14.0f,
+                                                       301 + set));
+    xyz.push_back(interleave(clouds.back()));
+  }
+  apfrnn::NSearch search(radius);
+  for (int set = 0; set < kSets; ++set) {
+    search.add_point_set(xyz[static_cast<std::size_t>(set)].data(),
+                         static_cast<int>(clouds[static_cast<std::size_t>(set)].x.size()),
+                         /*is_static=*/set == 3);
+  }
+  search.set_all_searches(true);
+  bool all_pairs = true;
+  auto check_all = [&] {
+    for (int query = 0; query < kSets; ++query) {
+      for (int target = 0; target < kSets; ++target) {
+        if (!all_pairs && query == 1 && target == 2) {
+          continue;
+        }
+        const auto &q = clouds[static_cast<std::size_t>(query)];
+        const auto &t = clouds[static_cast<std::size_t>(target)];
+        if (query == target) {
+          check_same_set(search, query, q, radius);
+        } else {
+          check_cross_set(search, query, target, q, t, radius);
+        }
+      }
+    }
+  };
+  std::mt19937 generator(5);
+  std::uniform_real_distribution<float> step(-0.3f, 0.3f);
+  for (int frame = 0; frame < 8; ++frame) {
+    CAPTURE(frame);
+    search.run();
+    check_all();
+    if (frame == 3) {
+      // Z-sort every set by the order the search reports.
+      search.prepare_zsort();
+      for (int set = 0; set < kSets; ++set) {
+        search.apply_zsort(set, xyz[static_cast<std::size_t>(set)].data(), 3);
+        auto &cloud = clouds[static_cast<std::size_t>(set)];
+        const auto &moved = xyz[static_cast<std::size_t>(set)];
+        for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+          cloud.x[i] = moved[3 * i];
+          cloud.y[i] = moved[3 * i + 1];
+          cloud.z[i] = moved[3 * i + 2];
+        }
+      }
+    }
+    if (frame == 5) {
+      clouds[1] = apfrnn::support::make_point_cloud(2100, 14.0f, 999);
+      xyz[1] = interleave(clouds[1]);
+      search.resize_point_set(1, xyz[1].data(),
+                              static_cast<int>(clouds[1].x.size()));
+    }
+    if (frame == 6) {
+      all_pairs = false;
+      search.set_active_search(1, 2, false);
+    }
+    for (int set = 0; set < 3; ++set) {
+      auto &cloud = clouds[static_cast<std::size_t>(set)];
+      for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+        cloud.x[i] += step(generator);
+        cloud.y[i] += step(generator);
+        cloud.z[i] += step(generator);
+      }
+      const std::vector<float> moved = interleave(cloud);
+      std::copy(moved.begin(), moved.end(),
+                xyz[static_cast<std::size_t>(set)].begin());
+    }
+    search.update_point_sets();
+  }
 }
 
 TEST_CASE("a sweep set converted to a grid mid-run keeps earlier pairs exact") {
