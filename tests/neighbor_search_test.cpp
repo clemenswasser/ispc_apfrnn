@@ -2283,8 +2283,9 @@ TEST_CASE("packed rows replace block rows once the caller follows the grid") {
 
 TEST_CASE("dense rows switch between in-place and packed tables") {
   // Tables within the last-level cache are written in place at full stride,
-  // larger ones are packed; a set and a cross pair alternate between the
-  // two as the limit changes, and every frame stays exact.
+  // larger ones are packed (and read with prefetching); a set and a cross
+  // pair alternate between the two as the limit changes, and every frame
+  // stays exact.
   constexpr float radius = 1.0f;
   auto fluid = apfrnn::support::make_point_cloud(12000, 11.0f, 51);
   auto boundary = apfrnn::support::make_point_cloud(5000, 11.0f, 52);
@@ -2313,6 +2314,18 @@ TEST_CASE("dense rows switch between in-place and packed tables") {
     CHECK((paths & apfrnn::NSearch::kPathSamePairDense) != 0);
     check_same_set(search, fluid_id, fluid, radius);
     check_cross_set(search, fluid_id, boundary_id, fluid, boundary, radius);
+    // Above the limit the pair views also prefetch rows ahead; reads through
+    // them must return the same rows.
+    for (const int target : {fluid_id, boundary_id}) {
+      const apfrnn::PairNeighbors pair = search.neighbors(fluid_id, target);
+      for (int point = 0; point < static_cast<int>(fluid.x.size()); ++point) {
+        const apfrnn::NeighborList row = pair[point];
+        const apfrnn::NeighborList expected =
+            search.get_neighbors(fluid_id, target, point);
+        REQUIRE(row.size() == expected.size());
+        CHECK(std::equal(row.begin(), row.end(), expected.begin()));
+      }
+    }
   }
   limit = saved;
 }

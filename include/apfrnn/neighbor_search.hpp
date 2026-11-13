@@ -26,9 +26,11 @@ namespace detail {
 // to_sorted[point] when rows are in sorted order. Without counts the rows are
 // CSR: offsets[row] to offsets[row + 1]. With counts, a row starts at
 // offsets[row] when there are offsets and at row * stride otherwise. Full
-// means the layout needs the full lookup.
+// means the layout needs the full lookup. RowsPrefetch is Rows whose reads
+// prefetch ahead (see prefetch_row); a separate kind keeps the plain read
+// free of the test.
 struct RowView {
-  enum Kind : unsigned char { Full, Empty, Rows };
+  enum Kind : unsigned char { Full, Empty, Rows, RowsPrefetch };
   Kind kind = Full;
   unsigned points = 0;
   const int *data = nullptr;
@@ -38,10 +40,46 @@ struct RowView {
   std::size_t stride = 0;
 };
 
-// Reads one row of a Rows view; points outside the query set are empty.
+// Start of a row of a Rows view, in ints from view.data.
+inline std::size_t row_start(const RowView &view, int row) {
+  if (view.offsets != nullptr) {
+    return static_cast<std::size_t>(view.offsets[row]);
+  }
+  return static_cast<std::size_t>(row) * view.stride;
+}
+
+// How many points ahead read_row() fetches a row, and how many cache lines
+// of it. Callers usually read rows in point order, but rows sit in sorted or
+// packed order, so consecutive points' rows are not adjacent and the hardware
+// prefetchers do not run ahead of them. When the rows do not fit the
+// last-level cache, fetching the row of a later point hides most of its
+// memory latency behind the current rows; four lines hold a typical SPH row.
+// Rows that fit the cache are read without it: there the prefetch is only
+// extra work per point.
+constexpr int kRowPrefetchDistance = 16;
+constexpr int kRowPrefetchLines = 4;
+
+inline void prefetch_row(const RowView &view, int point) {
+  if (static_cast<unsigned>(point) >= view.points) {
+    return;
+  }
+  const int row = view.to_sorted != nullptr ? view.to_sorted[point] : point;
+  const char *start =
+      reinterpret_cast<const char *>(view.data + row_start(view, row));
+  for (int line = 0; line < kRowPrefetchLines; ++line) {
+    __builtin_prefetch(start + 64 * line);
+  }
+}
+
+// Reads one row of a Rows or RowsPrefetch view (Prefetch selects the
+// latter); points outside the query set are empty.
+template <bool Prefetch = false>
 inline NeighborList read_row(const RowView &view, int point) {
   if (static_cast<unsigned>(point) >= view.points) {
     return {};
+  }
+  if constexpr (Prefetch) {
+    prefetch_row(view, point + kRowPrefetchDistance);
   }
   const int row = view.to_sorted != nullptr ? view.to_sorted[point] : point;
   if (view.counts == nullptr) {
@@ -49,12 +87,8 @@ inline NeighborList read_row(const RowView &view, int point) {
     return {reinterpret_cast<const uint32_t *>(view.data + begin),
             static_cast<std::size_t>(view.offsets[row + 1] - begin)};
   }
-  const int count = view.counts[row];
-  const std::size_t start =
-      view.offsets != nullptr ? static_cast<std::size_t>(view.offsets[row])
-                              : static_cast<std::size_t>(row) * view.stride;
-  return {reinterpret_cast<const uint32_t *>(view.data + start),
-          static_cast<std::size_t>(count)};
+  return {reinterpret_cast<const uint32_t *>(view.data + row_start(view, row)),
+          static_cast<std::size_t>(view.counts[row])};
 }
 
 } // namespace detail
@@ -211,6 +245,9 @@ public:
       }
       if (view.kind == detail::RowView::Rows) {
         return detail::read_row(view, point);
+      }
+      if (view.kind == detail::RowView::RowsPrefetch) {
+        return detail::read_row<true>(view, point);
       }
     }
     return get_neighbors_checked(set_i, set_j, point);
@@ -371,6 +408,9 @@ inline NeighborList PairNeighbors::operator[](int point) const {
   if (view_.kind == detail::RowView::Rows) {
     return detail::read_row(view_, point);
   }
+  if (view_.kind == detail::RowView::RowsPrefetch) {
+    return detail::read_row<true>(view_, point);
+  }
   if (view_.kind == detail::RowView::Full && search_ != nullptr) {
     return search_->get_neighbors(set_i_, set_j_, point);
   }
@@ -378,7 +418,8 @@ inline NeighborList PairNeighbors::operator[](int point) const {
 }
 
 inline int PairNeighbors::size() const {
-  if (view_.kind == detail::RowView::Rows) {
+  if (view_.kind == detail::RowView::Rows ||
+      view_.kind == detail::RowView::RowsPrefetch) {
     return static_cast<int>(view_.points);
   }
   return search_ != nullptr ? search_->get_n_points(set_i_) : 0;

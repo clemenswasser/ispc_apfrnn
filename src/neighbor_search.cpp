@@ -1951,6 +1951,18 @@ NeighborList NSearch::get_neighbors_checked(int set_i, int set_j,
 
 // Mirrors get_neighbors_checked() for every pair: the same layout tests in
 // the same order, so the inline reader returns the same rows.
+namespace {
+
+// Makes reads of a pair's rows prefetch ahead (see detail::prefetch_row):
+// only rows larger than the last-level cache gain from it.
+void mark_prefetch(detail::RowView &view, std::size_t ints) {
+  if (plan::pack_rows(static_cast<int64_t>(ints * sizeof(int)))) {
+    view.kind = detail::RowView::RowsPrefetch;
+  }
+}
+
+} // namespace
+
 void NSearch::build_row_views() {
   const int set_count = static_cast<int>(sets_.size());
   row_views_.assign(static_cast<std::size_t>(set_count) *
@@ -1978,6 +1990,7 @@ void NSearch::build_row_views() {
       if (pair.merged_rows) {
         view.data = pair.merged_data.data();
         view.offsets = pair.merged_offsets.data();
+        mark_prefetch(view, pair.merged_data.size());
         continue;
       }
       if (pair.same_set && source.fixed_valid &&
@@ -1990,6 +2003,7 @@ void NSearch::build_row_views() {
         } else {
           view.stride = static_cast<std::size_t>(source.fixed_capacity);
         }
+        mark_prefetch(view, source.fixed_neighbors.size());
         continue;
       }
       view.to_sorted = source.original_to_sorted.data();
@@ -2001,6 +2015,7 @@ void NSearch::build_row_views() {
         } else {
           view.stride = static_cast<std::size_t>(source.fixed_capacity);
         }
+        mark_prefetch(view, source.fixed_neighbors.size());
         continue;
       }
       if (!pair.same_set && pair.fixed_valid) {
@@ -2011,12 +2026,15 @@ void NSearch::build_row_views() {
         } else {
           view.stride = static_cast<std::size_t>(pair.fixed_capacity);
         }
+        mark_prefetch(view, pair.fixed_neighbors.size());
         continue;
       }
       view.data = pair.same_set ? source.data.col_idx.data()
                                 : pair.cross.col_idx.data();
       view.offsets = pair.same_set ? source.data.row_ptr.data()
                                    : pair.cross.row_ptr.data();
+      mark_prefetch(view, pair.same_set ? source.data.col_idx.size()
+                                                  : pair.cross.col_idx.size());
     }
   }
   row_views_valid_ = true;
