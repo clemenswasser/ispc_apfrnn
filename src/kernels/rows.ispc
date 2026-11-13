@@ -414,6 +414,59 @@ static inline uniform int hash_runs(const uniform HashGrid &hash,
   return num_runs;
 }
 
+// First cell in [begin, end) of a column whose z is at least `z`.
+static inline uniform int column_lower_bound(const uniform uint64 *uniform keys,
+                                             uniform int begin, uniform int end,
+                                             uniform int z) {
+  uniform int count = end - begin;
+  while (count > 0) {
+    const uniform int half = count >> 1;
+    if (unpack_coord_uniform(keys[begin + half], 0) < z) {
+      begin += half + 1;
+      count -= half + 1;
+    } else {
+      count = half;
+    }
+  }
+  return begin;
+}
+
+// As dense_runs for a sparse set with a column lookup: each of the 9
+// neighbor columns takes one hash probe, and its cells at z - 1 to z + 1 are
+// a contiguous range of it, so each column gives one run of points.
+static inline uniform int column_runs(const uniform DenseGrid &grid,
+                                      const uniform Cells &targets,
+                                      uniform uint64 key,
+                                      uniform int run_start[],
+                                      uniform int run_end[]) {
+  const uniform int cx = unpack_coord_uniform(key, 42);
+  const uniform int cy = unpack_coord_uniform(key, 21);
+  const uniform int cz = unpack_coord_uniform(key, 0);
+  uniform int num_runs = 0;
+  for (uniform int dx = -1; dx <= 1; ++dx) {
+    for (uniform int dy = -1; dy <= 1; ++dy) {
+      const uniform int column = find_cell_uniform(
+          *grid.column_hash, make_key_uniform(cx + dx, cy + dy, 0));
+      if (column < 0) {
+        continue;
+      }
+      const uniform int end = grid.columns[column + 1];
+      const uniform int first = column_lower_bound(
+          targets.keys, grid.columns[column], end, cz - 1);
+      uniform int last = first;
+      while (last < end && unpack_coord_uniform(targets.keys[last], 0) <= cz + 1) {
+        ++last;
+      }
+      if (first < last) {
+        run_start[num_runs] = targets.starts[first];
+        run_end[num_runs] = targets.ends[last - 1];
+        ++num_runs;
+      }
+    }
+  }
+  return num_runs;
+}
+
 // Collects the 27 neighbor cells of cell (cx, cy, cz) as runs of contiguous
 // target points. Adjacent cells along z merge into one run when the cells are
 // sorted by signed coordinate, giving 9 runs. Radix-sorted keys order a
@@ -425,6 +478,9 @@ static inline uniform int dense_runs(const uniform DenseGrid &grid,
                                      uniform int run_start[],
                                      uniform int run_end[]) {
   if (grid.cells == NULL) {
+    if (grid.column_hash != NULL) {
+      return column_runs(grid, targets, key, run_start, run_end);
+    }
     return hash_runs(*grid.hash, targets, key, run_start, run_end);
   }
   const uniform int cx = unpack_coord_uniform(key, 42);

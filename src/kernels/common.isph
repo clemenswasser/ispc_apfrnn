@@ -45,12 +45,18 @@ struct HashGrid {
 // Dense cell lookup: cells[(x * ny + y) * nz + z] is a cell index or -1,
 // with x/y/z relative to (min_x, min_y, min_z). z varies fastest, as in the
 // cell key order, so consecutive cells read neighboring lookup entries.
-// A sparse set has no lookup (cells is NULL) and finds cells in `hash`.
+// A sparse set has no lookup (cells is NULL). It finds cells through its
+// columns when `column_hash` is set: the hash maps a column key (a cell key
+// with z cleared) to its ordinal k, and the column's cells, in increasing
+// signed z, are [columns[k], columns[k + 1]). Without it, cells are found in
+// `hash`.
 struct DenseGrid {
   const uniform int *uniform cells;
   uniform int nx, ny, nz;
   uniform int min_x, min_y, min_z;
   const uniform HashGrid *uniform hash;
+  const uniform HashGrid *uniform column_hash;
+  const uniform int *uniform columns;
 };
 
 // Candidate point ranges of each query cell:

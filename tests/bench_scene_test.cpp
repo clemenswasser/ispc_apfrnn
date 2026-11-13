@@ -201,3 +201,25 @@ TEST_CASE("sparse moving sets with multi-point cells stay exact") {
                  }};
   run_scene(spec, 6);
 }
+
+TEST_CASE("sparse moving sets spanning the origin stay exact") {
+  // A sparse set (no dense lookup) whose cells have negative and positive
+  // coordinates on every axis. Its writers find cells through the column
+  // lookup, whose columns and z ranges cross zero.
+  SceneSpec spec{"sparse_origin", [] {
+                   SceneData scene;
+                   scene.radius = 2.0f;
+                   auto cloud = apfrnn::support::make_point_cloud(200000,
+                                                                  1000.0f, 31);
+                   for (std::size_t i = 0; i < cloud.x.size(); ++i) {
+                     cloud.x[i] -= 500.0f;
+                     cloud.y[i] -= 500.0f;
+                     cloud.z[i] -= 500.0f;
+                   }
+                   scene.xyz = {apfrnn::bench::interleave(cloud)};
+                   scene.is_static = {false};
+                   scene.pairs = {{0, 0}};
+                   return scene;
+                 }};
+  run_scene(spec, 4);
+}

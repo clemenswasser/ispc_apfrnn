@@ -309,6 +309,19 @@ struct NeighborSearchData {
   int dense_min_z = 0;
   bool dense_valid = false;
 
+  // Column lookup of a sparse set (no dense lookup): column k holds the
+  // sorted cells [column_cells[k], column_cells[k + 1]), and the column hash
+  // maps a column key (cell key with z cleared) to k.
+  std::vector<uint64_t> column_keys;
+  IntBuffer column_cells;
+  std::vector<uint64_t> column_hash_keys;
+  IntBuffer column_hash_vals;
+  std::vector<uint8_t> column_hash_control;
+  uint32_t column_hash_mask = 0;
+  bool columns_valid = false;
+  // Whether build_column_lookup ran for the current grid.
+  bool columns_built = false;
+
   // Nine z-merged target ranges for every dense grid cell. Shared by every
   // source set that uses this set as a target.
   bool dense_cache_valid = false;

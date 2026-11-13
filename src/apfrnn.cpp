@@ -1442,6 +1442,49 @@ inline void build_hash_table(const std::vector<uint64_t> &unique_keys,
       });
 }
 
+// Builds the column lookup of a set without a dense lookup (see
+// NeighborSearchData::column_cells). Cell keys are sorted by signed x, y and
+// z, so each column's cells are one contiguous range in increasing z; the
+// writers then find a cell's neighbors with 9 column probes instead of 27
+// cell probes.
+inline void build_column_lookup(NeighborSearchData &data) {
+  data.columns_valid = false;
+  data.columns_built = true;
+  if (data.dense_valid || data.cell_ranges_implicit || data.num_cells == 0 ||
+      !data.cell_keys_signed_order) {
+    return;
+  }
+  const uint64_t *keys = data.scratch_unique_keys.data();
+  const int num_cells = data.num_cells;
+  // Bits above z: the column part of a key.
+  constexpr uint64_t kColumnMask = ~uint64_t{0x1FFFFF};
+  auto starts_column = [&](int cell) {
+    return cell == 0 ||
+           (keys[cell - 1] & kColumnMask) != (keys[cell] & kColumnMask);
+  };
+  const int num_columns = tbb::parallel_reduce(
+      tbb::blocked_range<int>(0, num_cells, 16384), 0,
+      [&](const tbb::blocked_range<int> &range, int sum) {
+        for (int cell = range.begin(); cell < range.end(); ++cell) {
+          sum += starts_column(cell) ? 1 : 0;
+        }
+        return sum;
+      },
+      std::plus<int>());
+  data.column_keys.resize(static_cast<std::size_t>(num_columns));
+  data.column_cells.resize(static_cast<std::size_t>(num_columns) + 1);
+  parallel_compact(num_cells, 16384, starts_column, [&](int write, int cell) {
+    data.column_keys[static_cast<std::size_t>(write)] =
+        keys[cell] & kColumnMask;
+    data.column_cells[static_cast<std::size_t>(write)] = cell;
+  });
+  data.column_cells[static_cast<std::size_t>(num_columns)] = num_cells;
+  build_hash_table(data.column_keys, data.column_hash_keys,
+                   data.column_hash_vals, data.empty_key,
+                   data.column_hash_mask, data.column_hash_control);
+  data.columns_valid = true;
+}
+
 inline void build_dense_cell_lookup(NeighborSearchData &data) {
   constexpr int64_t kDenseCellLimit = 16 * 1024 * 1024;
 
@@ -2337,6 +2380,8 @@ bool build_point_grid_inplace(NeighborSearchData &data,
     data.scratch_unique_keys.clear();
     data.dense_cells.clear();
     data.dense_valid = false;
+    data.columns_valid = false;
+    data.columns_built = false;
     data.dense_nx = 0;
     data.dense_ny = 0;
     data.dense_nz = 0;
@@ -2440,6 +2485,9 @@ bool build_point_grid_inplace(NeighborSearchData &data,
                       : static_cast<int>(data.cell_starts.size());
   data.num_cells = num_cells;
   build_dense_cell_lookup(data);
+  // Built on demand by the packed writer (ensure_column_lookup).
+  data.columns_valid = false;
+  data.columns_built = false;
   int max_cell_points = 1;
   if (!data.cell_ranges_implicit) {
     max_cell_points = 0;
@@ -5123,10 +5171,18 @@ bool write_packed_dense_rows(const NeighborSearchData &source,
   // A sparse target has no dense lookup; the kernel then finds cells in its
   // hash table.
   const ispc::HashGrid hash = hash_of(target);
+  const ispc::HashGrid column_hash = {
+      target.column_hash_keys.data(), target.column_hash_vals.data(),
+      target.empty_key, target.column_hash_mask,
+      target.column_hash_control.data()};
   ispc::DenseGrid grid = dense_of(target);
   if (!target.dense_valid) {
     grid = ispc::DenseGrid{};
     grid.hash = &hash;
+    if (target.columns_valid) {
+      grid.column_hash = &column_hash;
+      grid.columns = target.column_cells.data();
+    }
   }
   const ispc::Cells targets = cells_of(target);
   const ispc::Points qpts = points_of(source);
@@ -5219,8 +5275,15 @@ bool write_neighbors_packed_dense_parallel(NeighborSearchData &data,
                                            IntBuffer &counts,
                                            IntBuffer &row_offset,
                                            int64_t known_total) {
+  // A sparse set's cells are found through its columns when it has them,
+  // otherwise through the cell hash.
   if (!data.dense_valid) {
-    ensure_hash_table(data);
+    if (!data.columns_built) {
+      build_column_lookup(data);
+    }
+    if (!data.columns_valid) {
+      ensure_hash_table(data);
+    }
   }
   // Dense cells hold ~7 points, so an eight-query group covers a whole cell
   // per candidate pass instead of splitting it into two quads.
