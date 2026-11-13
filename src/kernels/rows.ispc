@@ -891,12 +891,13 @@ static inline uniform int direct_row(uniform int query,
       const int value = tpts.index[j];
       const bool near = within_radius(point_at(tpts, j), q, r2);
       const bool hit = same_set ? and(near, value != self) : near;
-      const uniform int mask = packmask(hit);
       if (!checked || count <= capacity) {
-        out[programIndex] = shuffle(value, perm[mask * 8 + programIndex]);
-        out += popcnt(mask);
+        const uniform int added = store_compacted(out, hit, value, perm);
+        out += added;
+        count += added;
+      } else {
+        count += reduce_add(select(hit, 1, 0));
       }
-      count += popcnt(mask);
     }
   }
   return count;
