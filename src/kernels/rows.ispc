@@ -1062,11 +1062,20 @@ static inline void rows_blocked(uniform int source_block,
             r2) {
           continue;
         }
-        foreach (j = tgt.begin[b]... tgt.end[b]) {
-          out += append_active(
-              out, count,
-              is_neighbor(tpts, j, q, r2, same_set, query),
-              tpts.index[j], rows, capacity);
+        // Only the query's own block can hold the query itself; the other
+        // blocks take the plain distance test, whose mask packs in one step.
+        if (same_set && query >= tgt.begin[b] && query < tgt.end[b]) {
+          foreach (j = tgt.begin[b]... tgt.end[b]) {
+            out += append_active(out, count,
+                                 is_neighbor(tpts, j, q, r2, true, query),
+                                 tpts.index[j], rows, capacity);
+          }
+        } else {
+          foreach (j = tgt.begin[b]... tgt.end[b]) {
+            out += append_active(out, count,
+                                 within_radius(point_at(tpts, j), q, r2),
+                                 tpts.index[j], rows, capacity);
+          }
         }
       }
     }
